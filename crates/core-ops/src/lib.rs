@@ -1,15 +1,21 @@
-//! Differentiable operators for sptorch.
+//! SPTorch 的可微分核心算子库。
 //!
-//! 20+ ops with forward + backward + backend dispatch:
-//! add, mul, neg, sub, sum, mean, matmul, exp, log, reshape, transpose,
-//! softmax, log_softmax, cross_entropy_loss, embedding_lookup, relu, gelu,
-//! scale, masked_fill, batch_matmul, broadcast_add, concat.
+//! 本 crate 连接 `core-tensor` 的计算图协议和实际数学算子：每个可导算子都
+//! 同时实现前向计算、反向传播公式，并在可能时通过后端注册表分发到设备
+//! kernel。这里的目标是把数学语义写清楚，让 CPU fallback、CUDA 后端和未来
+//! Tank9k kernel 都能对齐同一套行为。
+//!
+//! 当前覆盖：add、mul、neg、sub、sum、mean、matmul、exp、log、reshape、
+//! transpose、softmax、log_softmax、cross_entropy_loss、embedding_lookup、relu、
+//! gelu、scale、masked_fill、batch_matmul、broadcast_add、concat。
 
 use sptorch_core_tensor::{get_backend, Device, Node, Op, Tensor};
 use std::sync::Arc;
 
 // ============ Backend-aware dispatch helper ============
 
+// 二元算子统一走这个入口：如果张量设备注册了后端，就把连续 F32 切片交给
+// 后端 kernel；否则执行 CPU 闭包。shape 检查由具体算子负责，这里只处理设备派发。
 fn dispatch_binary(
     a_data: &[f32],
     b_data: &[f32],
@@ -26,7 +32,7 @@ fn dispatch_binary(
     }
 }
 
-// 一元算子分发：优先走设备后端实现，缺失时回退到 CPU 实现。
+// 一元算子分发：优先使用设备后端，缺失时回退到 CPU 实现。
 fn dispatch_unary(
     a_data: &[f32],
     device: &Device,
@@ -77,6 +83,8 @@ mod gpu_accel {
 
 // ============ Tiled Matmul (cache-friendly CPU fallback) ============
 
+// CPU fallback 使用 matrixmultiply::sgemm。这里的 unsafe 仅用于把 Rust 切片
+// 指针交给成熟 BLAS 风格内核；前置 assert 保证输入长度满足 row-major 矩阵读取边界。
 fn tiled_matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
     assert!(a.len() >= m * k, "matmul: a.len()={} but need m*k={}", a.len(), m * k);
     assert!(b.len() >= k * n, "matmul: b.len()={} but need k*n={}", b.len(), k * n);
@@ -102,11 +110,9 @@ fn tiled_matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> 
     c
 }
 
-// Helper: matmul dispatch (GPU if available and matrix large enough, else CPU tiled)
-// GPU offload only worthwhile when matrix is large enough to amortize transfer cost
 const _GPU_MATMUL_THRESHOLD: usize = 128 * 128;
 
-// 矩阵乘法分发：满足阈值时优先尝试 GPU，否则走 CPU 分块实现。
+// 矩阵乘法分发：CUDA 失败不会中断训练，而是回退到 CPU 参考实现。
 fn dispatch_matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
     #[cfg(feature = "cuda")]
     {
@@ -130,7 +136,7 @@ impl Op for AddOp {
         vec![Some(grad_output.clone()), Some(grad_output.clone())]
     }
 }
-/// 逐元素加法：`a + b`，输入形状需一致。
+/// 逐元素加法：`a + b`，输入形状需要一致。
 pub fn add(a: &Tensor, b: &Tensor) -> Tensor {
     let a_data = a.data();
     let b_data = b.data();
@@ -182,7 +188,7 @@ impl Op for MulOp {
         ]
     }
 }
-/// 逐元素乘法：`a * b`，输入形状需一致。
+/// 逐元素乘法：`a * b`，输入形状需要一致。
 pub fn mul(a: &Tensor, b: &Tensor) -> Tensor {
     let a_data = a.data();
     let b_data = b.data();
@@ -1417,8 +1423,7 @@ where
 mod tests {
     use super::*;
 
-    // --- Forward tests ---
-
+    // 前向测试锁定基础数学语义，防止后端优化改变可观察结果。
     #[test]
     fn test_add_forward() {
         let a = Tensor::new(vec![1.0, 2.0], vec![2]);
@@ -1426,7 +1431,6 @@ mod tests {
         assert_eq!(add(&a, &b).data(), vec![4.0, 6.0]);
     }
 
-    // 测试：验证 mul_forward 的行为与数值正确性。
     #[test]
     fn test_mul_forward() {
         let a = Tensor::new(vec![2.0, 3.0], vec![2]);
@@ -1434,14 +1438,12 @@ mod tests {
         assert_eq!(mul(&a, &b).data(), vec![8.0, 15.0]);
     }
 
-    // 测试：验证 neg_forward 的行为与数值正确性。
     #[test]
     fn test_neg_forward() {
         let a = Tensor::new(vec![2.0, -3.0], vec![2]);
         assert_eq!(neg(&a).data(), vec![-2.0, 3.0]);
     }
 
-    // 测试：验证 sub_forward 的行为与数值正确性。
     #[test]
     fn test_sub_forward() {
         let a = Tensor::new(vec![5.0, 3.0], vec![2]);
@@ -1449,21 +1451,18 @@ mod tests {
         assert_eq!(sub(&a, &b).data(), vec![3.0, 2.0]);
     }
 
-    // 测试：验证 sum_forward 的行为与数值正确性。
     #[test]
     fn test_sum_forward() {
         let a = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]);
         assert_eq!(sum(&a).data(), vec![6.0]);
     }
 
-    // 测试：验证 mean_forward 的行为与数值正确性。
     #[test]
     fn test_mean_forward() {
         let a = Tensor::new(vec![2.0, 4.0, 6.0], vec![3]);
         assert_eq!(mean(&a).data(), vec![4.0]);
     }
 
-    // 测试：验证 matmul_forward 的行为与数值正确性。
     #[test]
     fn test_matmul_forward() {
         // [2,3] @ [3,2] = [2,2]
@@ -1472,7 +1471,6 @@ mod tests {
         assert_eq!(matmul(&a, &b).data(), vec![58.0, 64.0, 139.0, 154.0]);
     }
 
-    // 测试：验证 exp_forward 的行为与数值正确性。
     #[test]
     fn test_exp_forward() {
         let a = Tensor::new(vec![0.0, 1.0], vec![2]);
@@ -1481,7 +1479,6 @@ mod tests {
         assert!((r[1] - std::f32::consts::E).abs() < 1e-5);
     }
 
-    // 测试：验证 log_forward 的行为与数值正确性。
     #[test]
     fn test_log_forward() {
         let a = Tensor::new(vec![1.0, std::f32::consts::E], vec![2]);
@@ -1490,8 +1487,7 @@ mod tests {
         assert!((r[1] - 1.0).abs() < 1e-5);
     }
 
-    // --- Backward tests ---
-
+    // 反向测试覆盖手写梯度公式，是 autograd 正确性的第一层保护。
     #[test]
     fn test_add_backward() {
         let x = Tensor::with_grad(vec![2.0], vec![1], true);
@@ -1502,7 +1498,6 @@ mod tests {
         assert_eq!(y.grad().unwrap(), vec![1.0]);
     }
 
-    // 测试：验证 mul_backward 的行为与数值正确性。
     #[test]
     fn test_mul_backward() {
         let x = Tensor::with_grad(vec![3.0], vec![1], true);
@@ -1513,7 +1508,6 @@ mod tests {
         assert_eq!(y.grad().unwrap(), vec![3.0]); // dz/dy = x
     }
 
-    // 测试：验证 neg_backward 的行为与数值正确性。
     #[test]
     fn test_neg_backward() {
         let a = Tensor::with_grad(vec![2.0], vec![1], true);
@@ -1522,7 +1516,6 @@ mod tests {
         assert_eq!(a.grad().unwrap(), vec![-1.0]);
     }
 
-    // 测试：验证 sub_backward 的行为与数值正确性。
     #[test]
     fn test_sub_backward() {
         let x = Tensor::with_grad(vec![5.0], vec![1], true);
@@ -1533,7 +1526,6 @@ mod tests {
         assert_eq!(y.grad().unwrap(), vec![-1.0]);
     }
 
-    // 测试：验证 sum_backward 的行为与数值正确性。
     #[test]
     fn test_sum_backward() {
         let a = Tensor::with_grad(vec![1.0, 2.0, 3.0], vec![3], true);
@@ -1542,7 +1534,6 @@ mod tests {
         assert_eq!(a.grad().unwrap(), vec![1.0, 1.0, 1.0]);
     }
 
-    // 测试：验证 mean_backward 的行为与数值正确性。
     #[test]
     fn test_mean_backward() {
         let a = Tensor::with_grad(vec![2.0, 4.0, 6.0], vec![3], true);
@@ -1555,7 +1546,6 @@ mod tests {
         }
     }
 
-    // 测试：验证 matmul_backward 的行为与数值正确性。
     #[test]
     fn test_matmul_backward() {
         // A=[1,2; 3,4] B=[5,6; 7,8]
@@ -1576,8 +1566,7 @@ mod tests {
         assert_eq!(db, vec![4.0, 4.0, 6.0, 6.0]);
     }
 
-    // --- Numerical gradient checks ---
-
+    // 数值梯度检查用有限差分对照解析梯度，专门捕捉公式写错但样例碰巧通过的问题。
     #[test]
     fn test_grad_check_add() {
         let a = Tensor::new(vec![2.0, 3.0], vec![2]);
@@ -1590,7 +1579,6 @@ mod tests {
         ));
     }
 
-    // 测试：验证 grad_check_mul 的行为与数值正确性。
     #[test]
     fn test_grad_check_mul() {
         let a = Tensor::new(vec![2.0, 3.0], vec![2]);
@@ -1603,7 +1591,6 @@ mod tests {
         ));
     }
 
-    // 测试：验证 grad_check_matmul 的行为与数值正确性。
     #[test]
     fn test_grad_check_matmul() {
         let a = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
@@ -1616,22 +1603,19 @@ mod tests {
         ));
     }
 
-    // 测试：验证 grad_check_exp 的行为与数值正确性。
     #[test]
     fn test_grad_check_exp() {
         let a = Tensor::new(vec![0.5, 1.0], vec![2]);
         assert!(numerical_grad_check(|inputs| sum(&exp(&inputs[0])), &[&a], 1e-3, 1e-2));
     }
 
-    // 测试：验证 grad_check_log 的行为与数值正确性。
     #[test]
     fn test_grad_check_log() {
         let a = Tensor::new(vec![1.0, 2.0], vec![2]);
         assert!(numerical_grad_check(|inputs| sum(&log(&inputs[0])), &[&a], 1e-3, 1e-2));
     }
 
-    // --- Composite backward tests ---
-
+    // 组合图测试验证梯度能跨多个算子连续传播。
     #[test]
     fn test_composite_mul_add() {
         // z = x*y + x => dz/dx = y+1, dz/dy = x
@@ -1643,7 +1627,6 @@ mod tests {
         assert_eq!(y.grad().unwrap(), vec![3.0]); // x = 3
     }
 
-    // 测试：验证 composite_exp_log 的行为与数值正确性。
     #[test]
     fn test_composite_exp_log() {
         // log(exp(x)) = x => grad = 1
@@ -1654,8 +1637,7 @@ mod tests {
         assert!((g - 1.0).abs() < 1e-5);
     }
 
-    // --- Reshape tests ---
-
+    // reshape 测试关注 shape 变化不应改变元素顺序和梯度归属。
     #[test]
     fn test_reshape_forward() {
         let a = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
@@ -1664,7 +1646,6 @@ mod tests {
         assert_eq!(b.data(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     }
 
-    // 测试：验证 reshape_backward 的行为与数值正确性。
     #[test]
     fn test_reshape_backward() {
         let a = Tensor::with_grad(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], true);
@@ -1675,8 +1656,7 @@ mod tests {
         assert_eq!(a.shape(), vec![2, 3]); // grad shape matches input
     }
 
-    // --- Transpose tests ---
-
+    // transpose 测试固定二维转置的前向布局与反向还原语义。
     #[test]
     fn test_transpose_forward() {
         // [[1,2,3],[4,5,6]] -> [[1,4],[2,5],[3,6]]
@@ -1686,7 +1666,6 @@ mod tests {
         assert_eq!(b.data(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
     }
 
-    // 测试：验证 transpose_backward 的行为与数值正确性。
     #[test]
     fn test_transpose_backward() {
         let a = Tensor::with_grad(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], true);
@@ -1696,8 +1675,7 @@ mod tests {
         assert_eq!(a.grad().unwrap(), vec![1.0; 4]);
     }
 
-    // --- Softmax tests ---
-
+    // softmax 测试同时约束概率归一化和雅可比反向实现。
     #[test]
     fn test_softmax_forward_1d() {
         let a = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]);
@@ -1708,7 +1686,6 @@ mod tests {
         assert!(d[2] > d[1] && d[1] > d[0]);
     }
 
-    // 测试：验证 softmax_forward_2d 的行为与数值正确性。
     #[test]
     fn test_softmax_forward_2d() {
         let a = Tensor::new(vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0], vec![2, 3]);
@@ -1720,7 +1697,6 @@ mod tests {
         assert!((row1_sum - 1.0).abs() < 1e-6);
     }
 
-    // 测试：验证 softmax_backward 的行为与数值正确性。
     #[test]
     fn test_softmax_backward() {
         let a = Tensor::with_grad(vec![1.0, 2.0, 3.0], vec![3], true);
@@ -1734,8 +1710,7 @@ mod tests {
         }
     }
 
-    // --- LogSoftmax tests ---
-
+    // log_softmax 测试确保对数域输出和 softmax 语义一致。
     #[test]
     fn test_log_softmax_forward() {
         let a = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]);
@@ -1748,7 +1723,6 @@ mod tests {
         }
     }
 
-    // 测试：验证 grad_check_softmax 的行为与数值正确性。
     #[test]
     fn test_grad_check_softmax() {
         let a = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]);
@@ -1760,7 +1734,6 @@ mod tests {
         ));
     }
 
-    // 测试：验证 grad_check_log_softmax 的行为与数值正确性。
     #[test]
     fn test_grad_check_log_softmax() {
         let a = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]);
@@ -1772,8 +1745,7 @@ mod tests {
         ));
     }
 
-    // --- CrossEntropyLoss tests ---
-
+    // cross entropy 测试锁定 logits 到 NLL loss 的组合语义。
     #[test]
     fn test_cross_entropy_forward_1d() {
         // Uniform logits => loss = ln(num_classes)
@@ -1783,7 +1755,6 @@ mod tests {
         assert!((l - (3.0f32).ln()).abs() < 1e-5);
     }
 
-    // 测试：验证 cross_entropy_forward_2d 的行为与数值正确性。
     #[test]
     fn test_cross_entropy_forward_2d() {
         let a = Tensor::new(vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0], vec![2, 3]);
@@ -1792,7 +1763,6 @@ mod tests {
         assert!((l - (3.0f32).ln()).abs() < 1e-5);
     }
 
-    // 测试：验证 cross_entropy_backward 的行为与数值正确性。
     #[test]
     fn test_cross_entropy_backward() {
         let a = Tensor::with_grad(vec![1.0, 2.0, 3.0], vec![3], true);
@@ -1804,7 +1774,6 @@ mod tests {
         assert!(sum_g.abs() < 1e-6);
     }
 
-    // 测试：验证 grad_check_cross_entropy 的行为与数值正确性。
     #[test]
     fn test_grad_check_cross_entropy() {
         let a = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
@@ -1816,8 +1785,7 @@ mod tests {
         ));
     }
 
-    // --- Embedding tests ---
-
+    // embedding 测试重点覆盖重复索引时的梯度累加。
     #[test]
     fn test_embedding_forward() {
         // 4 embeddings of dim 3
@@ -1830,7 +1798,6 @@ mod tests {
         assert_eq!(out.data(), vec![0.1, 0.2, 0.3, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2,]);
     }
 
-    // 测试：验证 embedding_backward 的行为与数值正确性。
     #[test]
     fn test_embedding_backward() {
         let w = Tensor::with_grad(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![3, 2], true);
@@ -1844,15 +1811,13 @@ mod tests {
         assert_eq!(g, vec![2.0, 2.0, 0.0, 0.0, 1.0, 1.0]);
     }
 
-    // --- ReLU tests ---
-
+    // ReLU 测试固定 0 点及负区间的梯度截断语义。
     #[test]
     fn test_relu_forward() {
         let a = Tensor::new(vec![-1.0, 0.0, 1.0, 2.0], vec![4]);
         assert_eq!(relu(&a).data(), vec![0.0, 0.0, 1.0, 2.0]);
     }
 
-    // 测试：验证 relu_backward 的行为与数值正确性。
     #[test]
     fn test_relu_backward() {
         let a = Tensor::with_grad(vec![-1.0, 0.0, 1.0, 2.0], vec![4], true);
@@ -1862,7 +1827,6 @@ mod tests {
         assert_eq!(a.grad().unwrap(), vec![0.0, 0.0, 1.0, 1.0]);
     }
 
-    // 测试：验证 grad_check_relu 的行为与数值正确性。
     #[test]
     fn test_grad_check_relu() {
         // Avoid 0 (non-differentiable point)
@@ -1870,8 +1834,7 @@ mod tests {
         assert!(numerical_grad_check(|inputs| sum(&relu(&inputs[0])), &[&a], 1e-3, 1e-2));
     }
 
-    // --- GELU tests ---
-
+    // GELU 测试锁定 tanh 近似公式的前向与反向精度。
     #[test]
     fn test_gelu_forward() {
         let a = Tensor::new(vec![-1.0, 0.0, 1.0, 2.0], vec![4]);
@@ -1881,22 +1844,19 @@ mod tests {
         assert!(d[2] > 0.8); // gelu(1) ~ 0.841
     }
 
-    // 测试：验证 grad_check_gelu 的行为与数值正确性。
     #[test]
     fn test_grad_check_gelu() {
         let a = Tensor::new(vec![-1.0, 0.5, 1.0, 2.0], vec![4]);
         assert!(numerical_grad_check(|inputs| sum(&gelu(&inputs[0])), &[&a], 1e-3, 1e-2));
     }
 
-    // --- Scale tests ---
-
+    // scale 测试服务于梯度累积和混合精度缩放路径。
     #[test]
     fn test_scale_forward() {
         let a = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]);
         assert_eq!(scale(&a, 2.0).data(), vec![2.0, 4.0, 6.0]);
     }
 
-    // 测试：验证 scale_backward 的行为与数值正确性。
     #[test]
     fn test_scale_backward() {
         let a = Tensor::with_grad(vec![1.0, 2.0], vec![2], true);
@@ -1906,8 +1866,7 @@ mod tests {
         assert_eq!(a.grad().unwrap(), vec![3.0, 3.0]);
     }
 
-    // --- Masked Fill tests ---
-
+    // masked_fill 测试约束 attention mask 常用的 true/false 写入语义。
     #[test]
     fn test_masked_fill_forward() {
         let a = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![4]);
@@ -1920,7 +1879,6 @@ mod tests {
         assert_eq!(d[3], f32::NEG_INFINITY);
     }
 
-    // 测试：验证 masked_fill_backward 的行为与数值正确性。
     #[test]
     fn test_masked_fill_backward() {
         let a = Tensor::with_grad(vec![1.0, 2.0, 3.0, 4.0], vec![4], true);
@@ -1931,8 +1889,7 @@ mod tests {
         assert_eq!(a.grad().unwrap(), vec![1.0, 0.0, 1.0, 0.0]);
     }
 
-    // --- Batch Matmul tests ---
-
+    // batch matmul 测试覆盖 batch stride 切片和对应梯度。
     #[test]
     fn test_batch_matmul_forward() {
         // batch=1, [1,2,2] @ [1,2,2]
@@ -1943,7 +1900,6 @@ mod tests {
         assert_eq!(c.data(), vec![19.0, 22.0, 43.0, 50.0]);
     }
 
-    // 测试：验证 batch_matmul_multi_batch 的行为与数值正确性。
     #[test]
     fn test_batch_matmul_multi_batch() {
         // batch=2, each [2,2] @ [2,2]
@@ -1964,7 +1920,6 @@ mod tests {
         assert_eq!(&d[4..8], &[6.0, 8.0, 10.0, 12.0]);
     }
 
-    // 测试：验证 grad_check_batch_matmul 的行为与数值正确性。
     #[test]
     fn test_grad_check_batch_matmul() {
         let a = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![1, 2, 2]);
@@ -1977,8 +1932,7 @@ mod tests {
         ));
     }
 
-    // --- Broadcast Add tests ---
-
+    // broadcast_add 测试固定一维 bias 在 batch 维上的复用和梯度归约。
     #[test]
     fn test_broadcast_add_2d() {
         let a = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
@@ -1987,7 +1941,6 @@ mod tests {
         assert_eq!(c.data(), vec![11.0, 22.0, 33.0, 14.0, 25.0, 36.0]);
     }
 
-    // 测试：验证 broadcast_add_backward 的行为与数值正确性。
     #[test]
     fn test_broadcast_add_backward() {
         let a = Tensor::with_grad(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], true);
@@ -2000,8 +1953,7 @@ mod tests {
         assert_eq!(b.grad().unwrap(), vec![2.0, 2.0, 2.0]);
     }
 
-    // --- Concat tests ---
-
+    // concat 测试确保拼接后的梯度能按原 shape 切回每个输入。
     #[test]
     fn test_concat_forward() {
         let a = Tensor::new(vec![1.0, 2.0], vec![1, 2]);
@@ -2011,7 +1963,6 @@ mod tests {
         assert_eq!(c.data(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     }
 
-    // 测试：验证 concat_backward 的行为与数值正确性。
     #[test]
     fn test_concat_backward() {
         let a = Tensor::with_grad(vec![1.0, 2.0], vec![1, 2], true);
@@ -2023,8 +1974,7 @@ mod tests {
         assert_eq!(b.grad().unwrap(), vec![1.0, 1.0, 1.0, 1.0]);
     }
 
-    // --- Backend dispatch test ---
-
+    // 后端分发测试证明自定义设备注册后会覆盖 CPU fallback。
     #[test]
     fn test_backend_dispatch_custom() {
         use sptorch_core_tensor::{register_backend, BackendDispatch};

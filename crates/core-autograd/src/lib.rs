@@ -1,17 +1,29 @@
+//! 最小 autograd 扩展层。
+//!
+//! 这个 crate 目前保留一个轻量 `add` 示例，用来验证 `core-tensor` 暴露的
+//! [`Node`] / [`Op`] / [`Tensor`] 计算图协议是否足够被外部算子 crate 复用。
+//! 真正完整的算子集合位于 `sptorch-core-ops`，这里更像 autograd 协议的
+//! “冒烟测试”和教学入口。
+
 use sptorch_core_tensor::{Node, Op, Tensor};
 use std::sync::Arc;
 
+/// 加法算子的反向传播实现。
 #[derive(Debug)]
 pub struct AddOp;
 
 impl Op for AddOp {
-    // 加法的梯度会原样分发给两个输入。
     fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
-        // z = a + b => dL/da = dL/dz, dL/db = dL/dz
+        // z = a + b，所以上游梯度会原样分发给两个输入。
         vec![Some(grad_output.clone()), Some(grad_output.clone())]
     }
 }
-/// `add`：中文注释，说明函数用途、输入约束与输出语义。
+
+/// 逐元素加法，并在需要时挂接 autograd 节点。
+///
+/// 当前示例要求 `a` 与 `b` 形状一致；前向结果沿用 `a` 的 shape。如果任一
+/// 输入开启 `requires_grad`，结果张量会记录 [`AddOp`] 与两个输入，后续
+/// 调用 [`Tensor::backward`] 时梯度会沿这条边继续传播。
 pub fn add(a: &Tensor, b: &Tensor) -> Tensor {
     let a_data = a.data();
     let b_data = b.data();
@@ -39,7 +51,7 @@ pub fn add(a: &Tensor, b: &Tensor) -> Tensor {
 mod tests {
     use super::*;
 
-    // 基础用例：a+b 的反向梯度都应为 1。
+    // 基础用例：`a + b` 对两个输入的局部导数都为 1。
     #[test]
     fn test_autograd_basic() {
         let x = Tensor::with_grad(vec![2.0], vec![1], true);
@@ -54,7 +66,7 @@ mod tests {
         assert_eq!(y.grad().unwrap(), vec![1.0]);
     }
 
-    // 链式加法：验证梯度沿计算图逐层传播。
+    // 链式加法验证梯度能沿计算图逐层传播到更早的叶子节点。
     #[test]
     fn test_chain_add() {
         // a + b = c, c + d = e => da=1, db=1, dc=1, dd=1
@@ -73,7 +85,7 @@ mod tests {
         assert_eq!(d.grad().unwrap(), vec![1.0]);
     }
 
-    // 菱形计算图：同一变量被多次使用时梯度应累加。
+    // 同一个叶子张量在图中被多次使用时，梯度必须累加而不是覆盖。
     #[test]
     fn test_diamond_graph() {
         // x 被使用两次：z = (x + y) + x => dx = 2.0, dy = 1.0
