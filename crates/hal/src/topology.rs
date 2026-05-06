@@ -1,12 +1,22 @@
-//! Hardware topology descriptions for multi-board and heterogeneous deployments.
+//! 多板卡与异构设备拓扑描述。
 //!
-//! This module is intentionally framework-level: it models devices, links, and
-//! executable validation plans without binding to any single board or transport.
+//! 这个模块服务于 Tank9k 和未来异构集群的“先规划、再点亮”流程：在真实
+//! 串口、PCIe、DMA 后端稳定之前，框架仍然可以用拓扑模型验证连通性、
+//! 生成 Ring AllReduce 顺序，并估算 MatMul 分片是否合理。
+//!
+//! 拓扑是有向图。若一条链路在物理上双向可用，调用者需要显式加入两个
+//! 方向的 [`HardwareLink`]，这样可以表达半双工、控制链路和数据链路不对称
+//! 的硬件现实。
 
 use super::DeviceId;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 
+/// 设备之间的传输介质。
+///
+/// 它描述的是链路的工程类型，而不是 Rust 侧的具体实现。比如 `Serial`
+/// 可以先代表 mock 串口协议，后续再接真实 UART/DMA；规划层只关心带宽、
+/// 延迟和可达性。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TransportKind {
     Serial,
@@ -17,7 +27,6 @@ pub enum TransportKind {
 }
 
 impl fmt::Display for TransportKind {
-    // 中文注释：关键逻辑说明。
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             TransportKind::Serial => "serial",
@@ -29,6 +38,11 @@ impl fmt::Display for TransportKind {
     }
 }
 
+/// 链路在系统中的用途。
+///
+/// 同一对板卡可能同时存在控制、数据和遥测链路。把 role 放进拓扑模型，
+/// 是为了后续调度器能区分“发指令”“搬梯度”“读队列深度”这些不同路径，
+/// 而不是把所有连接都粗暴看成一条数据线。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LinkRole {
     Control,
@@ -38,7 +52,6 @@ pub enum LinkRole {
 }
 
 impl fmt::Display for LinkRole {
-    // 中文注释：关键逻辑说明。
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             LinkRole::Control => "control",
@@ -49,6 +62,11 @@ impl fmt::Display for LinkRole {
     }
 }
 
+/// 拓扑中的一个逻辑硬件节点。
+///
+/// `memory_mb` 和 `queue_depth_hint` 都是规划提示，不代表实时硬件状态。
+/// 实时状态应由 HAL/FFI 遥测层上报；拓扑层只保存足够稳定的信息，保证
+/// dry-run、CI 和文档中的示例可以复现。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HardwareNode {
     pub id: DeviceId,
@@ -60,7 +78,11 @@ pub struct HardwareNode {
 }
 
 impl HardwareNode {
-    /// `new`：中文注释，说明函数用途、输入约束与输出语义。
+    /// 创建一个默认在线的硬件节点。
+    ///
+    /// `label` 面向人类排障，`board_class` 面向调度和能力识别。比如多块
+    /// Tank9k 可以分别叫 `board-a`、`board-b`，但共享同一个 `tank9k`
+    /// board class。
     pub fn new(id: DeviceId, label: impl Into<String>, board_class: impl Into<String>, memory_mb: u32) -> Self {
         Self {
             id,
@@ -73,6 +95,11 @@ impl HardwareNode {
     }
 }
 
+/// 拓扑中的一条有向硬件链路。
+///
+/// `bandwidth_mb_s` 和 `latency_us` 是粗粒度规划参数，用于判断方案是否
+/// 值得进入真实硬件验证；它们不是 benchmark 结果，也不应该被展示成
+/// 性能承诺。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HardwareLink {
     pub from: DeviceId,
@@ -86,7 +113,11 @@ pub struct HardwareLink {
 }
 
 impl HardwareLink {
-    /// `new`：中文注释，说明函数用途、输入约束与输出语义。
+    /// 创建一条单跳、默认全双工的有向链路。
+    ///
+    /// 即使 `full_duplex` 为 true，这个对象仍只表示 `from -> to`。如果算法
+    /// 需要反向发送梯度或 fence，需要额外添加 `to -> from` 链路，避免规划
+    /// 层隐式猜测硬件能力。
     pub fn new(
         from: DeviceId,
         to: DeviceId,
@@ -108,6 +139,7 @@ impl HardwareLink {
     }
 }
 
+/// 一组硬件节点和有向链路组成的拓扑。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HardwareTopology {
     pub name: String,
@@ -116,7 +148,10 @@ pub struct HardwareTopology {
 }
 
 impl HardwareTopology {
-    /// `new`：中文注释，说明函数用途、输入约束与输出语义。
+    /// 创建空拓扑。
+    ///
+    /// 空拓扑是合法的中间状态，但 [`Self::validate_connectivity`] 会把它标记为
+    /// 不可用，防止上层误把“还没发现设备”当成“单机可运行”。
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -124,27 +159,43 @@ impl HardwareTopology {
             links: Vec::new(),
         }
     }
-    /// `add_node`：中文注释，说明函数用途、输入约束与输出语义。
+
+    /// 添加一个节点；当前不做去重，调用者应保持 `DeviceId` 唯一。
     pub fn add_node(&mut self, node: HardwareNode) {
         self.nodes.push(node);
     }
-    /// `add_link`：中文注释，说明函数用途、输入约束与输出语义。
+
+    /// 添加一条链路。
+    ///
+    /// 链路端点是否存在会在 [`Self::validate_connectivity`] 中统一诊断，便于批量
+    /// 构造拓扑时一次性返回所有问题。
     pub fn add_link(&mut self, link: HardwareLink) {
         self.links.push(link);
     }
-    /// `node`：中文注释，说明函数用途、输入约束与输出语义。
+
+    /// 按逻辑设备 ID 查找节点。
     pub fn node(&self, id: &DeviceId) -> Option<&HardwareNode> {
         self.nodes.iter().find(|node| &node.id == id)
     }
-    /// `neighbors`：中文注释，说明函数用途、输入约束与输出语义。
+
+    /// 返回从指定设备出发的所有有向链路。
     pub fn neighbors(&self, id: &DeviceId) -> Vec<&HardwareLink> {
         self.links.iter().filter(|link| &link.from == id).collect()
     }
-    /// `online_node_count`：中文注释，说明函数用途、输入约束与输出语义。
+
+    /// 返回当前标记为在线的节点数量。
+    ///
+    /// 这是规划输入中的状态，不会主动探测硬件；真实在线探测应由 HAL FFI
+    /// 或遥测服务更新节点字段后再重新验证。
     pub fn online_node_count(&self) -> usize {
         self.nodes.iter().filter(|node| node.online).count()
     }
-    /// `validate_connectivity`：中文注释，说明函数用途、输入约束与输出语义。
+
+    /// 验证拓扑是否从第一个节点出发可达所有节点。
+    ///
+    /// 这里使用有向 BFS，因此会抓出“环少了一条反向边”“某块板只接了控制
+    /// 线没有数据线”等早期硬件联调常见问题。离线节点会进入 diagnostics，
+    /// 但当前连通性仍按图结构计算，方便区分“拓扑设计错误”和“运行时掉线”。
     pub fn validate_connectivity(&self) -> TopologyValidation {
         let mut diagnostics = Vec::new();
         let mut graph: HashMap<&DeviceId, Vec<&DeviceId>> = HashMap::new();
@@ -209,13 +260,22 @@ impl HardwareTopology {
             diagnostics,
         }
     }
-    /// `ring_plan`：中文注释，说明函数用途、输入约束与输出语义。
+
+    /// 生成稳定的 Ring 顺序。
+    ///
+    /// 排序只依赖 `backend` 和 `ordinal`，不依赖插入顺序。这样 CI、文档样例
+    /// 和硬件 dry-run 会得到同一条 ring，方便比较 AllReduce 估算结果。
     pub fn ring_plan(&self) -> Vec<DeviceId> {
         let mut nodes = self.nodes.iter().map(|n| n.id.clone()).collect::<Vec<_>>();
         nodes.sort_by(|a, b| a.backend.cmp(&b.backend).then(a.ordinal.cmp(&b.ordinal)));
         nodes
     }
-    /// `allreduce_cost_estimate`：中文注释，说明函数用途、输入约束与输出语义。
+
+    /// 给定梯度 payload 字节数，估算 Ring AllReduce 的粗略耗时。
+    ///
+    /// 返回 `None` 表示拓扑不具备执行条件。估算采用最窄带宽和累计延迟，
+    /// 只用于方案筛选，不替代真实 benchmark；真实硬件点亮后仍需用遥测和
+    /// benchmark 校准。
     pub fn allreduce_cost_estimate(&self, payload_bytes: usize) -> Option<AllReduceEstimate> {
         if self.nodes.len() < 2 {
             return None;
@@ -256,7 +316,12 @@ impl HardwareTopology {
             latency_us,
         })
     }
-    /// `matmul_partition_plan`：中文注释，说明函数用途、输入约束与输出语义。
+
+    /// 生成 MatMul 验证分片计划。
+    ///
+    /// 当前策略按节点数量粗略切分行列，目标是为 Tank9k 多板 32x32 MatMul
+    /// 验证提供可解释计划，而不是追求最优 tiling。后续真实 kernel 上线后，
+    /// 可以在保持返回结构不变的前提下替换为更细的调度器。
     pub fn matmul_partition_plan(&self, m: usize, k: usize, n: usize) -> MatmulPartitionPlan {
         let nodes = self.ring_plan();
         let tile_rows = std::cmp::max(1, m / nodes.len().max(1));
@@ -290,6 +355,7 @@ impl HardwareTopology {
     }
 }
 
+/// 拓扑连通性诊断结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopologyValidation {
     pub connected: bool,
@@ -298,6 +364,7 @@ pub struct TopologyValidation {
     pub diagnostics: Vec<String>,
 }
 
+/// Ring AllReduce 粗略成本估算。
 #[derive(Debug, Clone, PartialEq)]
 pub struct AllReduceEstimate {
     pub nodes: Vec<DeviceId>,
@@ -308,6 +375,7 @@ pub struct AllReduceEstimate {
     pub latency_us: u32,
 }
 
+/// 单个 MatMul 分片在某个设备上的负责范围。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatmulShard {
     pub device: DeviceId,
@@ -316,6 +384,7 @@ pub struct MatmulShard {
     pub k: usize,
 }
 
+/// 一次 MatMul dry-run 的完整分片计划。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatmulPartitionPlan {
     pub m: usize,
@@ -328,7 +397,8 @@ pub struct MatmulPartitionPlan {
 mod tests {
     use super::*;
 
-    // 中文注释：关键逻辑说明。
+    // 这个测试把“三块 Tank9k 串口成环”作为最小多板验收样板：拓扑可达、
+    // ring 顺序稳定、AllReduce 有成本估算、MatMul 能分配到每块板。
     #[test]
     fn tank9k_ring_topology_validates_and_plans() {
         let a = DeviceId::tank9k(0);
@@ -384,7 +454,7 @@ mod tests {
         assert_eq!(partition.shards[2].device, c);
     }
 
-    // 中文注释：关键逻辑说明。
+    // 缺链路时必须拒绝 AllReduce 估算，否则上层可能把不可执行计划推给真实硬件。
     #[test]
     fn detects_missing_links() {
         let mut topo = HardwareTopology::new("broken");

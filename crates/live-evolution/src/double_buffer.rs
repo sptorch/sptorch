@@ -4,22 +4,25 @@ use std::sync::{
     Arc, RwLock,
 };
 
-/// Double-buffered parameter store for concurrent train/inference.
+/// 双缓冲参数仓。
 ///
-/// Two copies of model parameters: "active" (used by inference) and "shadow"
-/// (being updated by training). After a training step completes, an atomic
-/// swap makes the shadow become active.
+/// active 缓冲服务推理请求，shadow 缓冲承接在线训练更新。训练完成并通过
+/// 监控后，只翻转一个原子标志即可让 shadow 成为新的 active，避免在推理
+/// 热路径复制整套参数。这个结构是版本化张量协议的本地内存基础。
 pub struct DoubleBufferParams {
     buf_a: Vec<Tensor>,
     buf_b: Vec<Tensor>,
-    /// true = buf_a is active (inference), buf_b is shadow (training)
+    /// true 表示 buf_a 当前给推理读，buf_b 当前给训练写。
     a_is_active: Arc<AtomicBool>,
-    /// Guards the swap operation
+    /// swap 与快照读取共享同一把锁，防止快照期间看到一半旧版本、一半新版本。
     swap_lock: Arc<RwLock<()>>,
 }
 
 impl DoubleBufferParams {
-    /// `new`：中文注释，说明函数用途、输入约束与输出语义。
+    /// 从一组参数创建 active/shadow 两份独立快照。
+    ///
+    /// 两个缓冲初始内容完全一致，但 Tensor 对象互不共享存储。调用者可以
+    /// 直接把 shadow 交给训练过程修改，而不会污染正在服务推理的 active。
     pub fn new(params: &[Tensor]) -> Self {
         let buf_a: Vec<Tensor> = params.iter().map(clone_tensor).collect();
         let buf_b: Vec<Tensor> = params.iter().map(clone_tensor).collect();
@@ -30,7 +33,11 @@ impl DoubleBufferParams {
             swap_lock: Arc::new(RwLock::new(())),
         }
     }
-    /// `active_params`：中文注释，说明函数用途、输入约束与输出语义。
+
+    /// 返回当前 active 参数视图。
+    ///
+    /// 这个方法只读取原子标志，不加锁，适合推理热路径。若调用者需要一个
+    /// 跨所有参数一致的版本快照，应使用 [`Self::active_params_snapshot`]。
     pub fn active_params(&self) -> &[Tensor] {
         if self.a_is_active.load(Ordering::Acquire) {
             &self.buf_a
@@ -38,7 +45,11 @@ impl DoubleBufferParams {
             &self.buf_b
         }
     }
-    /// `shadow_params`：中文注释，说明函数用途、输入约束与输出语义。
+
+    /// 返回当前 shadow 参数视图。
+    ///
+    /// shadow 是训练写入目标；调用者必须保证训练更新和 swap 的时序由外层
+    /// fence/监控流程约束，不能在 swap 过程中继续写同一份参数。
     pub fn shadow_params(&self) -> &[Tensor] {
         if self.a_is_active.load(Ordering::Acquire) {
             &self.buf_b
@@ -46,7 +57,12 @@ impl DoubleBufferParams {
             &self.buf_a
         }
     }
-    /// `active_params_snapshot`：中文注释，说明函数用途、输入约束与输出语义。
+
+    /// 复制当前 active 参数的连续数据，得到一致快照。
+    ///
+    /// 读锁保证整个快照期间不会发生 swap，适合 Studio、checkpoint 或调试
+    /// 工具读取版本内容。返回值是普通 `Vec<Vec<f32>>`，不会把内部锁或 Tensor
+    /// 引用泄漏给异步调用者。
     pub fn active_params_snapshot(&self) -> Vec<Vec<f32>> {
         let _guard = self.swap_lock.read().unwrap();
         let params = if self.a_is_active.load(Ordering::Acquire) {
@@ -56,13 +72,22 @@ impl DoubleBufferParams {
         };
         params.iter().map(|p| p.contiguous_data()).collect()
     }
-    /// `swap`：中文注释，说明函数用途、输入约束与输出语义。
+
+    /// 原子切换 active 与 shadow 的角色。
+    ///
+    /// 写锁让切换与快照读取互斥；Acquire/Release 让训练写入在新 active 被
+    /// 推理线程读取前具备可见性。真实硬件接入后，调用本方法前必须先确认
+    /// 设备侧 fence 已经完成。
     pub fn swap(&self) {
         let _guard = self.swap_lock.write().unwrap();
         let prev = self.a_is_active.load(Ordering::Acquire);
         self.a_is_active.store(!prev, Ordering::Release);
     }
-    /// `sync_shadow_from_active`：中文注释，说明函数用途、输入约束与输出语义。
+
+    /// 用 active 内容覆盖 shadow。
+    ///
+    /// 回滚或放弃一次在线训练更新后，需要把 shadow 拉回稳定版本，否则下一轮
+    /// 训练会从已判定不可靠的参数继续漂移。
     pub fn sync_shadow_from_active(&self) {
         let _guard = self.swap_lock.write().unwrap();
         let (src, dst) = if self.a_is_active.load(Ordering::Acquire) {
@@ -77,13 +102,14 @@ impl DoubleBufferParams {
             d_storage.as_cpu_slice_mut().copy_from_slice(&src_data);
         }
     }
-    /// `num_params`：中文注释，说明函数用途、输入约束与输出语义。
+
+    /// 返回参数张量数量；active 与 shadow 数量始终相同。
     pub fn num_params(&self) -> usize {
         self.buf_a.len()
     }
 }
 
-// 中文注释：关键逻辑说明。
+/// 克隆 Tensor 的值、shape 和 requires_grad 标志，但不共享底层 Storage。
 fn clone_tensor(t: &Tensor) -> Tensor {
     let data = t.contiguous_data();
     let shape = t.shape();
@@ -94,7 +120,7 @@ fn clone_tensor(t: &Tensor) -> Tensor {
 mod tests {
     use super::*;
 
-    // 中文注释：关键逻辑说明。
+    // 初始状态必须保证 active/shadow 完全一致，否则在线训练会从不确定版本开始。
     #[test]
     fn test_double_buffer_initial_state() {
         let p = vec![Tensor::new(vec![1.0, 2.0, 3.0], vec![3])];
@@ -104,13 +130,13 @@ mod tests {
         assert_eq!(db.shadow_params()[0].data(), vec![1.0, 2.0, 3.0]);
     }
 
-    // 中文注释：关键逻辑说明。
+    // swap 只改变角色，不复制数据；这是实时服务场景可接受延迟的关键。
     #[test]
     fn test_double_buffer_swap() {
         let p = vec![Tensor::new(vec![1.0, 2.0], vec![2])];
         let db = DoubleBufferParams::new(&p);
 
-        // Modify shadow
+        // 模拟训练过程只写 shadow，active 在 swap 前必须保持旧值。
         {
             let shadow = db.shadow_params();
             let inner = shadow[0].0.read().unwrap();
@@ -120,25 +146,20 @@ mod tests {
             s[1] = 20.0;
         }
 
-        // Before swap: active is still [1, 2]
         assert_eq!(db.active_params()[0].data(), vec![1.0, 2.0]);
 
-        // Swap
         db.swap();
 
-        // After swap: active is now [10, 20]
         assert_eq!(db.active_params()[0].data(), vec![10.0, 20.0]);
-        // Old active is now shadow: [1, 2]
         assert_eq!(db.shadow_params()[0].data(), vec![1.0, 2.0]);
     }
 
-    // 中文注释：关键逻辑说明。
+    // 回滚后 shadow 必须回到稳定 active，否则下一次提交会夹带失败更新。
     #[test]
     fn test_sync_shadow_from_active() {
         let p = vec![Tensor::new(vec![5.0, 6.0], vec![2])];
         let db = DoubleBufferParams::new(&p);
 
-        // Modify shadow to something different
         {
             let shadow = db.shadow_params();
             let inner = shadow[0].0.read().unwrap();
@@ -147,7 +168,6 @@ mod tests {
         }
         assert_eq!(db.shadow_params()[0].data()[0], 99.0);
 
-        // Sync shadow from active
         db.sync_shadow_from_active();
         assert_eq!(db.shadow_params()[0].data(), vec![5.0, 6.0]);
     }

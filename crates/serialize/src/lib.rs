@@ -9,8 +9,8 @@ const MAGIC: u32 = 0x5350_5443; // "SPTC"
 const VERSION: u32 = 1;
 
 /// Save model parameters to a binary checkpoint file.
-/// Format: [magic:u32][version:u32][num_params:u32]
-///         for each param: [ndim:u32][shape...:u32][data...:f32]
+/// Format: `[magic:u32][version:u32][num_params:u32]`
+///         for each param: `[ndim:u32][shape...:u32][data...:f32]`
 pub fn save_checkpoint<P: AsRef<Path>>(path: P, params: &[Tensor]) -> io::Result<()> {
     let f = File::create(path)?;
     let mut w = BufWriter::new(f);

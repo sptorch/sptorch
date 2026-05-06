@@ -16,11 +16,19 @@ use crate::monitor::{MonitorAction, TrainingMonitor};
 
 static STARTED: OnceLock<AtomicBool> = OnceLock::new();
 
-// 中文注释：关键逻辑说明。
+/// 返回运行时启动标志。
+///
+/// 使用 `OnceLock<AtomicBool>` 是为了让库在没有显式 Runtime 对象的情况下也能
+/// 提供一个全局演化流，同时避免多次调用启动多个后台训练循环。
 fn started() -> &'static AtomicBool {
     STARTED.get_or_init(|| AtomicBool::new(false))
 }
-/// `ensure_runtime_started`：中文注释，说明函数用途、输入约束与输出语义。
+
+/// 启动在线进化后台循环，若已经启动则返回 `false`。
+///
+/// 该函数只负责启动一次事件源；调用者通常是 Studio bridge 或产品控制面。
+/// 真正的事件通过 [`crate::events::subscribe`] 订阅，避免把异步任务句柄暴露
+/// 给外部系统。
 pub fn ensure_runtime_started() -> bool {
     if started()
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -35,7 +43,11 @@ pub fn ensure_runtime_started() -> bool {
     true
 }
 
-// 中文注释：关键逻辑说明。
+/// 运行一个可观测的在线训练循环。
+///
+/// 当前循环仍是轻量模拟：它使用真实 `Tensor`、`SGD`、梯度缩放、双缓冲和
+/// 监控器，但样本与梯度由确定性序列生成。这样 Studio 和测试可以订阅真实
+/// 框架事件流，而不需要依赖某个产品仓或真实硬件。
 async fn run_loop() {
     let params = vec![Tensor::with_grad(vec![0.5, 0.25, -0.1, 0.9], vec![2, 2], true)];
     let db = DoubleBufferParams::new(&params);
@@ -81,6 +93,7 @@ async fn run_loop() {
                 p.accum_grad(&fake);
             }
 
+            // 梯度累积完成后按目标步数缩放，Studio 会把这个 scale 作为稳定性指标展示。
             let scale = 1.0 / (accum_target as f32);
             scale_gradients(&params, scale);
             trainer.optimizer_mut().step();
@@ -110,7 +123,11 @@ async fn run_loop() {
     }
 }
 
-// 中文注释：关键逻辑说明。
+/// 发布一次完整的 fence 状态机序列。
+///
+/// 真实硬件后端接入后，这里的 phase 应由 HAL FFI 的队列/fence 信号驱动。
+/// 当前模拟序列仍保持 Prepare -> WaitFence -> Swap -> Commit -> Done 顺序，
+/// 让 UI 和测试提前固定状态机契约。
 async fn emit_fence_sequence(version_id: u64) {
     let phases = [
         (FencePhase::Prepare, 0.2, 8, "prepare"),
@@ -147,7 +164,10 @@ async fn emit_fence_sequence(version_id: u64) {
     }
 }
 
-// 中文注释：关键逻辑说明。
+/// 发布 fence 错误并把硬件状态标记为不可在线。
+///
+/// 这条路径用于监控器触发回滚时通知外部控制面：本次 shadow 更新没有提交，
+/// 推理仍应继续锚定旧版本。
 fn emit_fence_error(message: String) {
     let fence = FenceState {
         phase: FencePhase::Error,
@@ -163,7 +183,10 @@ fn emit_fence_error(message: String) {
     }));
 }
 
-// 中文注释：关键逻辑说明。
+/// 发布一个新的版本提交节点。
+///
+/// `parent_version` 用简单线性链表示当前实现的版本历史。未来若支持分支
+/// 实验或多模型热切换，可以在 `VersionNode` 上扩展更丰富的 DAG 语义。
 fn emit_commit(version_id: u64, reason: &str) {
     publish(LiveEvolutionEvent::VersionCommit(VersionNode {
         version_id,
@@ -173,7 +196,10 @@ fn emit_commit(version_id: u64, reason: &str) {
     }));
 }
 
-// 中文注释：关键逻辑说明。
+/// 发布训练指标。
+///
+/// 指标携带当前 `version_id`，让请求级版本锚定可以把某次推理结果和当时的
+/// 模型快照关联起来。`fence` 字段只在状态机事件中填充。
 fn emit_metrics(
     loss: f32,
     grad_norm: f32,
@@ -195,7 +221,10 @@ fn emit_metrics(
     }));
 }
 
-// 中文注释：关键逻辑说明。
+/// 返回 Unix epoch 毫秒时间戳。
+///
+/// 系统时间异常时退回 0，避免监控事件因为时间源问题 panic；外部消费者应
+/// 把 0 视为不可用时间戳。
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

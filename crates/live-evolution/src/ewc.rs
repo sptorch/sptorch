@@ -1,23 +1,30 @@
 use sptorch_core_tensor::Tensor;
 
-/// Elastic Weight Consolidation (EWC) — prevents catastrophic forgetting
-/// by penalizing changes to parameters that were important for previous tasks.
+/// Elastic Weight Consolidation（EWC）正则器。
 ///
-/// Loss_total = Loss_new + (lambda/2) * sum_i F_i * (theta_i - theta_star_i)^2
+/// 在线学习最容易破坏旧任务能力。EWC 用上一阶段参数快照 `theta_star` 和
+/// Fisher 对角近似 `F_i` 衡量“哪些参数不能乱动”，并把如下惩罚项加到新任务
+/// loss 中：
 ///
-/// where F_i is the Fisher information (approximated by squared gradients)
-/// and theta_star is the parameter snapshot from the previous task.
+/// `Loss_total = Loss_new + (lambda / 2) * sum_i F_i * (theta_i - theta_star_i)^2`
+///
+/// 当前实现用平方梯度近似 Fisher，对小模型和增量训练足够直观；后续如果
+/// 引入更精确的 Fisher 估计，也应保持这里的外部语义不变。
 pub struct EWC {
-    /// Snapshot of parameters after previous task training
+    /// 上一个稳定版本的参数快照。
     param_snapshot: Vec<Vec<f32>>,
-    /// Fisher information diagonal (importance of each parameter)
+    /// Fisher 对角近似，值越大表示对应参数对旧任务越重要。
     fisher_diag: Vec<Vec<f32>>,
-    /// Regularization strength
+    /// 正则强度；越大越抗遗忘，但也越限制新任务适应能力。
     pub lambda: f32,
 }
 
 impl EWC {
-    /// `new`：中文注释，说明函数用途、输入约束与输出语义。
+    /// 从当前参数和对应梯度构建 EWC 正则器。
+    ///
+    /// `params` 与 `grads` 必须一一对应，且每个梯度向量长度应等于参数
+    /// 展平后的元素数。当前实现信任调用者，这是为了避免训练热路径重复做
+    /// shape 检查。
     pub fn new(params: &[Tensor], grads: &[Vec<f32>], lambda: f32) -> Self {
         let param_snapshot: Vec<Vec<f32>> = params.iter().map(|p| p.contiguous_data()).collect();
 
@@ -29,7 +36,11 @@ impl EWC {
             lambda,
         }
     }
-    /// `penalty`：中文注释，说明函数用途、输入约束与输出语义。
+
+    /// 计算当前参数相对快照的 EWC 惩罚值。
+    ///
+    /// 参数没有漂移时返回 0；重要参数（Fisher 大）漂移同样距离会产生更高
+    /// penalty，从而在训练目标里“拉回”旧能力。
     pub fn penalty(&self, current_params: &[Tensor]) -> f32 {
         let mut total = 0.0f32;
         for (i, param) in current_params.iter().enumerate() {
@@ -43,7 +54,12 @@ impl EWC {
         }
         self.lambda * 0.5 * total
     }
-    /// `penalty_grads`：中文注释，说明函数用途、输入约束与输出语义。
+
+    /// 计算 EWC 惩罚项对每个参数的梯度。
+    ///
+    /// 对 `lambda / 2 * F * (theta - theta_star)^2` 求导得到
+    /// `lambda * F * (theta - theta_star)`。调用者可将这些梯度加到正常
+    /// backprop 梯度上。
     pub fn penalty_grads(&self, current_params: &[Tensor]) -> Vec<Vec<f32>> {
         current_params
             .iter()
@@ -60,7 +76,11 @@ impl EWC {
             })
             .collect()
     }
-    /// `apply_penalty`：中文注释，说明函数用途、输入约束与输出语义。
+
+    /// 将 EWC 梯度原地叠加到参数已有梯度上。
+    ///
+    /// 如果某个参数还没有 grad tensor，会跳过它。这样 EWC 可以安全用于只
+    /// 训练部分层的场景，不会强行给冻结层创建梯度。
     pub fn apply_penalty(&self, params: &[Tensor]) {
         let penalty_grads = self.penalty_grads(params);
         for (param, pg) in params.iter().zip(penalty_grads.iter()) {
@@ -75,7 +95,8 @@ impl EWC {
             }
         }
     }
-    /// `num_params`：中文注释，说明函数用途、输入约束与输出语义。
+
+    /// 返回 EWC 管理的参数张量数量。
     pub fn num_params(&self) -> usize {
         self.param_snapshot.len()
     }
@@ -85,7 +106,7 @@ impl EWC {
 mod tests {
     use super::*;
 
-    // 中文注释：关键逻辑说明。
+    // 快照点 penalty 必须为 0，这是 EWC 不干扰已稳定版本的基本不变量。
     #[test]
     fn test_ewc_zero_penalty_at_snapshot() {
         let params = vec![
@@ -95,26 +116,24 @@ mod tests {
         let grads = vec![vec![0.1, 0.2, 0.3], vec![0.4, 0.5]];
         let ewc = EWC::new(&params, &grads, 1.0);
 
-        // At the snapshot point, penalty should be zero
         let penalty = ewc.penalty(&params);
         assert!(penalty.abs() < 1e-10);
     }
 
-    // 中文注释：关键逻辑说明。
+    // 漂移越大 penalty 越大，这直接决定在线更新是否会被监控/优化器压回。
     #[test]
     fn test_ewc_penalty_increases_with_drift() {
         let params = vec![Tensor::new(vec![1.0, 2.0], vec![2])];
         let grads = vec![vec![1.0, 1.0]]; // uniform Fisher
         let ewc = EWC::new(&params, &grads, 2.0);
 
-        // Drift params by 0.5
         let drifted = vec![Tensor::new(vec![1.5, 2.5], vec![2])];
         let penalty = ewc.penalty(&drifted);
         // lambda/2 * sum(F * diff^2) = 2.0/2 * (1.0*0.25 + 1.0*0.25) = 0.5
         assert!((penalty - 0.5).abs() < 1e-6);
     }
 
-    // 中文注释：关键逻辑说明。
+    // 梯度公式是 EWC 能否真正参与优化器更新的核心语义。
     #[test]
     fn test_ewc_penalty_grads() {
         let params = vec![Tensor::new(vec![1.0, 2.0], vec![2])];
@@ -129,18 +148,15 @@ mod tests {
         assert!((pg[0][1] - 4.0).abs() < 1e-6);
     }
 
-    // 中文注释：关键逻辑说明。
+    // Fisher 大的参数应该更“抗改”，这是防灾难性遗忘的直觉验收。
     #[test]
     fn test_ewc_high_fisher_resists_change() {
         let params = vec![Tensor::new(vec![1.0, 1.0], vec![2])];
-        // param[0] has high Fisher (important), param[1] has low Fisher
         let grads = vec![vec![10.0, 0.1]];
         let ewc = EWC::new(&params, &grads, 1.0);
 
         let drifted = vec![Tensor::new(vec![2.0, 2.0], vec![2])];
         let pg = ewc.penalty_grads(&drifted);
-        // param[0] penalty grad = 1.0 * 100.0 * 1.0 = 100.0 (strong resistance)
-        // param[1] penalty grad = 1.0 * 0.01 * 1.0 = 0.01 (weak resistance)
         assert!(pg[0][0] > pg[0][1] * 100.0);
     }
 }
