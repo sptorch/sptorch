@@ -72,7 +72,7 @@ impl Worker {
         Ok(averaged)
     }
 
-    /// Barrier synchronization — blocks until all workers reach this point.
+    /// 分布式屏障同步：阻塞直到所有 worker 都到达同一 step。
     pub async fn barrier(&mut self, step: u64) -> Result<(), Box<dyn std::error::Error>> {
         self.client
             .barrier(BarrierRequest {

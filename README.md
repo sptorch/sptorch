@@ -34,8 +34,6 @@ crates/
   runtime-cuda/     CUDA backend kernels and cuBLAS matmul
   distributed/      gRPC coordinator/worker, AllReduce, Barrier, hardware-aware parallel plans
   live-evolution/   Double-buffer parameters, EWC, online monitoring and rollback
-  cli-train/        CPU MiniGPT training entry
-  cli-train-gpu/    GPU training entry
   versioning/       Versioned tensor protocol shared with Studio
 ```
 
@@ -59,11 +57,8 @@ External ecosystem repositories:
 # Framework tests
 cargo test --workspace
 
-# CPU MiniGPT training
-cargo run --release -p sptorch-cli-train
-
-# GPU training, requires CUDA 12.x
-cargo run --release -p sptorch-cli-train-gpu
+# Framework checks
+cargo check --workspace
 ```
 
 Product and IDE commands are owned by their independent repositories:
@@ -73,16 +68,22 @@ cd ../text2sql && cargo test --workspace
 cd ../sptorch-studio && npm run test
 ```
 
+Engineering tool commands (local training/demo) are owned by the independent tools repository:
+
+```bash
+cd ../sptorch-tools && cargo check --workspace
+```
+
 ## Release Notes
 
-- Publishing and version strategy: [docs.release-strategy.md](docs.release-strategy.md).
-- crates.io publish order: [docs.publish-order.md](docs.publish-order.md).
-- Current roadmap and acceptance record: [roadmap.md](roadmap.md).
+- Publishing and version strategy: [docs/docs.release-strategy.md](docs/docs.release-strategy.md).
+- crates.io publish order: [docs/docs.publish-order.md](docs/docs.publish-order.md).
+- Current roadmap and acceptance record: [docs/roadmap.md](docs/roadmap.md).
 
 ## Current Release Checklist
 
 - [x] `sptorch` facade metadata is filled in.
-- [x] Non-published framework targets are marked `publish = false`: `sptorch-cli-train`, `sptorch-cli-train-gpu`, `sptorch-mock-npu`.
+- [x] Non-published framework target is marked `publish = false`: `sptorch-mock-npu`.
 - [x] `sptorch-core-tensor`, `sptorch-data`, and `sptorch-versioning` have package metadata and README baselines.
 - [ ] `cargo package -p sptorch` still requires publishing internal dependency crates first.
 

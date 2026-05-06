@@ -17,6 +17,7 @@ pub enum TransportKind {
 }
 
 impl fmt::Display for TransportKind {
+    // 中文注释：关键逻辑说明。
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             TransportKind::Serial => "serial",
@@ -37,6 +38,7 @@ pub enum LinkRole {
 }
 
 impl fmt::Display for LinkRole {
+    // 中文注释：关键逻辑说明。
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             LinkRole::Control => "control",
@@ -58,6 +60,7 @@ pub struct HardwareNode {
 }
 
 impl HardwareNode {
+    /// `new`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn new(id: DeviceId, label: impl Into<String>, board_class: impl Into<String>, memory_mb: u32) -> Self {
         Self {
             id,
@@ -83,6 +86,7 @@ pub struct HardwareLink {
 }
 
 impl HardwareLink {
+    /// `new`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn new(
         from: DeviceId,
         to: DeviceId,
@@ -112,6 +116,7 @@ pub struct HardwareTopology {
 }
 
 impl HardwareTopology {
+    /// `new`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -119,27 +124,27 @@ impl HardwareTopology {
             links: Vec::new(),
         }
     }
-
+    /// `add_node`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn add_node(&mut self, node: HardwareNode) {
         self.nodes.push(node);
     }
-
+    /// `add_link`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn add_link(&mut self, link: HardwareLink) {
         self.links.push(link);
     }
-
+    /// `node`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn node(&self, id: &DeviceId) -> Option<&HardwareNode> {
         self.nodes.iter().find(|node| &node.id == id)
     }
-
+    /// `neighbors`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn neighbors(&self, id: &DeviceId) -> Vec<&HardwareLink> {
         self.links.iter().filter(|link| &link.from == id).collect()
     }
-
+    /// `online_node_count`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn online_node_count(&self) -> usize {
         self.nodes.iter().filter(|node| node.online).count()
     }
-
+    /// `validate_connectivity`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn validate_connectivity(&self) -> TopologyValidation {
         let mut diagnostics = Vec::new();
         let mut graph: HashMap<&DeviceId, Vec<&DeviceId>> = HashMap::new();
@@ -204,13 +209,13 @@ impl HardwareTopology {
             diagnostics,
         }
     }
-
+    /// `ring_plan`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn ring_plan(&self) -> Vec<DeviceId> {
         let mut nodes = self.nodes.iter().map(|n| n.id.clone()).collect::<Vec<_>>();
         nodes.sort_by(|a, b| a.backend.cmp(&b.backend).then(a.ordinal.cmp(&b.ordinal)));
         nodes
     }
-
+    /// `allreduce_cost_estimate`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn allreduce_cost_estimate(&self, payload_bytes: usize) -> Option<AllReduceEstimate> {
         if self.nodes.len() < 2 {
             return None;
@@ -251,7 +256,7 @@ impl HardwareTopology {
             latency_us,
         })
     }
-
+    /// `matmul_partition_plan`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn matmul_partition_plan(&self, m: usize, k: usize, n: usize) -> MatmulPartitionPlan {
         let nodes = self.ring_plan();
         let tile_rows = std::cmp::max(1, m / nodes.len().max(1));
@@ -323,6 +328,7 @@ pub struct MatmulPartitionPlan {
 mod tests {
     use super::*;
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn tank9k_ring_topology_validates_and_plans() {
         let a = DeviceId::tank9k(0);
@@ -378,6 +384,7 @@ mod tests {
         assert_eq!(partition.shards[2].device, c);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn detects_missing_links() {
         let mut topo = HardwareTopology::new("broken");

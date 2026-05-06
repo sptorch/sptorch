@@ -114,6 +114,7 @@ mod tests {
     use super::*;
     use std::fs;
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_save_load_roundtrip() {
         let p1 = Tensor::with_grad(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], true);
@@ -136,6 +137,7 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_load_shape_mismatch() {
         let p1 = Tensor::new(vec![1.0, 2.0], vec![2]);

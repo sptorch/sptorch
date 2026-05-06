@@ -16,20 +16,21 @@ pub struct DeviceId {
 }
 
 impl DeviceId {
+    /// `cpu`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn cpu() -> Self {
         DeviceId {
             backend: "cpu".into(),
             ordinal: 0,
         }
     }
-
+    /// `cuda`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn cuda(ordinal: usize) -> Self {
         DeviceId {
             backend: "cuda".into(),
             ordinal,
         }
     }
-
+    /// `tank9k`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn tank9k(ordinal: usize) -> Self {
         DeviceId {
             backend: "tank9k".into(),
@@ -39,6 +40,7 @@ impl DeviceId {
 }
 
 impl fmt::Display for DeviceId {
+    // 中文注释：关键逻辑说明。
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}:{}", self.backend, self.ordinal)
     }
@@ -50,6 +52,7 @@ pub struct RawBuffer {
 }
 
 impl fmt::Debug for RawBuffer {
+    // 中文注释：关键逻辑说明。
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RawBuffer")
             .field("len", &self.data.len())
@@ -68,6 +71,7 @@ pub enum HalError {
 }
 
 impl fmt::Display for HalError {
+    // 中文注释：关键逻辑说明。
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             HalError::DeviceNotFound(id) => write!(f, "device not found: {}", id),
@@ -90,43 +94,60 @@ impl std::error::Error for HalError {}
 pub type HalResult<T> = Result<T, HalError>;
 
 pub trait Backend: Send + Sync + 'static {
+    // 中文注释：关键逻辑说明。
     fn name(&self) -> &str;
+    // 中文注释：关键逻辑说明。
     fn device_id(&self) -> DeviceId;
+    // 中文注释：关键逻辑说明。
     fn allocate(&self, size: usize) -> HalResult<RawBuffer>;
+    // 中文注释：关键逻辑说明。
     fn copy_to_host(&self, buf: &RawBuffer, dst: &mut [u8]) -> HalResult<()>;
+    // 中文注释：关键逻辑说明。
     fn copy_from_host(&self, src: &[u8], buf: &mut RawBuffer) -> HalResult<()>;
+    // 中文注释：关键逻辑说明。
     fn synchronize(&self) -> HalResult<()>;
 }
 
 pub trait KernelProvider: Backend {
     // ---- element-wise binary ----
     fn add_f32(&self, a: &[f32], b: &[f32], out: &mut [f32]);
+    // 中文注释：关键逻辑说明。
     fn mul_f32(&self, a: &[f32], b: &[f32], out: &mut [f32]);
 
     // ---- element-wise unary ----
     fn neg_f32(&self, a: &[f32], out: &mut [f32]);
+    // 中文注释：关键逻辑说明。
     fn exp_f32(&self, a: &[f32], out: &mut [f32]);
+    // 中文注释：关键逻辑说明。
     fn log_f32(&self, a: &[f32], out: &mut [f32]);
+    // 中文注释：关键逻辑说明。
     fn relu_f32(&self, a: &[f32], out: &mut [f32]);
+    // 中文注释：关键逻辑说明。
     fn gelu_f32(&self, a: &[f32], out: &mut [f32]);
+    // 中文注释：关键逻辑说明。
     fn scale_f32(&self, a: &[f32], scalar: f32, out: &mut [f32]);
 
     // ---- matmul ----
     fn matmul_f32(&self, a: &[f32], b: &[f32], out: &mut [f32], m: usize, k: usize, n: usize);
+    // 中文注释：关键逻辑说明。
     #[allow(clippy::too_many_arguments)]
     fn batch_matmul_f32(&self, a: &[f32], b: &[f32], out: &mut [f32], batch: usize, m: usize, k: usize, n: usize);
 
     // ---- reduction ----
     fn sum_f32(&self, a: &[f32]) -> f32;
+    // 中文注释：关键逻辑说明。
     fn softmax_f32(&self, a: &[f32], out: &mut [f32], rows: usize, cols: usize);
 
     // ---- misc ----
     fn masked_fill_f32(&self, a: &[f32], mask: &[bool], fill_value: f32, out: &mut [f32]);
+    // 中文注释：关键逻辑说明。
     fn broadcast_add_f32(&self, a: &[f32], b: &[f32], out: &mut [f32], a_len: usize, b_len: usize);
+    // 中文注释：关键逻辑说明。
     fn embedding_lookup_f32(&self, weight: &[f32], indices: &[usize], out: &mut [f32], vocab: usize, dim: usize);
 
     // ---- optimizer kernels ----
     fn sgd_update_f32(&self, params: &mut [f32], grad: &[f32], lr: f32);
+    // 中文注释：关键逻辑说明。
     #[allow(clippy::too_many_arguments)]
     fn adam_update_f32(
         &self,
@@ -147,14 +168,17 @@ pub trait KernelProvider: Backend {
 pub struct CpuBackend;
 
 impl Backend for CpuBackend {
+    // 中文注释：关键逻辑说明。
     fn name(&self) -> &str {
         "cpu"
     }
 
+    // 中文注释：关键逻辑说明。
     fn device_id(&self) -> DeviceId {
         DeviceId::cpu()
     }
 
+    // 中文注释：关键逻辑说明。
     fn allocate(&self, size: usize) -> HalResult<RawBuffer> {
         Ok(RawBuffer {
             data: vec![0u8; size],
@@ -162,58 +186,68 @@ impl Backend for CpuBackend {
         })
     }
 
+    // 中文注释：关键逻辑说明。
     fn copy_to_host(&self, buf: &RawBuffer, dst: &mut [u8]) -> HalResult<()> {
         dst.copy_from_slice(&buf.data);
         Ok(())
     }
 
+    // 中文注释：关键逻辑说明。
     fn copy_from_host(&self, src: &[u8], buf: &mut RawBuffer) -> HalResult<()> {
         buf.data.copy_from_slice(src);
         Ok(())
     }
 
+    // 中文注释：关键逻辑说明。
     fn synchronize(&self) -> HalResult<()> {
         Ok(())
     }
 }
 
 impl KernelProvider for CpuBackend {
+    // 中文注释：关键逻辑说明。
     fn add_f32(&self, a: &[f32], b: &[f32], out: &mut [f32]) {
         for i in 0..out.len() {
             out[i] = a[i] + b[i];
         }
     }
 
+    // 中文注释：关键逻辑说明。
     fn mul_f32(&self, a: &[f32], b: &[f32], out: &mut [f32]) {
         for i in 0..out.len() {
             out[i] = a[i] * b[i];
         }
     }
 
+    // 中文注释：关键逻辑说明。
     fn neg_f32(&self, a: &[f32], out: &mut [f32]) {
         for i in 0..out.len() {
             out[i] = -a[i];
         }
     }
 
+    // 中文注释：关键逻辑说明。
     fn exp_f32(&self, a: &[f32], out: &mut [f32]) {
         for i in 0..out.len() {
             out[i] = a[i].exp();
         }
     }
 
+    // 中文注释：关键逻辑说明。
     fn log_f32(&self, a: &[f32], out: &mut [f32]) {
         for i in 0..out.len() {
             out[i] = a[i].ln();
         }
     }
 
+    // 中文注释：关键逻辑说明。
     fn relu_f32(&self, a: &[f32], out: &mut [f32]) {
         for i in 0..out.len() {
             out[i] = if a[i] > 0.0 { a[i] } else { 0.0 };
         }
     }
 
+    // 中文注释：关键逻辑说明。
     fn gelu_f32(&self, a: &[f32], out: &mut [f32]) {
         for i in 0..out.len() {
             let x = a[i];
@@ -221,12 +255,14 @@ impl KernelProvider for CpuBackend {
         }
     }
 
+    // 中文注释：关键逻辑说明。
     fn scale_f32(&self, a: &[f32], scalar: f32, out: &mut [f32]) {
         for i in 0..out.len() {
             out[i] = a[i] * scalar;
         }
     }
 
+    // 中文注释：关键逻辑说明。
     fn matmul_f32(&self, a: &[f32], b: &[f32], out: &mut [f32], m: usize, k: usize, n: usize) {
         for i in 0..m {
             for j in 0..n {
@@ -239,6 +275,7 @@ impl KernelProvider for CpuBackend {
         }
     }
 
+    // 中文注释：关键逻辑说明。
     fn batch_matmul_f32(&self, a: &[f32], b: &[f32], out: &mut [f32], batch: usize, m: usize, k: usize, n: usize) {
         let a_stride = m * k;
         let b_stride = k * n;
@@ -258,10 +295,12 @@ impl KernelProvider for CpuBackend {
         }
     }
 
+    // 中文注释：关键逻辑说明。
     fn sum_f32(&self, a: &[f32]) -> f32 {
         a.iter().sum()
     }
 
+    // 中文注释：关键逻辑说明。
     fn softmax_f32(&self, a: &[f32], out: &mut [f32], rows: usize, cols: usize) {
         for r in 0..rows {
             let row = &a[r * cols..(r + 1) * cols];
@@ -278,30 +317,35 @@ impl KernelProvider for CpuBackend {
         }
     }
 
+    // 中文注释：关键逻辑说明。
     fn masked_fill_f32(&self, a: &[f32], mask: &[bool], fill_value: f32, out: &mut [f32]) {
         for i in 0..a.len() {
             out[i] = if mask[i] { fill_value } else { a[i] };
         }
     }
 
+    // 中文注释：关键逻辑说明。
     fn broadcast_add_f32(&self, a: &[f32], b: &[f32], out: &mut [f32], a_len: usize, b_len: usize) {
         for i in 0..a_len {
             out[i] = a[i] + b[i % b_len];
         }
     }
 
+    // 中文注释：关键逻辑说明。
     fn embedding_lookup_f32(&self, weight: &[f32], indices: &[usize], out: &mut [f32], _vocab: usize, dim: usize) {
         for (i, &idx) in indices.iter().enumerate() {
             out[i * dim..(i + 1) * dim].copy_from_slice(&weight[idx * dim..(idx + 1) * dim]);
         }
     }
 
+    // 中文注释：关键逻辑说明。
     fn sgd_update_f32(&self, params: &mut [f32], grad: &[f32], lr: f32) {
         for (w, g) in params.iter_mut().zip(grad.iter()) {
             *w -= lr * g;
         }
     }
 
+    // 中文注释：关键逻辑说明。
     fn adam_update_f32(
         &self,
         params: &mut [f32],
@@ -333,6 +377,7 @@ impl KernelProvider for CpuBackend {
 mod tests {
     use super::*;
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_cpu_backend_add() {
         let backend = CpuBackend;
@@ -343,6 +388,7 @@ mod tests {
         assert_eq!(out, vec![5.0, 7.0, 9.0]);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_cpu_backend_mul() {
         let backend = CpuBackend;
@@ -353,6 +399,7 @@ mod tests {
         assert_eq!(out, vec![8.0, 15.0]);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_cpu_backend_matmul() {
         let backend = CpuBackend;
@@ -364,6 +411,7 @@ mod tests {
         assert_eq!(out, vec![58.0, 64.0, 139.0, 154.0]);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_cpu_backend_allocate() {
         let backend = CpuBackend;
@@ -372,6 +420,7 @@ mod tests {
         assert_eq!(buf.device, DeviceId::cpu());
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_cpu_backend_neg() {
         let backend = CpuBackend;
@@ -381,6 +430,7 @@ mod tests {
         assert_eq!(out, vec![-1.0, 2.0, -3.0]);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_cpu_backend_exp_log() {
         let backend = CpuBackend;
@@ -397,6 +447,7 @@ mod tests {
         }
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_cpu_backend_relu() {
         let backend = CpuBackend;
@@ -406,6 +457,7 @@ mod tests {
         assert_eq!(out, vec![0.0, 0.0, 2.0, 0.0]);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_cpu_backend_gelu() {
         let backend = CpuBackend;
@@ -417,6 +469,7 @@ mod tests {
         assert!((out[2] - (-0.1587)).abs() < 1e-3);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_cpu_backend_scale() {
         let backend = CpuBackend;
@@ -426,6 +479,7 @@ mod tests {
         assert_eq!(out, vec![0.5, 1.0, 1.5]);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_cpu_backend_softmax() {
         let backend = CpuBackend;
@@ -437,6 +491,7 @@ mod tests {
         assert!(out[2] > out[1] && out[1] > out[0]);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_cpu_backend_batch_matmul() {
         let backend = CpuBackend;
@@ -448,6 +503,7 @@ mod tests {
         assert_eq!(out, a);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_cpu_backend_sgd_update() {
         let backend = CpuBackend;
@@ -458,6 +514,7 @@ mod tests {
         assert!((params[1] - 1.98).abs() < 1e-6);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_cpu_backend_embedding() {
         let backend = CpuBackend;
@@ -469,6 +526,7 @@ mod tests {
         assert_eq!(out, vec![0.5, 0.6, 0.1, 0.2, 0.3, 0.4]);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_cpu_backend_masked_fill() {
         let backend = CpuBackend;
@@ -479,6 +537,7 @@ mod tests {
         assert_eq!(out, vec![1.0, -999.0, 3.0, -999.0]);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_cpu_backend_broadcast_add() {
         let backend = CpuBackend;

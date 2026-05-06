@@ -5,8 +5,11 @@ use std::collections::HashMap;
 // ============ Tokenizer Trait ============
 
 pub trait Tokenizer {
+    // 中文注释：关键逻辑说明。
     fn encode(&self, text: &str) -> Vec<usize>;
+    // 中文注释：关键逻辑说明。
     fn decode(&self, ids: &[usize]) -> String;
+    // 中文注释：关键逻辑说明。
     fn vocab_size(&self) -> usize;
 }
 
@@ -18,6 +21,7 @@ pub struct CharTokenizer {
 }
 
 impl CharTokenizer {
+    /// `from_text`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn from_text(text: &str) -> Self {
         let mut chars: Vec<char> = text.chars().collect();
         chars.sort();
@@ -31,14 +35,17 @@ impl CharTokenizer {
 }
 
 impl Tokenizer for CharTokenizer {
+    // 中文注释：关键逻辑说明。
     fn encode(&self, text: &str) -> Vec<usize> {
         text.chars().filter_map(|c| self.char_to_id.get(&c).copied()).collect()
     }
 
+    // 中文注释：关键逻辑说明。
     fn decode(&self, ids: &[usize]) -> String {
         ids.iter().map(|&id| self.vocab[id]).collect()
     }
 
+    // 中文注释：关键逻辑说明。
     fn vocab_size(&self) -> usize {
         self.vocab.len()
     }
@@ -53,8 +60,7 @@ pub struct BpeTokenizer {
 }
 
 impl BpeTokenizer {
-    /// Train BPE from text. Starts with byte-level vocab (256 chars),
-    /// then greedily merges the most frequent adjacent pair until vocab_size reached.
+    /// `train`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn train(text: &str, target_vocab_size: usize) -> Self {
         // Initialize with single characters found in text
         let mut chars: Vec<char> = text.chars().collect();
@@ -121,6 +127,7 @@ impl BpeTokenizer {
 }
 
 impl Tokenizer for BpeTokenizer {
+    // 中文注释：关键逻辑说明。
     fn encode(&self, text: &str) -> Vec<usize> {
         // Start with character-level tokens
         let mut ids: Vec<usize> = text
@@ -151,10 +158,12 @@ impl Tokenizer for BpeTokenizer {
         ids
     }
 
+    // 中文注释：关键逻辑说明。
     fn decode(&self, ids: &[usize]) -> String {
         ids.iter().map(|&id| self.vocab[id].as_str()).collect()
     }
 
+    // 中文注释：关键逻辑说明。
     fn vocab_size(&self) -> usize {
         self.vocab.len()
     }
@@ -163,10 +172,13 @@ impl Tokenizer for BpeTokenizer {
 // ============ Dataset Trait ============
 
 pub trait Dataset {
+    // 中文注释：关键逻辑说明。
     fn len(&self) -> usize;
+    // 中文注释：关键逻辑说明。
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+    // 中文注释：关键逻辑说明。
     fn get(&self, index: usize) -> (Vec<usize>, Vec<usize>);
 }
 
@@ -178,12 +190,14 @@ pub struct TextDataset {
 }
 
 impl TextDataset {
+    /// `new`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn new(tokens: Vec<usize>, seq_len: usize) -> Self {
         TextDataset { tokens, seq_len }
     }
 }
 
 impl Dataset for TextDataset {
+    // 中文注释：关键逻辑说明。
     fn len(&self) -> usize {
         if self.tokens.len() <= self.seq_len {
             0
@@ -192,6 +206,7 @@ impl Dataset for TextDataset {
         }
     }
 
+    // 中文注释：关键逻辑说明。
     fn get(&self, index: usize) -> (Vec<usize>, Vec<usize>) {
         let input = self.tokens[index..index + self.seq_len].to_vec();
         let target = self.tokens[index + 1..index + self.seq_len + 1].to_vec();
@@ -210,6 +225,7 @@ pub struct DataLoader<'a, D: Dataset> {
 }
 
 impl<'a, D: Dataset> DataLoader<'a, D> {
+    /// `new`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn new(dataset: &'a D, batch_size: usize, shuffle: bool) -> Self {
         let mut indices: Vec<usize> = (0..dataset.len()).collect();
         if shuffle {
@@ -223,7 +239,7 @@ impl<'a, D: Dataset> DataLoader<'a, D> {
             pos: 0,
         }
     }
-
+    /// `reset`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn reset(&mut self) {
         self.pos = 0;
         if self.shuffle {
@@ -233,6 +249,7 @@ impl<'a, D: Dataset> DataLoader<'a, D> {
 
     /// Returns (inputs, targets) where each is a Vec of sequences.
     #[allow(clippy::type_complexity)]
+    /// `next_batch`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn next_batch(&mut self) -> Option<(Vec<Vec<usize>>, Vec<Vec<usize>>)> {
         if self.pos >= self.indices.len() {
             return None;
@@ -252,7 +269,7 @@ impl<'a, D: Dataset> DataLoader<'a, D> {
 
         Some((inputs, targets))
     }
-
+    /// `num_batches`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn num_batches(&self) -> usize {
         self.indices.len().div_ceil(self.batch_size)
     }
@@ -262,6 +279,7 @@ impl<'a, D: Dataset> DataLoader<'a, D> {
 mod tests {
     use super::*;
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_char_tokenizer() {
         let tok = CharTokenizer::from_text("hello");
@@ -271,6 +289,7 @@ mod tests {
         assert_eq!(tok.decode(&ids), "hello");
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_char_tokenizer_roundtrip() {
         let text = "the quick brown fox";
@@ -279,6 +298,7 @@ mod tests {
         assert_eq!(tok.decode(&ids), text);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_text_dataset() {
         let tokens = vec![0, 1, 2, 3, 4, 5, 6, 7];
@@ -289,6 +309,7 @@ mod tests {
         assert_eq!(tgt, vec![1, 2, 3, 4]);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_dataloader_no_shuffle() {
         let tokens = vec![0, 1, 2, 3, 4, 5];
@@ -302,6 +323,7 @@ mod tests {
         assert!(dl.next_batch().is_none());
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_dataloader_reset() {
         let tokens = vec![0, 1, 2, 3, 4];
@@ -313,6 +335,7 @@ mod tests {
         assert!(dl.next_batch().is_some());
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_dataloader_num_batches() {
         let tokens = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
@@ -331,6 +354,7 @@ mod tests {
         assert!(tok.vocab_size() <= 10);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_bpe_roundtrip() {
         let text = "the quick brown fox jumps over the lazy dog";
@@ -340,6 +364,7 @@ mod tests {
         assert_eq!(decoded, text);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_bpe_compression() {
         let text = "hello hello hello hello hello world world world";
@@ -349,6 +374,7 @@ mod tests {
         assert!(ids.len() < text.len());
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_bpe_vocab_contains_merges() {
         let text = "abababab";

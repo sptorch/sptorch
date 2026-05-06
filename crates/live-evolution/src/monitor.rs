@@ -20,6 +20,7 @@ pub enum MonitorAction {
 }
 
 impl TrainingMonitor {
+    /// `new`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn new(window_size: usize, degradation_threshold: f32) -> Self {
         TrainingMonitor {
             loss_history: Vec::new(),
@@ -30,8 +31,7 @@ impl TrainingMonitor {
             rollback_count: 0,
         }
     }
-
-    /// Record a new loss value and check for degradation.
+    /// `record_loss`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn record_loss(&mut self, loss: f32) -> MonitorAction {
         self.loss_history.push(loss);
         self.total_samples += 1;
@@ -61,27 +61,26 @@ impl TrainingMonitor {
 
         MonitorAction::Continue
     }
-
-    /// Reset the monitor after a rollback (keep best_avg, clear history).
+    /// `reset_after_rollback`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn reset_after_rollback(&mut self) {
         self.loss_history.clear();
     }
-
+    /// `rolling_avg`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn rolling_avg(&self) -> f32 {
         if self.loss_history.is_empty() {
             return f32::MAX;
         }
         self.loss_history.iter().sum::<f32>() / self.loss_history.len() as f32
     }
-
+    /// `best_avg_loss`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn best_avg_loss(&self) -> f32 {
         self.best_avg_loss
     }
-
+    /// `total_samples`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn total_samples(&self) -> u64 {
         self.total_samples
     }
-
+    /// `rollback_count`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn rollback_count(&self) -> u32 {
         self.rollback_count
     }
@@ -91,6 +90,7 @@ impl TrainingMonitor {
 mod tests {
     use super::*;
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_monitor_improving_loss() {
         let mut mon = TrainingMonitor::new(3, 0.2);
@@ -101,6 +101,7 @@ mod tests {
         assert!(mon.best_avg_loss() < 2.5);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_monitor_triggers_rollback() {
         let mut mon = TrainingMonitor::new(3, 0.1); // 10% threshold
@@ -124,6 +125,7 @@ mod tests {
         assert!(mon.rollback_count() >= 1);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_monitor_no_rollback_within_threshold() {
         let mut mon = TrainingMonitor::new(3, 0.5); // 50% threshold (lenient)
@@ -138,6 +140,7 @@ mod tests {
         assert_eq!(action, MonitorAction::Continue);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_monitor_reset_after_rollback() {
         let mut mon = TrainingMonitor::new(2, 0.1);
@@ -151,6 +154,7 @@ mod tests {
         assert!((mon.best_avg_loss() - 1.0).abs() < 1e-6); // best preserved
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_monitor_sample_count() {
         let mut mon = TrainingMonitor::new(3, 0.2);

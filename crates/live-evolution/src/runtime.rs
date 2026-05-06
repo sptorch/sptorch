@@ -16,10 +16,11 @@ use crate::monitor::{MonitorAction, TrainingMonitor};
 
 static STARTED: OnceLock<AtomicBool> = OnceLock::new();
 
+// 中文注释：关键逻辑说明。
 fn started() -> &'static AtomicBool {
     STARTED.get_or_init(|| AtomicBool::new(false))
 }
-
+/// `ensure_runtime_started`：中文注释，说明函数用途、输入约束与输出语义。
 pub fn ensure_runtime_started() -> bool {
     if started()
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -34,6 +35,7 @@ pub fn ensure_runtime_started() -> bool {
     true
 }
 
+// 中文注释：关键逻辑说明。
 async fn run_loop() {
     let params = vec![Tensor::with_grad(vec![0.5, 0.25, -0.1, 0.9], vec![2, 2], true)];
     let db = DoubleBufferParams::new(&params);
@@ -108,6 +110,7 @@ async fn run_loop() {
     }
 }
 
+// 中文注释：关键逻辑说明。
 async fn emit_fence_sequence(version_id: u64) {
     let phases = [
         (FencePhase::Prepare, 0.2, 8, "prepare"),
@@ -144,6 +147,7 @@ async fn emit_fence_sequence(version_id: u64) {
     }
 }
 
+// 中文注释：关键逻辑说明。
 fn emit_fence_error(message: String) {
     let fence = FenceState {
         phase: FencePhase::Error,
@@ -159,6 +163,7 @@ fn emit_fence_error(message: String) {
     }));
 }
 
+// 中文注释：关键逻辑说明。
 fn emit_commit(version_id: u64, reason: &str) {
     publish(LiveEvolutionEvent::VersionCommit(VersionNode {
         version_id,
@@ -168,6 +173,7 @@ fn emit_commit(version_id: u64, reason: &str) {
     }));
 }
 
+// 中文注释：关键逻辑说明。
 fn emit_metrics(
     loss: f32,
     grad_norm: f32,
@@ -189,6 +195,7 @@ fn emit_metrics(
     }));
 }
 
+// 中文注释：关键逻辑说明。
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

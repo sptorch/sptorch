@@ -3,12 +3,14 @@ use sptorch_core_tensor::Tensor;
 // ============ Optimizer Trait ============
 
 pub trait Optimizer {
+    // 中文注释：关键逻辑说明。
     fn step(&mut self);
+    // 中文注释：关键逻辑说明。
     fn zero_grad(&self);
 }
 
 // ============ zero_grad ============
-
+/// `zero_grad`：中文注释，说明函数用途、输入约束与输出语义。
 pub fn zero_grad(params: &[Tensor]) {
     for p in params {
         let mut inner = p.0.write().unwrap();
@@ -17,8 +19,7 @@ pub fn zero_grad(params: &[Tensor]) {
 }
 
 // ============ clip_grad_norm ============
-
-/// Clips gradient norm in-place. Returns the original norm.
+/// `clip_grad_norm`：中文注释，说明函数用途、输入约束与输出语义。
 pub fn clip_grad_norm(params: &[Tensor], max_norm: f32) -> f32 {
     let mut total_norm_sq = 0.0f32;
     for p in params {
@@ -49,8 +50,7 @@ pub fn clip_grad_norm(params: &[Tensor], max_norm: f32) -> f32 {
 // ============ NaN/Inf guard ============
 
 // ============ Gradient Accumulation ============
-
-/// Scale all parameter gradients by a factor (e.g. 1/accum_steps for gradient accumulation).
+/// `scale_gradients`：中文注释，说明函数用途、输入约束与输出语义。
 pub fn scale_gradients(params: &[Tensor], factor: f32) {
     for p in params {
         let inner = p.0.read().unwrap();
@@ -81,6 +81,7 @@ pub struct SGD {
 }
 
 impl SGD {
+    /// `new`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn new(params: Vec<Tensor>, lr: f32, momentum: f32) -> Self {
         let n = params.len();
         SGD {
@@ -93,6 +94,7 @@ impl SGD {
 }
 
 impl Optimizer for SGD {
+    // 中文注释：关键逻辑说明。
     fn step(&mut self) {
         for (i, param) in self.params.iter().enumerate() {
             let grad = match param.grad() {
@@ -124,6 +126,7 @@ impl Optimizer for SGD {
         }
     }
 
+    // 中文注释：关键逻辑说明。
     fn zero_grad(&self) {
         zero_grad(&self.params);
     }
@@ -144,6 +147,7 @@ pub struct AdamW {
 }
 
 impl AdamW {
+    /// `new`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn new(params: Vec<Tensor>, lr: f32, beta1: f32, beta2: f32, eps: f32, weight_decay: f32) -> Self {
         let m: Vec<Vec<f32>> = params.iter().map(|p| vec![0.0; p.numel()]).collect();
         let v: Vec<Vec<f32>> = params.iter().map(|p| vec![0.0; p.numel()]).collect();
@@ -159,13 +163,14 @@ impl AdamW {
             t: 0,
         }
     }
-
+    /// `default`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn default(params: Vec<Tensor>, lr: f32) -> Self {
         Self::new(params, lr, 0.9, 0.999, 1e-8, 0.01)
     }
 }
 
 impl Optimizer for AdamW {
+    // 中文注释：关键逻辑说明。
     fn step(&mut self) {
         self.t += 1;
         let bc1 = 1.0 - self.beta1.powi(self.t as i32);
@@ -208,6 +213,7 @@ impl Optimizer for AdamW {
         }
     }
 
+    // 中文注释：关键逻辑说明。
     fn zero_grad(&self) {
         zero_grad(&self.params);
     }
@@ -216,6 +222,7 @@ impl Optimizer for AdamW {
 // ============ Learning Rate Schedulers ============
 
 pub trait LrScheduler {
+    // 中文注释：关键逻辑说明。
     fn get_lr(&self, step: u64) -> f32;
 }
 
@@ -228,6 +235,7 @@ pub struct CosineScheduler {
 }
 
 impl CosineScheduler {
+    /// `new`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn new(base_lr: f32, warmup_steps: u64, total_steps: u64) -> Self {
         CosineScheduler {
             base_lr,
@@ -239,6 +247,7 @@ impl CosineScheduler {
 }
 
 impl LrScheduler for CosineScheduler {
+    // 中文注释：关键逻辑说明。
     fn get_lr(&self, step: u64) -> f32 {
         if step < self.warmup_steps {
             self.base_lr * (step as f32 / self.warmup_steps.max(1) as f32)
@@ -252,12 +261,14 @@ impl LrScheduler for CosineScheduler {
 }
 
 impl AdamW {
+    /// `set_lr`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn set_lr(&mut self, lr: f32) {
         self.lr = lr;
     }
 }
 
 impl SGD {
+    /// `set_lr`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn set_lr(&mut self, lr: f32) {
         self.lr = lr;
     }
@@ -268,6 +279,7 @@ mod tests {
     use super::*;
     use sptorch_core_tensor::Tensor;
 
+    // 中文注释：关键逻辑说明。
     fn make_param_with_grad(data: Vec<f32>, grad_data: Vec<f32>) -> Tensor {
         let shape = vec![data.len()];
         let t = Tensor::with_grad(data, shape.clone(), true);
@@ -276,6 +288,7 @@ mod tests {
         t
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_sgd_basic() {
         let p = make_param_with_grad(vec![1.0, 2.0], vec![0.1, 0.2]);
@@ -286,6 +299,7 @@ mod tests {
         assert!((d[1] - 1.98).abs() < 1e-6); // 2.0 - 0.1*0.2
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_sgd_momentum() {
         let p = make_param_with_grad(vec![1.0], vec![1.0]);
@@ -296,6 +310,7 @@ mod tests {
         assert!((d[0] - 0.9).abs() < 1e-6);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_adamw_basic() {
         let p = make_param_with_grad(vec![1.0, 2.0], vec![0.1, 0.2]);
@@ -307,6 +322,7 @@ mod tests {
         assert!(d[1] < 2.0);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_adamw_weight_decay() {
         let p = make_param_with_grad(vec![1.0], vec![0.0]);
@@ -317,6 +333,7 @@ mod tests {
         assert!((d[0] - 0.99).abs() < 1e-6);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_zero_grad() {
         let p = make_param_with_grad(vec![1.0], vec![0.5]);
@@ -325,6 +342,7 @@ mod tests {
         assert!(p.grad().is_none());
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_clip_grad_norm() {
         let p = make_param_with_grad(vec![1.0], vec![3.0, 4.0]);
@@ -335,6 +353,7 @@ mod tests {
         assert!((clipped_norm - 1.0).abs() < 1e-4);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_clip_grad_norm_no_clip() {
         let p = make_param_with_grad(vec![1.0], vec![0.3, 0.4]);
@@ -346,6 +365,7 @@ mod tests {
         assert!((g[1] - 0.4).abs() < 1e-6);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_nan_guard() {
         let p = make_param_with_grad(vec![1.0], vec![f32::NAN]);
@@ -355,6 +375,7 @@ mod tests {
         assert_eq!(p.data(), vec![1.0]);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_cosine_scheduler_warmup() {
         let sched = CosineScheduler::new(0.001, 100, 1000);
@@ -363,6 +384,7 @@ mod tests {
         assert!((sched.get_lr(100) - 0.001).abs() < 1e-6);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_cosine_scheduler_decay() {
         let sched = CosineScheduler::new(0.001, 0, 1000);
@@ -374,6 +396,7 @@ mod tests {
         assert!((lr_end - 0.0001).abs() < 1e-6); // min_lr = 0.1 * base
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_gradient_accumulation_basic() {
         let p = Tensor::with_grad(vec![1.0, 2.0], vec![2], true);

@@ -26,6 +26,7 @@ fn dispatch_binary(
     }
 }
 
+// 一元算子分发：优先走设备后端实现，缺失时回退到 CPU 实现。
 fn dispatch_unary(
     a_data: &[f32],
     device: &Device,
@@ -49,7 +50,7 @@ mod gpu_accel {
     use std::sync::OnceLock;
 
     static GPU: OnceLock<Option<CudaBackend>> = OnceLock::new();
-
+    /// 获取全局 CUDA 后端实例；不可用时返回 `None`。
     pub fn get_gpu() -> Option<&'static CudaBackend> {
         GPU.get_or_init(|| match CudaBackend::new(0) {
             Ok(b) => {
@@ -64,7 +65,7 @@ mod gpu_accel {
         })
         .as_ref()
     }
-
+    /// 尝试在 GPU 上执行矩阵乘法并返回主机结果。
     pub fn gpu_matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Option<Vec<f32>> {
         let backend = get_gpu()?;
         let ga = GpuTensor::from_host(backend, a, vec![m, k]).ok()?;
@@ -105,6 +106,7 @@ fn tiled_matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> 
 // GPU offload only worthwhile when matrix is large enough to amortize transfer cost
 const _GPU_MATMUL_THRESHOLD: usize = 128 * 128;
 
+// 矩阵乘法分发：满足阈值时优先尝试 GPU，否则走 CPU 分块实现。
 fn dispatch_matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
     #[cfg(feature = "cuda")]
     {
@@ -123,11 +125,12 @@ fn dispatch_matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f3
 pub struct AddOp;
 
 impl Op for AddOp {
+    // 根据上游梯度计算当前节点对输入的梯度。
     fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
         vec![Some(grad_output.clone()), Some(grad_output.clone())]
     }
 }
-
+/// 逐元素加法：`a + b`，输入形状需一致。
 pub fn add(a: &Tensor, b: &Tensor) -> Tensor {
     let a_data = a.data();
     let b_data = b.data();
@@ -164,6 +167,7 @@ pub struct MulOp {
 }
 
 impl Op for MulOp {
+    // 根据上游梯度计算当前节点对输入的梯度。
     fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
         let g = grad_output.data();
         let a = self.saved_a.data();
@@ -178,7 +182,7 @@ impl Op for MulOp {
         ]
     }
 }
-
+/// 逐元素乘法：`a * b`，输入形状需一致。
 pub fn mul(a: &Tensor, b: &Tensor) -> Tensor {
     let a_data = a.data();
     let b_data = b.data();
@@ -215,12 +219,13 @@ pub fn mul(a: &Tensor, b: &Tensor) -> Tensor {
 pub struct NegOp;
 
 impl Op for NegOp {
+    // 根据上游梯度计算当前节点对输入的梯度。
     fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
         let grad_data: Vec<f32> = grad_output.data().iter().map(|x| -x).collect();
         vec![Some(Tensor::new(grad_data, grad_output.shape()))]
     }
 }
-
+/// 逐元素取负：`-a`。
 pub fn neg(a: &Tensor) -> Tensor {
     let a_data = a.data();
     let shape = a.shape();
@@ -247,7 +252,7 @@ pub fn neg(a: &Tensor) -> Tensor {
 }
 
 // ============ Sub ============
-
+/// 逐元素减法：`a - b`，通过 `add(a, -b)` 复用实现。
 pub fn sub(a: &Tensor, b: &Tensor) -> Tensor {
     add(a, &neg(b))
 }
@@ -260,13 +265,14 @@ pub struct SumOp {
 }
 
 impl Op for SumOp {
+    // 根据上游梯度计算当前节点对输入的梯度。
     fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
         let g_val = grad_output.data()[0];
         let size: usize = self.input_shape.iter().product();
         vec![Some(Tensor::new(vec![g_val; size], self.input_shape.clone()))]
     }
 }
-
+/// 对张量全部元素求和，返回标量张量 `[1]`。
 pub fn sum(a: &Tensor) -> Tensor {
     let a_data = a.data();
     let total: f32 = a_data.iter().sum();
@@ -293,6 +299,7 @@ pub struct MeanOp {
 }
 
 impl Op for MeanOp {
+    // 根据上游梯度计算当前节点对输入的梯度。
     fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
         let g_val = grad_output.data()[0];
         let size: usize = self.input_shape.iter().product();
@@ -302,7 +309,7 @@ impl Op for MeanOp {
         ))]
     }
 }
-
+/// 对张量全部元素求均值，返回标量张量 `[1]`。
 pub fn mean(a: &Tensor) -> Tensor {
     let a_data = a.data();
     let n = a_data.len() as f32;
@@ -333,6 +340,7 @@ pub struct MatmulOp {
 }
 
 impl Op for MatmulOp {
+    // 根据上游梯度计算当前节点对输入的梯度。
     fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
         let a_shape = self.saved_a.shape();
         let b_shape = self.saved_b.shape();
@@ -365,7 +373,7 @@ impl Op for MatmulOp {
         vec![Some(Tensor::new(da, vec![m, k])), Some(Tensor::new(db, vec![k, n]))]
     }
 }
-
+/// 二维矩阵乘法：`[m,k] x [k,n] -> [m,n]`。
 pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
     let a_shape = a.shape();
     let b_shape = b.shape();
@@ -409,6 +417,7 @@ pub struct ExpOp {
 }
 
 impl Op for ExpOp {
+    // 根据上游梯度计算当前节点对输入的梯度。
     fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
         // d/da exp(a) = exp(a) * grad
         let g = grad_output.data();
@@ -417,7 +426,7 @@ impl Op for ExpOp {
         vec![Some(Tensor::new(da, grad_output.shape()))]
     }
 }
-
+/// 逐元素指数函数。
 pub fn exp(a: &Tensor) -> Tensor {
     let a_data = a.data();
     let shape = a.shape();
@@ -450,6 +459,7 @@ pub struct LogOp {
 }
 
 impl Op for LogOp {
+    // 根据上游梯度计算当前节点对输入的梯度。
     fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
         // d/da ln(a) = grad / a
         let g = grad_output.data();
@@ -458,7 +468,7 @@ impl Op for LogOp {
         vec![Some(Tensor::new(da, grad_output.shape()))]
     }
 }
-
+/// 逐元素自然对数；输入应大于 0。
 pub fn log(a: &Tensor) -> Tensor {
     let a_data = a.data();
     let shape = a.shape();
@@ -491,13 +501,14 @@ pub struct ReshapeOp {
 }
 
 impl Op for ReshapeOp {
+    // 根据上游梯度计算当前节点对输入的梯度。
     fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
         // Reshape grad back to input shape
         let g = grad_output.contiguous_data();
         vec![Some(Tensor::new(g, self.input_shape.clone()))]
     }
 }
-
+/// 仅改变张量形状视图，元素总数必须保持一致。
 pub fn reshape(a: &Tensor, new_shape: Vec<usize>) -> Tensor {
     let old_shape = a.shape();
     let old_numel: usize = old_shape.iter().product();
@@ -529,6 +540,7 @@ pub fn reshape(a: &Tensor, new_shape: Vec<usize>) -> Tensor {
 pub struct TransposeOp;
 
 impl Op for TransposeOp {
+    // 根据上游梯度计算当前节点对输入的梯度。
     fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
         // Transpose the grad back
         let g = grad_output.contiguous_data();
@@ -543,7 +555,7 @@ impl Op for TransposeOp {
         vec![Some(Tensor::new(out, vec![cols, rows]))]
     }
 }
-
+/// 转置二维矩阵最后两个维度。
 pub fn transpose(a: &Tensor) -> Tensor {
     let shape = a.shape();
     assert_eq!(shape.len(), 2, "transpose: only 2D tensors supported");
@@ -579,6 +591,7 @@ pub struct SoftmaxOp {
 }
 
 impl Op for SoftmaxOp {
+    // 根据上游梯度计算当前节点对输入的梯度。
     fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
         // d softmax / d input_i = s_i * (delta_ij - s_j)
         // For each row: grad_input = s * (grad_output - sum(grad_output * s))
@@ -605,7 +618,7 @@ impl Op for SoftmaxOp {
         }
     }
 }
-
+/// 按最后一维执行 softmax，输出同形状概率分布。
 pub fn softmax(a: &Tensor) -> Tensor {
     let data = a.contiguous_data();
     let shape = a.shape();
@@ -663,6 +676,7 @@ pub struct LogSoftmaxOp {
 }
 
 impl Op for LogSoftmaxOp {
+    // 根据上游梯度计算当前节点对输入的梯度。
     fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
         // d log_softmax / d input = grad - softmax * sum(grad)
         let s = self.softmax_output.contiguous_data();
@@ -687,7 +701,7 @@ impl Op for LogSoftmaxOp {
         }
     }
 }
-
+/// 按最后一维执行 log-softmax，数值上更稳定。
 pub fn log_softmax(a: &Tensor) -> Tensor {
     let data = a.contiguous_data();
     let shape = a.shape();
@@ -744,6 +758,7 @@ pub struct CrossEntropyLossOp {
 }
 
 impl Op for CrossEntropyLossOp {
+    // 根据上游梯度计算当前节点对输入的梯度。
     fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
         // d CE / d logits = softmax - one_hot(target)
         // Scaled by grad_output (scalar) and 1/batch_size
@@ -773,10 +788,7 @@ impl Op for CrossEntropyLossOp {
         vec![Some(Tensor::new(da, shape))]
     }
 }
-
-/// Cross-entropy loss: -mean(log_softmax(logits)[target])
-/// logits: [batch, num_classes] or [num_classes]
-/// targets: class indices
+/// 计算交叉熵损失（内部基于 log-softmax 与目标索引）。
 pub fn cross_entropy_loss(logits: &Tensor, targets: &[usize]) -> Tensor {
     let data = logits.contiguous_data();
     let shape = logits.shape();
@@ -874,6 +886,7 @@ pub struct EmbeddingLookupOp {
 }
 
 impl Op for EmbeddingLookupOp {
+    // 根据上游梯度计算当前节点对输入的梯度。
     fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
         // Scatter grad back to embedding table
         let g = grad_output.contiguous_data();
@@ -886,11 +899,7 @@ impl Op for EmbeddingLookupOp {
         vec![Some(Tensor::new(dw, vec![self.num_embeddings, self.embedding_dim]))]
     }
 }
-
-/// Lookup rows from embedding weight table
-/// weight: [num_embeddings, embedding_dim]
-/// indices: list of row indices
-/// returns: [len(indices), embedding_dim]
+/// 按索引从 embedding 权重矩阵中抽取行向量。
 pub fn embedding_lookup(weight: &Tensor, indices: &[usize]) -> Tensor {
     let w_shape = weight.shape();
     assert_eq!(w_shape.len(), 2, "embedding weight must be 2D");
@@ -936,6 +945,7 @@ pub struct ReluOp {
 }
 
 impl Op for ReluOp {
+    // 根据上游梯度计算当前节点对输入的梯度。
     fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
         let g = grad_output.contiguous_data();
         let da: Vec<f32> = g
@@ -946,7 +956,7 @@ impl Op for ReluOp {
         vec![Some(Tensor::new(da, grad_output.shape()))]
     }
 }
-
+/// ReLU 激活：`max(x, 0)`。
 pub fn relu(a: &Tensor) -> Tensor {
     let data = a.contiguous_data();
     let shape = a.shape();
@@ -980,6 +990,7 @@ pub struct GeluOp {
 }
 
 impl Op for GeluOp {
+    // 根据上游梯度计算当前节点对输入的梯度。
     fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
         // GELU'(x) = 0.5*(1+tanh(k)) + 0.5*x*(1-tanh(k)^2)*k'
         // where k = sqrt(2/pi)*(x + 0.044715*x^3), k' = sqrt(2/pi)*(1 + 0.134145*x^2)
@@ -1000,7 +1011,7 @@ impl Op for GeluOp {
         vec![Some(Tensor::new(da, grad_output.shape()))]
     }
 }
-
+/// GELU 激活（近似公式）。
 pub fn gelu(a: &Tensor) -> Tensor {
     let data = a.contiguous_data();
     let shape = a.shape();
@@ -1038,13 +1049,14 @@ pub struct ScaleOp {
 }
 
 impl Op for ScaleOp {
+    // 根据上游梯度计算当前节点对输入的梯度。
     fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
         let g = grad_output.contiguous_data();
         let da: Vec<f32> = g.iter().map(|gi| gi * self.scalar).collect();
         vec![Some(Tensor::new(da, grad_output.shape()))]
     }
 }
-
+/// 标量缩放：`a * scalar`。
 pub fn scale(a: &Tensor, scalar: f32) -> Tensor {
     let data = a.contiguous_data();
     let shape = a.shape();
@@ -1078,6 +1090,7 @@ pub struct MaskedFillOp {
 }
 
 impl Op for MaskedFillOp {
+    // 根据上游梯度计算当前节点对输入的梯度。
     fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
         let g = grad_output.contiguous_data();
         let da: Vec<f32> = g
@@ -1088,8 +1101,7 @@ impl Op for MaskedFillOp {
         vec![Some(Tensor::new(da, grad_output.shape()))]
     }
 }
-
-/// Where mask[i] is true, replace with fill_value; otherwise keep original.
+/// 按布尔 mask 将指定位置填充为常数。
 pub fn masked_fill(a: &Tensor, mask: &[bool], fill_value: f32) -> Tensor {
     let data = a.contiguous_data();
     let shape = a.shape();
@@ -1122,6 +1134,7 @@ pub struct BatchMatmulOp {
 }
 
 impl Op for BatchMatmulOp {
+    // 根据上游梯度计算当前节点对输入的梯度。
     fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
         let a_shape = self.saved_a.shape();
         let b_shape = self.saved_b.shape();
@@ -1169,7 +1182,7 @@ impl Op for BatchMatmulOp {
         ]
     }
 }
-
+/// 批量矩阵乘法：`[b,m,k] x [b,k,n] -> [b,m,n]`。
 pub fn batch_matmul(a: &Tensor, b: &Tensor) -> Tensor {
     let a_shape = a.shape();
     let b_shape = b.shape();
@@ -1216,6 +1229,7 @@ pub struct BroadcastAddOp {
 }
 
 impl Op for BroadcastAddOp {
+    // 根据上游梯度计算当前节点对输入的梯度。
     fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
         let g = grad_output.contiguous_data();
         let g_shape = grad_output.shape();
@@ -1233,9 +1247,7 @@ impl Op for BroadcastAddOp {
         vec![Some(da), Some(Tensor::new(db_data, self.b_shape.clone()))]
     }
 }
-
-/// Add with broadcasting: b is broadcast to match a's shape.
-/// Supports: [B,M,N]+[N], [B,M,N]+[1,1,N], [M,N]+[N], etc.
+/// 将一维偏置向量广播加到二维张量行上。
 pub fn broadcast_add(a: &Tensor, b: &Tensor) -> Tensor {
     let a_data = a.contiguous_data();
     let b_data = b.contiguous_data();
@@ -1279,6 +1291,7 @@ pub struct ConcatOp {
 }
 
 impl Op for ConcatOp {
+    // 根据上游梯度计算当前节点对输入的梯度。
     fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
         let g = grad_output.contiguous_data();
         let mut offset = 0;
@@ -1290,8 +1303,7 @@ impl Op for ConcatOp {
         grads
     }
 }
-
-/// Concatenate tensors along first axis. All tensors must have same shape except dim 0.
+/// 在第 0 维拼接多个形状兼容的张量。
 pub fn concat(tensors: &[&Tensor]) -> Tensor {
     assert!(!tensors.is_empty());
     let first_shape = tensors[0].shape();
@@ -1414,6 +1426,7 @@ mod tests {
         assert_eq!(add(&a, &b).data(), vec![4.0, 6.0]);
     }
 
+    // 测试：验证 mul_forward 的行为与数值正确性。
     #[test]
     fn test_mul_forward() {
         let a = Tensor::new(vec![2.0, 3.0], vec![2]);
@@ -1421,12 +1434,14 @@ mod tests {
         assert_eq!(mul(&a, &b).data(), vec![8.0, 15.0]);
     }
 
+    // 测试：验证 neg_forward 的行为与数值正确性。
     #[test]
     fn test_neg_forward() {
         let a = Tensor::new(vec![2.0, -3.0], vec![2]);
         assert_eq!(neg(&a).data(), vec![-2.0, 3.0]);
     }
 
+    // 测试：验证 sub_forward 的行为与数值正确性。
     #[test]
     fn test_sub_forward() {
         let a = Tensor::new(vec![5.0, 3.0], vec![2]);
@@ -1434,18 +1449,21 @@ mod tests {
         assert_eq!(sub(&a, &b).data(), vec![3.0, 2.0]);
     }
 
+    // 测试：验证 sum_forward 的行为与数值正确性。
     #[test]
     fn test_sum_forward() {
         let a = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]);
         assert_eq!(sum(&a).data(), vec![6.0]);
     }
 
+    // 测试：验证 mean_forward 的行为与数值正确性。
     #[test]
     fn test_mean_forward() {
         let a = Tensor::new(vec![2.0, 4.0, 6.0], vec![3]);
         assert_eq!(mean(&a).data(), vec![4.0]);
     }
 
+    // 测试：验证 matmul_forward 的行为与数值正确性。
     #[test]
     fn test_matmul_forward() {
         // [2,3] @ [3,2] = [2,2]
@@ -1454,6 +1472,7 @@ mod tests {
         assert_eq!(matmul(&a, &b).data(), vec![58.0, 64.0, 139.0, 154.0]);
     }
 
+    // 测试：验证 exp_forward 的行为与数值正确性。
     #[test]
     fn test_exp_forward() {
         let a = Tensor::new(vec![0.0, 1.0], vec![2]);
@@ -1462,6 +1481,7 @@ mod tests {
         assert!((r[1] - std::f32::consts::E).abs() < 1e-5);
     }
 
+    // 测试：验证 log_forward 的行为与数值正确性。
     #[test]
     fn test_log_forward() {
         let a = Tensor::new(vec![1.0, std::f32::consts::E], vec![2]);
@@ -1482,6 +1502,7 @@ mod tests {
         assert_eq!(y.grad().unwrap(), vec![1.0]);
     }
 
+    // 测试：验证 mul_backward 的行为与数值正确性。
     #[test]
     fn test_mul_backward() {
         let x = Tensor::with_grad(vec![3.0], vec![1], true);
@@ -1492,6 +1513,7 @@ mod tests {
         assert_eq!(y.grad().unwrap(), vec![3.0]); // dz/dy = x
     }
 
+    // 测试：验证 neg_backward 的行为与数值正确性。
     #[test]
     fn test_neg_backward() {
         let a = Tensor::with_grad(vec![2.0], vec![1], true);
@@ -1500,6 +1522,7 @@ mod tests {
         assert_eq!(a.grad().unwrap(), vec![-1.0]);
     }
 
+    // 测试：验证 sub_backward 的行为与数值正确性。
     #[test]
     fn test_sub_backward() {
         let x = Tensor::with_grad(vec![5.0], vec![1], true);
@@ -1510,6 +1533,7 @@ mod tests {
         assert_eq!(y.grad().unwrap(), vec![-1.0]);
     }
 
+    // 测试：验证 sum_backward 的行为与数值正确性。
     #[test]
     fn test_sum_backward() {
         let a = Tensor::with_grad(vec![1.0, 2.0, 3.0], vec![3], true);
@@ -1518,6 +1542,7 @@ mod tests {
         assert_eq!(a.grad().unwrap(), vec![1.0, 1.0, 1.0]);
     }
 
+    // 测试：验证 mean_backward 的行为与数值正确性。
     #[test]
     fn test_mean_backward() {
         let a = Tensor::with_grad(vec![2.0, 4.0, 6.0], vec![3], true);
@@ -1530,6 +1555,7 @@ mod tests {
         }
     }
 
+    // 测试：验证 matmul_backward 的行为与数值正确性。
     #[test]
     fn test_matmul_backward() {
         // A=[1,2; 3,4] B=[5,6; 7,8]
@@ -1564,6 +1590,7 @@ mod tests {
         ));
     }
 
+    // 测试：验证 grad_check_mul 的行为与数值正确性。
     #[test]
     fn test_grad_check_mul() {
         let a = Tensor::new(vec![2.0, 3.0], vec![2]);
@@ -1576,6 +1603,7 @@ mod tests {
         ));
     }
 
+    // 测试：验证 grad_check_matmul 的行为与数值正确性。
     #[test]
     fn test_grad_check_matmul() {
         let a = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
@@ -1588,12 +1616,14 @@ mod tests {
         ));
     }
 
+    // 测试：验证 grad_check_exp 的行为与数值正确性。
     #[test]
     fn test_grad_check_exp() {
         let a = Tensor::new(vec![0.5, 1.0], vec![2]);
         assert!(numerical_grad_check(|inputs| sum(&exp(&inputs[0])), &[&a], 1e-3, 1e-2));
     }
 
+    // 测试：验证 grad_check_log 的行为与数值正确性。
     #[test]
     fn test_grad_check_log() {
         let a = Tensor::new(vec![1.0, 2.0], vec![2]);
@@ -1613,6 +1643,7 @@ mod tests {
         assert_eq!(y.grad().unwrap(), vec![3.0]); // x = 3
     }
 
+    // 测试：验证 composite_exp_log 的行为与数值正确性。
     #[test]
     fn test_composite_exp_log() {
         // log(exp(x)) = x => grad = 1
@@ -1633,6 +1664,7 @@ mod tests {
         assert_eq!(b.data(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     }
 
+    // 测试：验证 reshape_backward 的行为与数值正确性。
     #[test]
     fn test_reshape_backward() {
         let a = Tensor::with_grad(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], true);
@@ -1654,6 +1686,7 @@ mod tests {
         assert_eq!(b.data(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
     }
 
+    // 测试：验证 transpose_backward 的行为与数值正确性。
     #[test]
     fn test_transpose_backward() {
         let a = Tensor::with_grad(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], true);
@@ -1675,6 +1708,7 @@ mod tests {
         assert!(d[2] > d[1] && d[1] > d[0]);
     }
 
+    // 测试：验证 softmax_forward_2d 的行为与数值正确性。
     #[test]
     fn test_softmax_forward_2d() {
         let a = Tensor::new(vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0], vec![2, 3]);
@@ -1686,6 +1720,7 @@ mod tests {
         assert!((row1_sum - 1.0).abs() < 1e-6);
     }
 
+    // 测试：验证 softmax_backward 的行为与数值正确性。
     #[test]
     fn test_softmax_backward() {
         let a = Tensor::with_grad(vec![1.0, 2.0, 3.0], vec![3], true);
@@ -1713,6 +1748,7 @@ mod tests {
         }
     }
 
+    // 测试：验证 grad_check_softmax 的行为与数值正确性。
     #[test]
     fn test_grad_check_softmax() {
         let a = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]);
@@ -1724,6 +1760,7 @@ mod tests {
         ));
     }
 
+    // 测试：验证 grad_check_log_softmax 的行为与数值正确性。
     #[test]
     fn test_grad_check_log_softmax() {
         let a = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]);
@@ -1746,6 +1783,7 @@ mod tests {
         assert!((l - (3.0f32).ln()).abs() < 1e-5);
     }
 
+    // 测试：验证 cross_entropy_forward_2d 的行为与数值正确性。
     #[test]
     fn test_cross_entropy_forward_2d() {
         let a = Tensor::new(vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0], vec![2, 3]);
@@ -1754,6 +1792,7 @@ mod tests {
         assert!((l - (3.0f32).ln()).abs() < 1e-5);
     }
 
+    // 测试：验证 cross_entropy_backward 的行为与数值正确性。
     #[test]
     fn test_cross_entropy_backward() {
         let a = Tensor::with_grad(vec![1.0, 2.0, 3.0], vec![3], true);
@@ -1765,6 +1804,7 @@ mod tests {
         assert!(sum_g.abs() < 1e-6);
     }
 
+    // 测试：验证 grad_check_cross_entropy 的行为与数值正确性。
     #[test]
     fn test_grad_check_cross_entropy() {
         let a = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
@@ -1790,6 +1830,7 @@ mod tests {
         assert_eq!(out.data(), vec![0.1, 0.2, 0.3, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2,]);
     }
 
+    // 测试：验证 embedding_backward 的行为与数值正确性。
     #[test]
     fn test_embedding_backward() {
         let w = Tensor::with_grad(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![3, 2], true);
@@ -1811,6 +1852,7 @@ mod tests {
         assert_eq!(relu(&a).data(), vec![0.0, 0.0, 1.0, 2.0]);
     }
 
+    // 测试：验证 relu_backward 的行为与数值正确性。
     #[test]
     fn test_relu_backward() {
         let a = Tensor::with_grad(vec![-1.0, 0.0, 1.0, 2.0], vec![4], true);
@@ -1820,6 +1862,7 @@ mod tests {
         assert_eq!(a.grad().unwrap(), vec![0.0, 0.0, 1.0, 1.0]);
     }
 
+    // 测试：验证 grad_check_relu 的行为与数值正确性。
     #[test]
     fn test_grad_check_relu() {
         // Avoid 0 (non-differentiable point)
@@ -1838,6 +1881,7 @@ mod tests {
         assert!(d[2] > 0.8); // gelu(1) ~ 0.841
     }
 
+    // 测试：验证 grad_check_gelu 的行为与数值正确性。
     #[test]
     fn test_grad_check_gelu() {
         let a = Tensor::new(vec![-1.0, 0.5, 1.0, 2.0], vec![4]);
@@ -1852,6 +1896,7 @@ mod tests {
         assert_eq!(scale(&a, 2.0).data(), vec![2.0, 4.0, 6.0]);
     }
 
+    // 测试：验证 scale_backward 的行为与数值正确性。
     #[test]
     fn test_scale_backward() {
         let a = Tensor::with_grad(vec![1.0, 2.0], vec![2], true);
@@ -1875,6 +1920,7 @@ mod tests {
         assert_eq!(d[3], f32::NEG_INFINITY);
     }
 
+    // 测试：验证 masked_fill_backward 的行为与数值正确性。
     #[test]
     fn test_masked_fill_backward() {
         let a = Tensor::with_grad(vec![1.0, 2.0, 3.0, 4.0], vec![4], true);
@@ -1897,6 +1943,7 @@ mod tests {
         assert_eq!(c.data(), vec![19.0, 22.0, 43.0, 50.0]);
     }
 
+    // 测试：验证 batch_matmul_multi_batch 的行为与数值正确性。
     #[test]
     fn test_batch_matmul_multi_batch() {
         // batch=2, each [2,2] @ [2,2]
@@ -1917,6 +1964,7 @@ mod tests {
         assert_eq!(&d[4..8], &[6.0, 8.0, 10.0, 12.0]);
     }
 
+    // 测试：验证 grad_check_batch_matmul 的行为与数值正确性。
     #[test]
     fn test_grad_check_batch_matmul() {
         let a = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![1, 2, 2]);
@@ -1939,6 +1987,7 @@ mod tests {
         assert_eq!(c.data(), vec![11.0, 22.0, 33.0, 14.0, 25.0, 36.0]);
     }
 
+    // 测试：验证 broadcast_add_backward 的行为与数值正确性。
     #[test]
     fn test_broadcast_add_backward() {
         let a = Tensor::with_grad(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], true);
@@ -1962,6 +2011,7 @@ mod tests {
         assert_eq!(c.data(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     }
 
+    // 测试：验证 concat_backward 的行为与数值正确性。
     #[test]
     fn test_concat_backward() {
         let a = Tensor::with_grad(vec![1.0, 2.0], vec![1, 2], true);
@@ -1982,46 +2032,55 @@ mod tests {
 
         struct DoubleBackend;
         impl BackendDispatch for DoubleBackend {
+            // 后端逐元素加法内核接口。
             fn add_f32(&self, a: &[f32], b: &[f32], out: &mut [f32]) {
                 for i in 0..out.len() {
                     out[i] = (a[i] + b[i]) * 2.0;
                 }
             }
+            // 后端逐元素乘法内核接口。
             fn mul_f32(&self, a: &[f32], b: &[f32], out: &mut [f32]) {
                 for i in 0..out.len() {
                     out[i] = a[i] * b[i] * 2.0;
                 }
             }
+            // 后端逐元素取负内核接口。
             fn neg_f32(&self, a: &[f32], out: &mut [f32]) {
                 for i in 0..out.len() {
                     out[i] = -a[i] * 2.0;
                 }
             }
+            // 后端逐元素指数内核接口。
             fn exp_f32(&self, a: &[f32], out: &mut [f32]) {
                 for i in 0..out.len() {
                     out[i] = a[i].exp();
                 }
             }
+            // 后端逐元素对数内核接口。
             fn log_f32(&self, a: &[f32], out: &mut [f32]) {
                 for i in 0..out.len() {
                     out[i] = a[i].ln();
                 }
             }
+            // 后端 ReLU 激活内核接口。
             fn relu_f32(&self, a: &[f32], out: &mut [f32]) {
                 for i in 0..out.len() {
                     out[i] = if a[i] > 0.0 { a[i] } else { 0.0 };
                 }
             }
+            // 后端 GELU 激活内核接口。
             fn gelu_f32(&self, a: &[f32], out: &mut [f32]) {
                 for i in 0..out.len() {
                     out[i] = a[i];
                 }
             }
+            // 后端标量缩放内核接口。
             fn scale_f32(&self, a: &[f32], s: f32, out: &mut [f32]) {
                 for i in 0..out.len() {
                     out[i] = a[i] * s;
                 }
             }
+            // 后端矩阵乘法内核接口。
             fn matmul_f32(&self, a: &[f32], b: &[f32], out: &mut [f32], m: usize, k: usize, n: usize) {
                 for i in 0..m {
                     for j in 0..n {

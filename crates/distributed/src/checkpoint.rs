@@ -13,6 +13,7 @@ pub struct CheckpointManager {
 }
 
 impl CheckpointManager {
+    /// 创建检查点管理器并初始化保存目录。
     pub fn new(save_dir: impl AsRef<Path>, max_keep: usize) -> io::Result<Self> {
         let save_dir = save_dir.as_ref().to_path_buf();
         fs::create_dir_all(&save_dir)?;
@@ -22,8 +23,7 @@ impl CheckpointManager {
             saved_steps: Vec::new(),
         })
     }
-
-    /// Save a checkpoint synchronously. Returns the path saved to.
+    /// 保存当前参数为指定 step 的检查点文件。
     pub fn save(&mut self, params: &[Tensor], step: u64) -> io::Result<PathBuf> {
         let filename = format!("checkpoint_step_{}.sptc", step);
         let path = self.save_dir.join(&filename);
@@ -41,8 +41,7 @@ impl CheckpointManager {
 
         Ok(path)
     }
-
-    /// Load the latest checkpoint. Returns the step number.
+    /// 加载最新检查点并返回 step；不存在时返回 `None`。
     pub fn load_latest(&self, params: &[Tensor]) -> io::Result<Option<u64>> {
         if self.saved_steps.is_empty() {
             // Scan directory for existing checkpoints
@@ -75,19 +74,18 @@ impl CheckpointManager {
         sptorch_serialize::load_checkpoint(&path, params)?;
         Ok(Some(latest))
     }
-
-    /// Resume training: load latest checkpoint and return the step to continue from.
+    /// 恢复训练起始 step（最新 step + 1；无检查点时为 0）。
     pub fn resume(&self, params: &[Tensor]) -> io::Result<u64> {
         match self.load_latest(params)? {
             Some(step) => Ok(step + 1),
             None => Ok(0),
         }
     }
-
+    /// 返回当前记录的最新 step。
     pub fn latest_step(&self) -> Option<u64> {
         self.saved_steps.last().copied()
     }
-
+    /// 返回当前已记录检查点数量。
     pub fn num_saved(&self) -> usize {
         self.saved_steps.len()
     }
@@ -98,12 +96,14 @@ mod tests {
     use super::*;
     use std::env::temp_dir;
 
+    // 构造当前进程专用的临时检查点目录，避免测试间互相污染。
     fn temp_checkpoint_dir(suffix: &str) -> PathBuf {
         let mut p = temp_dir();
         p.push(format!("sptorch_ckpt_{}_{}", suffix, std::process::id()));
         p
     }
 
+    // 验证保存后再加载可以恢复参数值。
     #[test]
     fn test_checkpoint_save_load() {
         let dir = temp_checkpoint_dir("save_load");
@@ -126,6 +126,7 @@ mod tests {
         assert_eq!(params[0].data(), vec![1.0, 2.0, 3.0]);
     }
 
+    // 验证超过 max_keep 后会裁剪最旧检查点文件。
     #[test]
     fn test_checkpoint_pruning() {
         let dir = temp_checkpoint_dir("pruning");
@@ -146,6 +147,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    // 验证 resume 会从“最新 step + 1”继续训练。
     #[test]
     fn test_checkpoint_resume() {
         let dir = temp_checkpoint_dir("resume");
@@ -161,6 +163,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    // 验证无检查点时 resume 从 0 开始。
     #[test]
     fn test_checkpoint_resume_empty() {
         let dir = temp_checkpoint_dir("resume_empty");

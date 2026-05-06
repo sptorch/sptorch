@@ -24,10 +24,11 @@ pub struct HardwareParallelPlan {
 }
 
 impl HardwareParallelPlan {
+    /// 检查规划器是否具备可用拓扑信息。
     pub fn ready(&self) -> bool {
         self.validation.connected && self.validation.total_nodes > 0
     }
-
+    /// 返回硬件并行规划摘要字符串。
     pub fn summary(&self) -> String {
         format!(
             "topology={} world={} connected={} collectives={}",
@@ -38,7 +39,7 @@ impl HardwareParallelPlan {
         )
     }
 }
-
+/// 基于拓扑与负载大小规划 ring-allreduce 执行方案。
 pub fn plan_ring_allreduce(topology: &HardwareTopology, payload_bytes: usize) -> HardwareParallelPlan {
     let validation = topology.validate_connectivity();
     let world = topology.ring_plan();
@@ -52,7 +53,7 @@ pub fn plan_ring_allreduce(topology: &HardwareTopology, payload_bytes: usize) ->
         matmul: None,
     }
 }
-
+/// 为 TANK9K MatMul 校验场景生成并行执行计划。
 pub fn plan_tank9k_matmul_validation(
     topology: &HardwareTopology,
     m: usize,
@@ -79,6 +80,7 @@ mod tests {
     use super::*;
     use sptorch_hal::topology::{HardwareLink, HardwareNode, LinkRole, TransportKind};
 
+    // 构造一个用于测试的 TANK9K 环形拓扑。
     fn tank9k_ring(n: usize) -> HardwareTopology {
         let mut topo = HardwareTopology::new("tank9k-validation-ring");
         for i in 0..n {
@@ -102,6 +104,7 @@ mod tests {
         topo
     }
 
+    // 验证多板卡拓扑可生成完整且可执行的验证计划。
     #[test]
     fn builds_multi_board_tank9k_validation_plan() {
         let topo = tank9k_ring(4);
@@ -117,6 +120,7 @@ mod tests {
         assert_eq!(plan.allreduce.as_ref().unwrap().ring_hops, 4);
     }
 
+    // 验证拓扑链路不完整时计划应标记为不可用。
     #[test]
     fn broken_topology_produces_not_ready_plan() {
         let mut topo = HardwareTopology::new("broken-tank9k");

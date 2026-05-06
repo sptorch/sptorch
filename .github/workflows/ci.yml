@@ -21,8 +21,10 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --workspace --exclude sptorch-runtime-cuda --exclude sptorch-cli-train-gpu --exclude sptorch-distributed --exclude sptorch-mock-npu -- -D warnings
+        run: cargo clippy --workspace --exclude sptorch-runtime-cuda --exclude sptorch-distributed --exclude sptorch-mock-npu -- -D warnings
       - name: Build mock-npu
         run: cargo build -p sptorch-mock-npu
+      - name: Test hal-ffi mock chain
+        run: cargo test -p sptorch-hal-ffi --test test_ffi_mock
       - name: Test
-        run: cargo test --workspace --exclude sptorch-runtime-cuda --exclude sptorch-cli-train-gpu --exclude sptorch-distributed
+        run: cargo test --workspace --exclude sptorch-runtime-cuda --exclude sptorch-distributed

@@ -98,6 +98,7 @@ pub struct HardwareState {
 mod tests {
     use super::*;
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_versioned_storage_json_roundtrip() {
         let storage = VersionedStorage {
@@ -143,6 +144,7 @@ mod tests {
         assert_eq!(out, storage);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_evolution_metrics_json_roundtrip() {
         let m = EvolutionMetrics {

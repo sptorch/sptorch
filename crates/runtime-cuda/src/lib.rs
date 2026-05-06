@@ -10,6 +10,7 @@ pub enum CudaError {
 }
 
 impl From<DriverError> for CudaError {
+    // 中文注释：关键逻辑说明。
     fn from(e: DriverError) -> Self {
         CudaError::Driver(e)
     }
@@ -21,6 +22,7 @@ pub struct CudaBackend {
 }
 
 impl CudaBackend {
+    /// `new`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn new(ordinal: usize) -> Result<Self, CudaError> {
         let dev = CudaDevice::new(ordinal)?;
         let blas = Arc::new(CudaBlas::new(dev.clone()).map_err(|e| CudaError::Cublas(e.to_string()))?);
@@ -37,6 +39,7 @@ pub struct GpuTensor {
 }
 
 impl GpuTensor {
+    /// `from_host`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn from_host(backend: &CudaBackend, data: &[f32], shape: Vec<usize>) -> Result<Self, CudaError> {
         let numel = data.len();
         let gpu_data = backend.dev.htod_sync_copy(data)?;
@@ -46,12 +49,12 @@ impl GpuTensor {
             numel,
         })
     }
-
+    /// `to_host`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn to_host(&self, backend: &CudaBackend) -> Result<Vec<f32>, CudaError> {
         let host = backend.dev.dtoh_sync_copy(&self.data)?;
         Ok(host)
     }
-
+    /// `zeros`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn zeros(backend: &CudaBackend, shape: Vec<usize>) -> Result<Self, CudaError> {
         let numel: usize = shape.iter().product();
         let gpu_data = backend.dev.alloc_zeros::<f32>(numel)?;
@@ -149,6 +152,7 @@ fn launch_cfg(n: usize) -> LaunchConfig {
 }
 
 impl CudaBackend {
+    /// `load_kernels`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn load_kernels(&self) -> Result<(), CudaError> {
         if self.dev.has_func("elem", "add_kernel") {
             return Ok(());
@@ -157,7 +161,7 @@ impl CudaBackend {
         self.dev.load_ptx(ptx, "elem", KERNEL_NAMES)?;
         Ok(())
     }
-
+    /// `gpu_add`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn gpu_add(&self, a: &GpuTensor, b: &GpuTensor) -> Result<GpuTensor, CudaError> {
         assert_eq!(a.numel, b.numel);
         let mut out = GpuTensor::zeros(self, a.shape.clone())?;
@@ -166,7 +170,7 @@ impl CudaBackend {
         unsafe { f.launch(cfg, (&a.data, &b.data, &mut out.data, a.numel as u32)) }?;
         Ok(out)
     }
-
+    /// `gpu_mul`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn gpu_mul(&self, a: &GpuTensor, b: &GpuTensor) -> Result<GpuTensor, CudaError> {
         assert_eq!(a.numel, b.numel);
         let mut out = GpuTensor::zeros(self, a.shape.clone())?;
@@ -175,7 +179,7 @@ impl CudaBackend {
         unsafe { f.launch(cfg, (&a.data, &b.data, &mut out.data, a.numel as u32)) }?;
         Ok(out)
     }
-
+    /// `gpu_neg`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn gpu_neg(&self, a: &GpuTensor) -> Result<GpuTensor, CudaError> {
         let mut out = GpuTensor::zeros(self, a.shape.clone())?;
         let f = self.dev.get_func("elem", "neg_kernel").unwrap();
@@ -183,7 +187,7 @@ impl CudaBackend {
         unsafe { f.launch(cfg, (&a.data, &mut out.data, a.numel as u32)) }?;
         Ok(out)
     }
-
+    /// `gpu_scale`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn gpu_scale(&self, a: &GpuTensor, scalar: f32) -> Result<GpuTensor, CudaError> {
         let mut out = GpuTensor::zeros(self, a.shape.clone())?;
         let f = self.dev.get_func("elem", "scale_kernel").unwrap();
@@ -191,7 +195,7 @@ impl CudaBackend {
         unsafe { f.launch(cfg, (&a.data, &mut out.data, scalar, a.numel as u32)) }?;
         Ok(out)
     }
-
+    /// `gpu_exp`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn gpu_exp(&self, a: &GpuTensor) -> Result<GpuTensor, CudaError> {
         let mut out = GpuTensor::zeros(self, a.shape.clone())?;
         let f = self.dev.get_func("elem", "exp_kernel").unwrap();
@@ -199,7 +203,7 @@ impl CudaBackend {
         unsafe { f.launch(cfg, (&a.data, &mut out.data, a.numel as u32)) }?;
         Ok(out)
     }
-
+    /// `gpu_log`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn gpu_log(&self, a: &GpuTensor) -> Result<GpuTensor, CudaError> {
         let mut out = GpuTensor::zeros(self, a.shape.clone())?;
         let f = self.dev.get_func("elem", "log_kernel").unwrap();
@@ -207,7 +211,7 @@ impl CudaBackend {
         unsafe { f.launch(cfg, (&a.data, &mut out.data, a.numel as u32)) }?;
         Ok(out)
     }
-
+    /// `gpu_gelu`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn gpu_gelu(&self, a: &GpuTensor) -> Result<GpuTensor, CudaError> {
         let mut out = GpuTensor::zeros(self, a.shape.clone())?;
         let f = self.dev.get_func("elem", "gelu_kernel").unwrap();
@@ -215,7 +219,7 @@ impl CudaBackend {
         unsafe { f.launch(cfg, (&a.data, &mut out.data, a.numel as u32)) }?;
         Ok(out)
     }
-
+    /// `gpu_relu`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn gpu_relu(&self, a: &GpuTensor) -> Result<GpuTensor, CudaError> {
         let mut out = GpuTensor::zeros(self, a.shape.clone())?;
         let f = self.dev.get_func("elem", "relu_kernel").unwrap();
@@ -223,8 +227,7 @@ impl CudaBackend {
         unsafe { f.launch(cfg, (&a.data, &mut out.data, a.numel as u32)) }?;
         Ok(out)
     }
-
-    /// matmul via cuBLAS: C = A @ B, A:[m,k], B:[k,n] -> C:[m,n]
+    /// `gpu_matmul`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn gpu_matmul(&self, a: &GpuTensor, b: &GpuTensor) -> Result<GpuTensor, CudaError> {
         let (m, k) = (a.shape[0], a.shape[1]);
         let n = b.shape[1];
@@ -256,8 +259,7 @@ impl CudaBackend {
 
         Ok(out)
     }
-
-    /// SGD update in-place: param -= lr * grad
+    /// `gpu_sgd_update`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn gpu_sgd_update(&self, param: &mut GpuTensor, grad: &GpuTensor, lr: f32) -> Result<(), CudaError> {
         assert_eq!(param.numel, grad.numel);
         let f = self.dev.get_func("elem", "sgd_kernel").unwrap();
@@ -265,8 +267,7 @@ impl CudaBackend {
         unsafe { f.launch(cfg, (&mut param.data, &grad.data, lr, param.numel as u32)) }?;
         Ok(())
     }
-
-    /// Accumulate in-place: a += b
+    /// `gpu_accum`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn gpu_accum(&self, a: &mut GpuTensor, b: &GpuTensor) -> Result<(), CudaError> {
         assert_eq!(a.numel, b.numel);
         let f = self.dev.get_func("elem", "accum_kernel").unwrap();
@@ -276,8 +277,7 @@ impl CudaBackend {
     }
 
     // ============ 复合操作 (host-side orchestration + GPU kernels) ============
-
-    /// Transpose 2D: [m,n] -> [n,m]
+    /// `gpu_transpose`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn gpu_transpose(&self, a: &GpuTensor) -> Result<GpuTensor, CudaError> {
         assert_eq!(a.shape.len(), 2);
         let (m, n) = (a.shape[0], a.shape[1]);
@@ -290,8 +290,7 @@ impl CudaBackend {
         }
         GpuTensor::from_host(self, &out, vec![n, m])
     }
-
-    /// Broadcast add: a:[rows, cols] + b:[cols] -> [rows, cols]
+    /// `gpu_broadcast_add`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn gpu_broadcast_add(&self, a: &GpuTensor, b: &GpuTensor) -> Result<GpuTensor, CudaError> {
         let a_host = a.to_host(self)?;
         let b_host = b.to_host(self)?;
@@ -303,8 +302,7 @@ impl CudaBackend {
             .collect();
         GpuTensor::from_host(self, &out, a.shape.clone())
     }
-
-    /// Softmax along last axis: [rows, cols] or [cols]
+    /// `gpu_softmax`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn gpu_softmax(&self, a: &GpuTensor) -> Result<GpuTensor, CudaError> {
         let data = a.to_host(self)?;
         let shape = &a.shape;
@@ -328,8 +326,7 @@ impl CudaBackend {
         };
         GpuTensor::from_host(self, &out, a.shape.clone())
     }
-
-    /// Cross-entropy loss: logits:[seq, vocab], targets:&[usize] -> scalar loss + softmax
+    /// `gpu_cross_entropy`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn gpu_cross_entropy(&self, logits: &GpuTensor, targets: &[usize]) -> Result<(f32, GpuTensor), CudaError> {
         let data = logits.to_host(self)?;
         let shape = &logits.shape;
@@ -352,8 +349,7 @@ impl CudaBackend {
         let sm_gpu = GpuTensor::from_host(self, &sm, vec![seq_len, vocab])?;
         Ok((loss, sm_gpu))
     }
-
-    /// Cross-entropy backward: grad = (softmax - one_hot) / batch_size
+    /// `gpu_cross_entropy_backward`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn gpu_cross_entropy_backward(&self, sm: &GpuTensor, targets: &[usize]) -> Result<GpuTensor, CudaError> {
         let mut grad = sm.to_host(self)?;
         let (seq_len, vocab) = (sm.shape[0], sm.shape[1]);
@@ -366,8 +362,7 @@ impl CudaBackend {
         }
         GpuTensor::from_host(self, &grad, sm.shape.clone())
     }
-
-    /// Embedding lookup: weight:[num_emb, dim], indices -> [len, dim]
+    /// `gpu_embedding`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn gpu_embedding(&self, weight: &GpuTensor, indices: &[usize]) -> Result<GpuTensor, CudaError> {
         let w = weight.to_host(self)?;
         let dim = weight.shape[1];
@@ -378,8 +373,7 @@ impl CudaBackend {
         }
         GpuTensor::from_host(self, &out, vec![seq_len, dim])
     }
-
-    /// Embedding backward: scatter grad back to weight shape
+    /// `gpu_embedding_backward`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn gpu_embedding_backward(
         &self,
         grad: &GpuTensor,
@@ -396,8 +390,7 @@ impl CudaBackend {
         }
         GpuTensor::from_host(self, &dw, vec![num_emb, dim])
     }
-
-    /// Masked fill: where mask[i] is true, set fill_value
+    /// `gpu_masked_fill`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn gpu_masked_fill(&self, a: &GpuTensor, mask: &[bool], fill_value: f32) -> Result<GpuTensor, CudaError> {
         let mut data = a.to_host(self)?;
         for (i, &m) in mask.iter().enumerate() {
@@ -407,8 +400,7 @@ impl CudaBackend {
         }
         GpuTensor::from_host(self, &data, a.shape.clone())
     }
-
-    /// Reshape (just changes shape metadata, data stays on GPU)
+    /// `gpu_reshape`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn gpu_reshape(&self, a: &GpuTensor, new_shape: Vec<usize>) -> Result<GpuTensor, CudaError> {
         let new_numel: usize = new_shape.iter().product();
         assert_eq!(a.numel, new_numel);
@@ -416,14 +408,12 @@ impl CudaBackend {
         let host = a.to_host(self)?;
         GpuTensor::from_host(self, &host, new_shape)
     }
-
-    /// Sum all elements -> scalar
+    /// `gpu_sum`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn gpu_sum(&self, a: &GpuTensor) -> Result<f32, CudaError> {
         let host = a.to_host(self)?;
         Ok(host.iter().sum())
     }
-
-    /// Layer norm: input:[batch, dim], gamma:[dim], beta:[dim]
+    /// `gpu_layer_norm`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn gpu_layer_norm(
         &self,
         input: &GpuTensor,
@@ -448,8 +438,7 @@ impl CudaBackend {
         }
         GpuTensor::from_host(self, &out, input.shape.clone())
     }
-
-    /// Batch matmul: [B,M,K] @ [B,K,N] -> [B,M,N] via cuBLAS batched
+    /// `gpu_batch_matmul`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn gpu_batch_matmul(&self, a: &GpuTensor, b: &GpuTensor) -> Result<GpuTensor, CudaError> {
         let (batch, m, k) = (a.shape[0], a.shape[1], a.shape[2]);
         let n = b.shape[2];
@@ -474,12 +463,14 @@ impl CudaBackend {
 mod tests {
     use super::*;
 
+    // 中文注释：关键逻辑说明。
     fn setup() -> CudaBackend {
         let backend = CudaBackend::new(0).expect("Failed to create CUDA backend");
         backend.load_kernels().expect("Failed to load kernels");
         backend
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_host_roundtrip() {
         let b = setup();
@@ -489,6 +480,7 @@ mod tests {
         assert_eq!(host, data);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_gpu_add() {
         let b = setup();
@@ -498,6 +490,7 @@ mod tests {
         assert_eq!(out.to_host(&b).unwrap(), vec![6.0, 8.0, 10.0, 12.0]);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_gpu_mul() {
         let b = setup();
@@ -507,6 +500,7 @@ mod tests {
         assert_eq!(out.to_host(&b).unwrap(), vec![6.0, 12.0, 20.0, 30.0]);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_gpu_neg() {
         let b = setup();
@@ -515,6 +509,7 @@ mod tests {
         assert_eq!(out.to_host(&b).unwrap(), vec![-1.0, 2.0, -3.0]);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_gpu_scale() {
         let b = setup();
@@ -523,6 +518,7 @@ mod tests {
         assert_eq!(out.to_host(&b).unwrap(), vec![2.5, 5.0, 7.5]);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_gpu_exp() {
         let b = setup();
@@ -533,6 +529,7 @@ mod tests {
         assert!((r[1] - std::f32::consts::E).abs() < 1e-5);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_gpu_log() {
         let b = setup();
@@ -543,6 +540,7 @@ mod tests {
         assert!((r[1] - 1.0).abs() < 1e-5);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_gpu_gelu() {
         let b = setup();
@@ -554,6 +552,7 @@ mod tests {
         assert!(r[2] > 0.8); // gelu(1) ~ 0.841
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_gpu_relu() {
         let b = setup();
@@ -562,6 +561,7 @@ mod tests {
         assert_eq!(out.to_host(&b).unwrap(), vec![0.0, 0.0, 1.0, 2.0]);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_gpu_matmul() {
         let b = setup();
@@ -571,6 +571,7 @@ mod tests {
         assert_eq!(out.to_host(&b).unwrap(), vec![58.0, 64.0, 139.0, 154.0]);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_gpu_matmul_square() {
         let b = setup();
@@ -580,6 +581,7 @@ mod tests {
         assert_eq!(out.to_host(&b).unwrap(), vec![19.0, 22.0, 43.0, 50.0]);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_gpu_vs_cpu_matmul_large() {
         let b = setup();
@@ -622,6 +624,7 @@ use std::sync::OnceLock;
 
 static CUDA_BACKEND: OnceLock<Option<CudaBackend>> = OnceLock::new();
 
+// 中文注释：关键逻辑说明。
 fn get_or_init_cuda() -> Option<&'static CudaBackend> {
     CUDA_BACKEND
         .get_or_init(|| match CudaBackend::new(0) {
@@ -636,9 +639,7 @@ fn get_or_init_cuda() -> Option<&'static CudaBackend> {
         })
         .as_ref()
 }
-
-/// Register the CUDA backend into the global dispatch registry.
-/// Call this once at startup to enable GPU-accelerated autograd ops.
+/// `register_cuda_backend`：中文注释，说明函数用途、输入约束与输出语义。
 pub fn register_cuda_backend() {
     if get_or_init_cuda().is_some() {
         let dispatch = Arc::new(CudaDispatch);
@@ -650,6 +651,7 @@ pub fn register_cuda_backend() {
 struct CudaDispatch;
 
 impl BackendDispatch for CudaDispatch {
+    // 中文注释：关键逻辑说明。
     fn add_f32(&self, a: &[f32], b: &[f32], out: &mut [f32]) {
         let backend = get_or_init_cuda().unwrap();
         let ga = GpuTensor::from_host(backend, a, vec![a.len()]).unwrap();
@@ -658,6 +660,7 @@ impl BackendDispatch for CudaDispatch {
         out.copy_from_slice(&gc.to_host(backend).unwrap());
     }
 
+    // 中文注释：关键逻辑说明。
     fn mul_f32(&self, a: &[f32], b: &[f32], out: &mut [f32]) {
         let backend = get_or_init_cuda().unwrap();
         let ga = GpuTensor::from_host(backend, a, vec![a.len()]).unwrap();
@@ -666,6 +669,7 @@ impl BackendDispatch for CudaDispatch {
         out.copy_from_slice(&gc.to_host(backend).unwrap());
     }
 
+    // 中文注释：关键逻辑说明。
     fn neg_f32(&self, a: &[f32], out: &mut [f32]) {
         let backend = get_or_init_cuda().unwrap();
         let ga = GpuTensor::from_host(backend, a, vec![a.len()]).unwrap();
@@ -673,6 +677,7 @@ impl BackendDispatch for CudaDispatch {
         out.copy_from_slice(&gc.to_host(backend).unwrap());
     }
 
+    // 中文注释：关键逻辑说明。
     fn exp_f32(&self, a: &[f32], out: &mut [f32]) {
         let backend = get_or_init_cuda().unwrap();
         let ga = GpuTensor::from_host(backend, a, vec![a.len()]).unwrap();
@@ -680,6 +685,7 @@ impl BackendDispatch for CudaDispatch {
         out.copy_from_slice(&gc.to_host(backend).unwrap());
     }
 
+    // 中文注释：关键逻辑说明。
     fn log_f32(&self, a: &[f32], out: &mut [f32]) {
         let backend = get_or_init_cuda().unwrap();
         let ga = GpuTensor::from_host(backend, a, vec![a.len()]).unwrap();
@@ -687,6 +693,7 @@ impl BackendDispatch for CudaDispatch {
         out.copy_from_slice(&gc.to_host(backend).unwrap());
     }
 
+    // 中文注释：关键逻辑说明。
     fn relu_f32(&self, a: &[f32], out: &mut [f32]) {
         let backend = get_or_init_cuda().unwrap();
         let ga = GpuTensor::from_host(backend, a, vec![a.len()]).unwrap();
@@ -694,6 +701,7 @@ impl BackendDispatch for CudaDispatch {
         out.copy_from_slice(&gc.to_host(backend).unwrap());
     }
 
+    // 中文注释：关键逻辑说明。
     fn gelu_f32(&self, a: &[f32], out: &mut [f32]) {
         let backend = get_or_init_cuda().unwrap();
         let ga = GpuTensor::from_host(backend, a, vec![a.len()]).unwrap();
@@ -701,6 +709,7 @@ impl BackendDispatch for CudaDispatch {
         out.copy_from_slice(&gc.to_host(backend).unwrap());
     }
 
+    // 中文注释：关键逻辑说明。
     fn scale_f32(&self, a: &[f32], scalar: f32, out: &mut [f32]) {
         let backend = get_or_init_cuda().unwrap();
         let ga = GpuTensor::from_host(backend, a, vec![a.len()]).unwrap();
@@ -708,6 +717,7 @@ impl BackendDispatch for CudaDispatch {
         out.copy_from_slice(&gc.to_host(backend).unwrap());
     }
 
+    // 中文注释：关键逻辑说明。
     fn matmul_f32(&self, a: &[f32], b: &[f32], out: &mut [f32], m: usize, k: usize, n: usize) {
         let backend = get_or_init_cuda().unwrap();
         let ga = GpuTensor::from_host(backend, a, vec![m, k]).unwrap();

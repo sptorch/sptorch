@@ -12,19 +12,21 @@ use sptorch_core_tensor::Tensor;
 // ============ Module Trait ============
 
 pub trait Module: Send + Sync {
+    // 前向计算接口：接收输入张量并返回输出张量。
     fn forward(&self, input: &Tensor) -> Tensor;
+    // 返回当前模块需要优化或保存的参数张量列表。
     fn parameters(&self) -> Vec<Tensor>;
 }
 
 // ============ Initialization ============
-
+/// 使用 Xavier Uniform 初始化权重张量。
 pub fn xavier_uniform(rows: usize, cols: usize) -> Tensor {
     let mut rng = rand::thread_rng();
     let limit = (6.0 / (rows + cols) as f32).sqrt();
     let data: Vec<f32> = (0..rows * cols).map(|_| rng.gen_range(-limit..limit)).collect();
     Tensor::with_grad(data, vec![rows, cols], true)
 }
-
+/// 使用 Kaiming Normal 初始化权重张量。
 pub fn kaiming_normal(rows: usize, cols: usize) -> Tensor {
     let mut rng = rand::thread_rng();
     let std = (2.0 / rows as f32).sqrt();
@@ -39,6 +41,7 @@ pub fn kaiming_normal(rows: usize, cols: usize) -> Tensor {
     Tensor::with_grad(data, vec![rows, cols], true)
 }
 
+// 创建全零可训练张量，通常用于初始化偏置。
 fn zeros_grad(size: usize) -> Tensor {
     Tensor::with_grad(vec![0.0; size], vec![size], true)
 }
@@ -51,6 +54,7 @@ pub struct Linear {
 }
 
 impl Linear {
+    /// 创建线性层并初始化权重/偏置。
     pub fn new(in_features: usize, out_features: usize, use_bias: bool) -> Self {
         let weight = xavier_uniform(out_features, in_features);
         let bias = if use_bias { Some(zeros_grad(out_features)) } else { None };
@@ -59,6 +63,7 @@ impl Linear {
 }
 
 impl Module for Linear {
+    // 前向计算接口：接收输入张量并返回输出张量。
     fn forward(&self, input: &Tensor) -> Tensor {
         // input: [batch, in_features], weight: [out, in]
         // output = input @ weight^T + bias = [batch, out]
@@ -71,6 +76,7 @@ impl Module for Linear {
         }
     }
 
+    // 返回当前模块需要优化或保存的参数张量列表。
     fn parameters(&self) -> Vec<Tensor> {
         let mut params = vec![self.weight.clone()];
         if let Some(ref b) = self.bias {
@@ -90,10 +96,11 @@ pub struct Dropout {
 }
 
 impl Dropout {
+    /// 创建 Dropout 层并设置丢弃率。
     pub fn new(rate: f32) -> Self {
         Dropout { rate, training: true }
     }
-
+    /// 执行 Dropout 前向：训练期随机置零并缩放，评估期直通。
     pub fn forward(&self, input: &Tensor) -> Tensor {
         if !self.training || self.rate == 0.0 {
             return input.clone();
@@ -109,10 +116,11 @@ impl Dropout {
         let mask = Tensor::new(mask_data, input.shape());
         mul(input, &mask)
     }
-
+    /// 切换到评估模式（禁用随机丢弃）。
     pub fn eval(&mut self) {
         self.training = false;
     }
+    /// 切换到训练模式（启用随机丢弃）。
     pub fn train(&mut self) {
         self.training = true;
     }
@@ -132,8 +140,7 @@ pub struct LoRALinear {
 }
 
 impl LoRALinear {
-    /// Wrap an existing Linear with LoRA adapters.
-    /// Freezes the base weight (requires_grad = false).
+    /// 基于已有线性层创建 LoRA 适配器并冻结基座参数。
     pub fn new(base: Linear, rank: usize, alpha: f32) -> Self {
         let in_features = base.weight.shape()[1];
         let out_features = base.weight.shape()[0];
@@ -156,8 +163,7 @@ impl LoRALinear {
             rank,
         }
     }
-
-    /// Create LoRA from scratch (new Linear + LoRA adapters).
+    /// 按维度直接构造 LoRA 线性层。
     pub fn from_dims(in_features: usize, out_features: usize, use_bias: bool, rank: usize, alpha: f32) -> Self {
         let base = Linear::new(in_features, out_features, use_bias);
         Self::new(base, rank, alpha)
@@ -165,6 +171,7 @@ impl LoRALinear {
 }
 
 impl Module for LoRALinear {
+    // 前向计算接口：接收输入张量并返回输出张量。
     fn forward(&self, input: &Tensor) -> Tensor {
         // Base: x @ W^T
         let base_out = self.base.forward(input);
@@ -180,6 +187,7 @@ impl Module for LoRALinear {
         add(&base_out, &lora_out)
     }
 
+    // 返回当前模块需要优化或保存的参数张量列表。
     fn parameters(&self) -> Vec<Tensor> {
         // Only return trainable LoRA parameters
         vec![self.lora_a.clone(), self.lora_b.clone()]
@@ -187,16 +195,14 @@ impl Module for LoRALinear {
 }
 
 impl LoRALinear {
-    /// Return all parameters including frozen base (for checkpoint saving).
+    /// 返回包含基座参数与 LoRA 参数的完整参数列表。
     pub fn all_parameters(&self) -> Vec<Tensor> {
         let mut p = self.base.parameters();
         p.push(self.lora_a.clone());
         p.push(self.lora_b.clone());
         p
     }
-
-    /// Merge LoRA weights into base: W' = W + (alpha/rank) * B @ A
-    /// After merging, the LoRA adapters are zeroed out.
+    /// 将 LoRA 增量权重合并进基座权重。
     pub fn merge(&self) {
         let a_data = self.lora_a.contiguous_data();
         let b_data = self.lora_b.contiguous_data();
@@ -233,6 +239,7 @@ pub struct Embedding {
 }
 
 impl Embedding {
+    /// 创建 Embedding 层。
     pub fn new(num_embeddings: usize, embedding_dim: usize) -> Self {
         let mut rng = rand::thread_rng();
         let data: Vec<f32> = (0..num_embeddings * embedding_dim)
@@ -242,11 +249,11 @@ impl Embedding {
             weight: Tensor::with_grad(data, vec![num_embeddings, embedding_dim], true),
         }
     }
-
+    /// 按 token 索引查表并返回 embedding。
     pub fn forward_indices(&self, indices: &[usize]) -> Tensor {
         embedding_lookup(&self.weight, indices)
     }
-
+    /// 返回 Embedding 可训练参数。
     pub fn parameters(&self) -> Vec<Tensor> {
         vec![self.weight.clone()]
     }
@@ -262,6 +269,7 @@ pub struct LayerNorm {
 }
 
 impl LayerNorm {
+    /// 创建 LayerNorm 层。
     pub fn new(normalized_shape: usize) -> Self {
         LayerNorm {
             gamma: Tensor::with_grad(vec![1.0; normalized_shape], vec![normalized_shape], true),
@@ -273,6 +281,7 @@ impl LayerNorm {
 }
 
 impl Module for LayerNorm {
+    // 前向计算接口：接收输入张量并返回输出张量。
     fn forward(&self, input: &Tensor) -> Tensor {
         let shape = input.shape();
         let data = input.contiguous_data();
@@ -315,6 +324,7 @@ impl Module for LayerNorm {
         res
     }
 
+    // 返回当前模块需要优化或保存的参数张量列表。
     fn parameters(&self) -> Vec<Tensor> {
         vec![self.gamma.clone(), self.beta.clone()]
     }
@@ -331,6 +341,7 @@ struct LayerNormOp {
 }
 
 impl sptorch_core_tensor::Op for LayerNormOp {
+    // 反向传播：根据上游梯度计算对输入/参数的梯度。
     fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
         let g = grad_output.contiguous_data();
         let dim = self.dim;
@@ -394,6 +405,7 @@ pub struct MultiHeadAttention {
 }
 
 impl MultiHeadAttention {
+    /// 创建多头自注意力层，要求 `d_model % n_head == 0`。
     pub fn new(d_model: usize, n_head: usize) -> Self {
         assert_eq!(d_model % n_head, 0);
         let head_dim = d_model / n_head;
@@ -407,8 +419,7 @@ impl MultiHeadAttention {
             wo: Linear::new(d_model, d_model, false),
         }
     }
-
-    /// input: [seq_len, d_model], returns [seq_len, d_model]
+    /// 执行带因果掩码的自注意力前向。
     pub fn forward_causal(&self, input: &Tensor) -> Tensor {
         let shape = input.shape();
         let seq_len = shape[0];
@@ -457,7 +468,7 @@ impl MultiHeadAttention {
         // Output projection
         self.wo.forward(&out_2d)
     }
-
+    /// 返回注意力层全部参数。
     pub fn parameters(&self) -> Vec<Tensor> {
         let mut p = Vec::new();
         p.extend(self.wq.parameters());
@@ -509,6 +520,7 @@ struct ReshapeToHeadsOp {
 }
 
 impl sptorch_core_tensor::Op for ReshapeToHeadsOp {
+    // 反向传播：根据上游梯度计算对输入/参数的梯度。
     fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
         // Reverse: [n_head, seq_len, head_dim] -> [seq_len, d_model]
         let g = grad_output.contiguous_data();
@@ -565,6 +577,7 @@ struct ReshapeFromHeadsOp {
 }
 
 impl sptorch_core_tensor::Op for ReshapeFromHeadsOp {
+    // 反向传播：根据上游梯度计算对输入/参数的梯度。
     fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
         // Reverse: [seq_len, d_model] -> [n_head, seq_len, head_dim]
         let g = grad_output.contiguous_data();
@@ -617,6 +630,7 @@ struct BatchTransposeOp {
 }
 
 impl sptorch_core_tensor::Op for BatchTransposeOp {
+    // 反向传播：根据上游梯度计算对输入/参数的梯度。
     fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
         // Transpose back: [B, cols, rows] -> [B, rows, cols]
         let g = grad_output.contiguous_data();
@@ -646,6 +660,7 @@ pub struct TransformerBlock {
 }
 
 impl TransformerBlock {
+    /// 创建 TransformerBlock（注意力 + FFN + LayerNorm）。
     pub fn new(d_model: usize, n_head: usize, d_ff: usize) -> Self {
         TransformerBlock {
             ln1: LayerNorm::new(d_model),
@@ -657,8 +672,7 @@ impl TransformerBlock {
             ffn_dropout: Dropout::new(0.1),
         }
     }
-
-    /// input: [seq_len, d_model] -> [seq_len, d_model]
+    /// 执行 TransformerBlock 前向（含残差连接）。
     pub fn forward_seq(&self, input: &Tensor) -> Tensor {
         let normed = self.ln1.forward(input);
         let attn_out = self.attn.forward_causal(&normed);
@@ -670,7 +684,7 @@ impl TransformerBlock {
         let ffn_out = self.ffn_dropout.forward(&self.ffn_down.forward(&ffn_out));
         add(&x, &ffn_out)
     }
-
+    /// 设置块内 Dropout 的训练/评估状态。
     pub fn set_training(&mut self, training: bool) {
         if training {
             self.attn_dropout.train();
@@ -680,7 +694,7 @@ impl TransformerBlock {
             self.ffn_dropout.eval();
         }
     }
-
+    /// 返回 TransformerBlock 全部参数。
     pub fn parameters(&self) -> Vec<Tensor> {
         let mut p = Vec::new();
         p.extend(self.ln1.parameters());
@@ -704,6 +718,7 @@ pub struct GPT {
 }
 
 impl GPT {
+    /// 创建 GPT 模型。
     pub fn new(vocab_size: usize, d_model: usize, n_head: usize, n_layer: usize, d_ff: usize, seq_len: usize) -> Self {
         let blocks = (0..n_layer)
             .map(|_| TransformerBlock::new(d_model, n_head, d_ff))
@@ -717,9 +732,7 @@ impl GPT {
             seq_len,
         }
     }
-
-    /// token_ids: &[usize] of length <= seq_len
-    /// returns logits: [seq_len, vocab_size]
+    /// 将 token 序列前向为 logits。
     pub fn forward_ids(&self, token_ids: &[usize]) -> Tensor {
         let slen = token_ids.len();
         assert!(slen <= self.seq_len);
@@ -736,7 +749,7 @@ impl GPT {
         let x = self.ln_f.forward(&x);
         self.lm_head.forward(&x)
     }
-
+    /// 返回 GPT 全部可训练参数。
     pub fn parameters(&self) -> Vec<Tensor> {
         let mut p = Vec::new();
         p.extend(self.token_emb.parameters());
@@ -751,7 +764,7 @@ impl GPT {
 }
 
 // ============ Text Generation ============
-
+/// 贪心解码生成 token 序列。
 pub fn generate_greedy(model: &GPT, prompt: &[usize], max_new_tokens: usize, vocab_size: usize) -> Vec<usize> {
     let mut ids = prompt.to_vec();
     for _ in 0..max_new_tokens {
@@ -773,7 +786,7 @@ pub fn generate_greedy(model: &GPT, prompt: &[usize], max_new_tokens: usize, voc
     }
     ids
 }
-
+/// 按 temperature 与 top-k 采样生成序列。
 pub fn generate_with_sampling(
     model: &GPT,
     prompt: &[usize],
@@ -839,20 +852,21 @@ pub struct TokenTrie {
 }
 
 impl Default for TokenTrie {
+    // 默认构造一个空 Trie。
     fn default() -> Self {
         Self::new()
     }
 }
 
 impl TokenTrie {
+    /// 创建空 TokenTrie。
     pub fn new() -> Self {
         TokenTrie {
             children: std::collections::HashMap::new(),
             is_terminal: false,
         }
     }
-
-    /// Insert a token sequence into the trie.
+    /// 向 Trie 插入一条合法 token 路径。
     pub fn insert(&mut self, tokens: &[usize]) {
         let mut node = self;
         for &t in tokens {
@@ -860,9 +874,7 @@ impl TokenTrie {
         }
         node.is_terminal = true;
     }
-
-    /// Get the set of allowed next tokens given a prefix of already-generated tokens.
-    /// Returns None if the prefix doesn't match any path (unconstrained fallback).
+    /// 查询给定前缀下允许的下一 token 集合。
     pub fn allowed_tokens(&self, prefix: &[usize]) -> Option<Vec<usize>> {
         let mut node = self;
         for &t in prefix {
@@ -872,29 +884,28 @@ impl TokenTrie {
             }
         }
         if node.children.is_empty() {
-            None // terminal or dead end — no constraint
+            None // 到达终止节点或死路时不再施加约束
         } else {
             Some(node.children.keys().copied().collect())
         }
     }
 }
 
-/// Trait for custom token constraints at each decoding step.
-/// Implement this to plug in SQL grammar, regex, or schema-based constraints.
+/// 每一步解码可插拔约束的抽象接口。
+/// 可用于接入 SQL 语法、正则或 schema 约束。
 pub trait TokenConstraint: Send + Sync {
-    /// Given the tokens generated so far, return the set of allowed next token IDs.
-    /// Return None to allow all tokens (unconstrained).
+    /// 根据当前已生成序列，返回下一步允许的 token ID 集合。
+    /// 返回 `None` 表示放开约束，允许全部 token。
     fn allowed_next(&self, generated: &[usize]) -> Option<Vec<usize>>;
 }
 
 impl TokenConstraint for TokenTrie {
+    // 按当前已生成序列返回下一步允许的 token 集合。
     fn allowed_next(&self, generated: &[usize]) -> Option<Vec<usize>> {
         self.allowed_tokens(generated)
     }
 }
-
-/// Generate tokens with constraints applied at each step.
-/// Disallowed tokens get logit = -inf before sampling.
+/// 在约束条件下执行采样生成。
 pub fn generate_constrained(
     model: &GPT,
     prompt: &[usize],
@@ -975,6 +986,7 @@ pub fn generate_constrained(
 mod tests {
     use super::*;
 
+    // 验证线性层前向输出形状正确。
     #[test]
     fn test_linear_forward_shape() {
         let linear = Linear::new(4, 3, true);
@@ -983,6 +995,7 @@ mod tests {
         assert_eq!(out.shape(), vec![2, 3]);
     }
 
+    // 验证关闭 bias 时参数数量符合预期。
     #[test]
     fn test_linear_no_bias() {
         let linear = Linear::new(3, 2, false);
@@ -990,6 +1003,7 @@ mod tests {
         assert_eq!(linear.parameters().len(), 1);
     }
 
+    // 验证启用 bias 时参数数量符合预期。
     #[test]
     fn test_linear_with_bias() {
         let linear = Linear::new(3, 2, true);
@@ -997,6 +1011,7 @@ mod tests {
         assert_eq!(linear.parameters().len(), 2);
     }
 
+    // 验证 embedding 查表输出形状正确。
     #[test]
     fn test_embedding_forward() {
         let emb = Embedding::new(10, 4);
@@ -1004,6 +1019,7 @@ mod tests {
         assert_eq!(out.shape(), vec![3, 4]);
     }
 
+    // 验证一维 LayerNorm 输出均值接近 0。
     #[test]
     fn test_layer_norm_forward_1d() {
         let ln = LayerNorm::new(3);
@@ -1015,6 +1031,7 @@ mod tests {
         assert!(mean.abs() < 1e-5);
     }
 
+    // 验证二维 LayerNorm 每行归一化有效。
     #[test]
     fn test_layer_norm_forward_2d() {
         let ln = LayerNorm::new(4);
@@ -1029,6 +1046,7 @@ mod tests {
         assert!(mean1.abs() < 1e-5);
     }
 
+    // 验证 Xavier Uniform 采样值位于理论区间。
     #[test]
     fn test_xavier_uniform_range() {
         let t = xavier_uniform(100, 100);
@@ -1039,6 +1057,7 @@ mod tests {
         }
     }
 
+    // 验证 Kaiming Normal 样本均值接近 0。
     #[test]
     fn test_kaiming_normal_stats() {
         let t = kaiming_normal(1000, 100);
@@ -1058,6 +1077,7 @@ mod tests {
         assert_eq!(out.shape(), vec![4, 8]);
     }
 
+    // 验证多头注意力参数数量与结构一致。
     #[test]
     fn test_mha_parameters_count() {
         let mha = MultiHeadAttention::new(8, 2);
@@ -1085,6 +1105,7 @@ mod tests {
         assert_eq!(logits.shape(), vec![4, 16]); // [seq_len, vocab_size]
     }
 
+    // 验证 GPT 参数总数与模块拆分一致。
     #[test]
     fn test_gpt_parameters() {
         let gpt = GPT::new(16, 8, 2, 1, 32, 8);
@@ -1093,6 +1114,7 @@ mod tests {
         assert_eq!(params.len(), 17);
     }
 
+    // 验证 GPT 反向传播可执行且参数梯度存在。
     #[test]
     fn test_gpt_backward_runs() {
         let gpt = GPT::new(8, 4, 2, 1, 16, 4);
@@ -1139,6 +1161,7 @@ mod tests {
         assert_eq!(out.shape(), vec![2, 3]);
     }
 
+    // 验证 LoRA 仅适配器参数参与训练。
     #[test]
     fn test_lora_only_adapters_trainable() {
         let lora = LoRALinear::from_dims(4, 3, true, 2, 1.0);
@@ -1150,6 +1173,7 @@ mod tests {
         assert!(!lora.base.weight.requires_grad());
     }
 
+    // 验证 LoRA 初始输出与基座线性层一致。
     #[test]
     fn test_lora_starts_as_base() {
         // With B initialized to zeros, LoRA output should equal base output
@@ -1193,6 +1217,7 @@ mod tests {
         }
     }
 
+    // 验证 LoRA 反向传播后适配器梯度可用。
     #[test]
     fn test_lora_backward_runs() {
         let lora = LoRALinear::from_dims(4, 3, false, 2, 1.0);
@@ -1206,6 +1231,7 @@ mod tests {
         assert!(lora.lora_b.grad().is_some(), "lora_b has no gradient");
     }
 
+    // 验证 LoRA merge 会按公式更新基座权重。
     #[test]
     fn test_lora_merge() {
         let lora = LoRALinear::from_dims(4, 3, false, 2, 2.0);
@@ -1265,13 +1291,14 @@ mod tests {
         allowed.sort();
         assert_eq!(allowed, vec![2, 3]);
 
-        // After [0, 1, 2], terminal — no children
+        // 前缀 [0, 1, 2] 到达终止节点，没有子分支
         assert_eq!(trie.allowed_tokens(&[0, 1, 2]), None);
 
         // Invalid prefix
         assert_eq!(trie.allowed_tokens(&[5]), None);
     }
 
+    // 验证 TokenConstraint trait 在 Trie 上的行为。
     #[test]
     fn test_trie_constraint_trait() {
         let mut trie = TokenTrie::new();
@@ -1286,6 +1313,7 @@ mod tests {
         assert_eq!(allowed, vec![20, 30]);
     }
 
+    // 验证约束生成严格遵守 Trie 可选 token。
     #[test]
     fn test_constrained_generation_respects_trie() {
         // Build a tiny model and a trie that only allows token 0 -> 1 -> 2
@@ -1313,6 +1341,7 @@ mod tests {
         assert_eq!(out.data(), vec![1.0, 2.0, 3.0, 4.0]);
     }
 
+    // 验证 dropout 率为 0 时输出不变。
     #[test]
     fn test_dropout_zero_rate() {
         let drop = Dropout::new(0.0);
@@ -1320,10 +1349,10 @@ mod tests {
         let out = drop.forward(&input);
         assert_eq!(out.data(), vec![1.0, 2.0, 3.0]);
     }
-
+    // 验证训练模式下高 dropout 率会产生大量 0。
     #[test]
     fn test_dropout_train_has_zeros() {
-        let drop = Dropout::new(0.9); // 90% dropout — almost all zeros
+        let drop = Dropout::new(0.9); // 90% dropout，理论上大多数位置会被置零
         let input = Tensor::new(vec![1.0; 100], vec![100]);
         let out = drop.forward(&input);
         let zeros = out.data().iter().filter(|&&x| x == 0.0).count();
@@ -1334,9 +1363,10 @@ mod tests {
         );
     }
 
+    // 验证 inverted dropout 近似保持期望均值。
     #[test]
     fn test_dropout_scale_preserves_mean() {
-        // With inverted dropout, E[output] ≈ E[input]
+        // inverted dropout 下，输出期望值应接近输入期望值
         let drop = Dropout::new(0.5);
         let input = Tensor::new(vec![2.0; 10000], vec![10000]);
         let out = drop.forward(&input);

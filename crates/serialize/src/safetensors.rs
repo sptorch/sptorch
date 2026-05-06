@@ -61,19 +61,15 @@ impl SafeTensorsFile {
 
         Ok(SafeTensorsFile { tensors })
     }
-
-    /// Get a tensor by name.
+    /// `get`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn get(&self, name: &str) -> Option<&Tensor> {
         self.tensors.get(name)
     }
-
-    /// List all tensor names.
+    /// `names`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn names(&self) -> Vec<&str> {
         self.tensors.keys().map(|s| s.as_str()).collect()
     }
-
-    /// Load tensors into existing model parameters by name mapping.
-    /// `mapping` maps model param index -> safetensors tensor name.
+    /// `load_into`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn load_into(&self, params: &[Tensor], mapping: &[(usize, &str)]) -> io::Result<()> {
         for &(idx, name) in mapping {
             let src = self.tensors.get(name).ok_or_else(|| {
@@ -106,6 +102,7 @@ impl SafeTensorsFile {
     }
 }
 
+// 按 safetensors 的 dtype 将原始字节流转换为 f32 向量。
 fn convert_to_f32(dtype: &str, bytes: &[u8]) -> io::Result<Vec<f32>> {
     match dtype {
         "F32" => {
@@ -148,6 +145,7 @@ fn convert_to_f32(dtype: &str, bytes: &[u8]) -> io::Result<Vec<f32>> {
     }
 }
 
+// 将 IEEE 754 half (f16) 位模式手动扩展为 f32。
 fn f16_to_f32(bits: u16) -> f32 {
     let sign = ((bits >> 15) & 1) as u32;
     let exp = ((bits >> 10) & 0x1F) as u32;
@@ -177,6 +175,7 @@ fn f16_to_f32(bits: u16) -> f32 {
     f32::from_bits((sign << 31) | (f32_exp << 23) | (mant << 13))
 }
 
+// 将 bfloat16 通过高 16 位对齐方式转换为 f32。
 fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
@@ -185,6 +184,7 @@ fn bf16_to_f32(bits: u16) -> f32 {
 mod tests {
     use super::*;
 
+    // 验证 f16 常见值转换结果。
     #[test]
     fn test_f16_to_f32_basic() {
         // f16 for 1.0: sign=0, exp=15, mant=0 -> bits = 0x3C00
@@ -200,6 +200,7 @@ mod tests {
         assert!((val - (-1.0)).abs() < 1e-6);
     }
 
+    // 验证 bf16 常见值转换结果。
     #[test]
     fn test_bf16_to_f32_basic() {
         // bf16 for 1.0: 0x3F80 (upper 16 bits of f32 1.0 = 0x3F800000)
@@ -210,6 +211,7 @@ mod tests {
         assert_eq!(val, 0.0);
     }
 
+    // 验证 F32 字节序列可被正确解析。
     #[test]
     fn test_convert_f32() {
         let data: Vec<u8> = vec![1.0f32, 2.0, 3.0].iter().flat_map(|f| f.to_le_bytes()).collect();
@@ -217,6 +219,7 @@ mod tests {
         assert_eq!(result, vec![1.0, 2.0, 3.0]);
     }
 
+    // 构造最小 safetensors 文件，验证加载与张量形状/数据。
     #[test]
     fn test_load_safetensors_synthetic() {
         // Build a minimal safetensors file in memory
@@ -253,6 +256,7 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    // 验证按名称映射将 safetensors 权重写回模型参数。
     #[test]
     fn test_load_into_params() {
         // Build safetensors file

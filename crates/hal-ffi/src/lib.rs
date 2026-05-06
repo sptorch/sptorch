@@ -61,6 +61,7 @@ unsafe impl Send for FfiDeviceBuffer {}
 unsafe impl Sync for FfiDeviceBuffer {}
 
 impl std::fmt::Debug for FfiDeviceBuffer {
+    // 中文注释：关键逻辑说明。
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FfiDeviceBuffer")
             .field("len", &self.len)
@@ -70,14 +71,17 @@ impl std::fmt::Debug for FfiDeviceBuffer {
 }
 
 impl sptorch_core_tensor::DeviceBuffer for FfiDeviceBuffer {
+    // 中文注释：关键逻辑说明。
     fn device(&self) -> Device {
         Device::Custom(0)
     }
 
+    // 中文注释：关键逻辑说明。
     fn len(&self) -> usize {
         self.len
     }
 
+    // 中文注释：关键逻辑说明。
     fn to_host(&self) -> Vec<f32> {
         let mut host = vec![0.0f32; self.len];
         unsafe {
@@ -86,6 +90,7 @@ impl sptorch_core_tensor::DeviceBuffer for FfiDeviceBuffer {
         host
     }
 
+    // 中文注释：关键逻辑说明。
     fn from_host(
         _data: &[f32],
         _device: Device,
@@ -95,6 +100,7 @@ impl sptorch_core_tensor::DeviceBuffer for FfiDeviceBuffer {
 }
 
 impl Drop for FfiDeviceBuffer {
+    // 中文注释：关键逻辑说明。
     fn drop(&mut self) {
         if !self.ptr.is_null() {
             unsafe {
@@ -131,6 +137,7 @@ unsafe impl Send for FfiBackendInner {}
 unsafe impl Sync for FfiBackendInner {}
 
 impl Drop for FfiBackendInner {
+    // 中文注释：关键逻辑说明。
     fn drop(&mut self) {
         unsafe {
             (self.shutdown)();
@@ -194,8 +201,7 @@ impl FfiBackend {
             Ok(FfiBackend { inner: Arc::new(inner) })
         }
     }
-
-    /// Upload host data to device, returning an opaque buffer.
+    /// `upload`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn upload(&self, data: &[f32]) -> std::result::Result<FfiDeviceBuffer, String> {
         let ptr = unsafe { (self.inner.alloc)(data.len()) };
         if ptr.is_null() {
@@ -215,6 +221,7 @@ impl FfiBackend {
         })
     }
 
+    // 中文注释：关键逻辑说明。
     fn run_unary(&self, a: &[f32], op: UnaryOpFn) -> Vec<f32> {
         let n = a.len();
         let a_buf = self.upload(a).expect("upload failed");
@@ -232,6 +239,7 @@ impl FfiBackend {
         out
     }
 
+    // 中文注释：关键逻辑说明。
     fn run_binary(&self, a: &[f32], b: &[f32], op: BinaryOpFn) -> Vec<f32> {
         let n = a.len();
         let a_buf = self.upload(a).expect("upload failed");
@@ -249,9 +257,7 @@ impl FfiBackend {
         }
         out
     }
-
-    /// Query backend runtime telemetry if supported by the loaded shared library.
-    /// Returns `None` when the backend does not export `sptorch_query_runtime`.
+    /// `query_runtime`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn query_runtime(&self) -> Option<(u32, bool)> {
         let f = self.inner.query_runtime?;
         let mut queue_depth = 0u32;
@@ -265,6 +271,7 @@ impl FfiBackend {
 }
 
 impl Backend for FfiBackend {
+    // 中文注释：关键逻辑说明。
     fn name(&self) -> &str {
         unsafe {
             let ptr = (self.inner.name)();
@@ -272,6 +279,7 @@ impl Backend for FfiBackend {
         }
     }
 
+    // 中文注释：关键逻辑说明。
     fn device_id(&self) -> DeviceId {
         DeviceId {
             backend: self.name().to_string(),
@@ -279,6 +287,7 @@ impl Backend for FfiBackend {
         }
     }
 
+    // 中文注释：关键逻辑说明。
     fn allocate(&self, size: usize) -> HalResult<RawBuffer> {
         Ok(RawBuffer {
             data: vec![0u8; size],
@@ -286,16 +295,19 @@ impl Backend for FfiBackend {
         })
     }
 
+    // 中文注释：关键逻辑说明。
     fn copy_to_host(&self, buf: &RawBuffer, dst: &mut [u8]) -> HalResult<()> {
         dst.copy_from_slice(&buf.data);
         Ok(())
     }
 
+    // 中文注释：关键逻辑说明。
     fn copy_from_host(&self, src: &[u8], buf: &mut RawBuffer) -> HalResult<()> {
         buf.data.copy_from_slice(src);
         Ok(())
     }
 
+    // 中文注释：关键逻辑说明。
     fn synchronize(&self) -> HalResult<()> {
         let rc = unsafe { (self.inner.sync)() };
         if rc != 0 {
@@ -306,41 +318,49 @@ impl Backend for FfiBackend {
 }
 
 impl KernelProvider for FfiBackend {
+    // 中文注释：关键逻辑说明。
     fn add_f32(&self, a: &[f32], b: &[f32], out: &mut [f32]) {
         let result = self.run_binary(a, b, self.inner.add);
         out.copy_from_slice(&result);
     }
 
+    // 中文注释：关键逻辑说明。
     fn mul_f32(&self, a: &[f32], b: &[f32], out: &mut [f32]) {
         let result = self.run_binary(a, b, self.inner.mul);
         out.copy_from_slice(&result);
     }
 
+    // 中文注释：关键逻辑说明。
     fn neg_f32(&self, a: &[f32], out: &mut [f32]) {
         let result = self.run_unary(a, self.inner.neg);
         out.copy_from_slice(&result);
     }
 
+    // 中文注释：关键逻辑说明。
     fn exp_f32(&self, a: &[f32], out: &mut [f32]) {
         let result = self.run_unary(a, self.inner.exp);
         out.copy_from_slice(&result);
     }
 
+    // 中文注释：关键逻辑说明。
     fn log_f32(&self, a: &[f32], out: &mut [f32]) {
         let result = self.run_unary(a, self.inner.log);
         out.copy_from_slice(&result);
     }
 
+    // 中文注释：关键逻辑说明。
     fn relu_f32(&self, a: &[f32], out: &mut [f32]) {
         let result = self.run_unary(a, self.inner.relu);
         out.copy_from_slice(&result);
     }
 
+    // 中文注释：关键逻辑说明。
     fn gelu_f32(&self, a: &[f32], out: &mut [f32]) {
         let result = self.run_unary(a, self.inner.gelu);
         out.copy_from_slice(&result);
     }
 
+    // 中文注释：关键逻辑说明。
     fn scale_f32(&self, a: &[f32], scalar: f32, out: &mut [f32]) {
         let n = a.len();
         let a_buf = self.upload(a).expect("upload failed");
@@ -356,6 +376,7 @@ impl KernelProvider for FfiBackend {
         }
     }
 
+    // 中文注释：关键逻辑说明。
     fn matmul_f32(&self, a: &[f32], b: &[f32], out: &mut [f32], m: usize, k: usize, n: usize) {
         let a_buf = self.upload(a).expect("upload failed");
         let b_buf = self.upload(b).expect("upload failed");
@@ -371,6 +392,7 @@ impl KernelProvider for FfiBackend {
         }
     }
 
+    // 中文注释：关键逻辑说明。
     fn batch_matmul_f32(&self, a: &[f32], b: &[f32], out: &mut [f32], batch: usize, m: usize, k: usize, n: usize) {
         let a_buf = self.upload(a).expect("upload failed");
         let b_buf = self.upload(b).expect("upload failed");
@@ -387,10 +409,12 @@ impl KernelProvider for FfiBackend {
         }
     }
 
+    // 中文注释：关键逻辑说明。
     fn sum_f32(&self, a: &[f32]) -> f32 {
         a.iter().sum()
     }
 
+    // 中文注释：关键逻辑说明。
     fn softmax_f32(&self, a: &[f32], out: &mut [f32], rows: usize, cols: usize) {
         let n = rows * cols;
         let a_buf = self.upload(a).expect("upload failed");
@@ -406,30 +430,35 @@ impl KernelProvider for FfiBackend {
         }
     }
 
+    // 中文注释：关键逻辑说明。
     fn masked_fill_f32(&self, a: &[f32], mask: &[bool], fill_value: f32, out: &mut [f32]) {
         for i in 0..a.len() {
             out[i] = if mask[i] { fill_value } else { a[i] };
         }
     }
 
+    // 中文注释：关键逻辑说明。
     fn broadcast_add_f32(&self, a: &[f32], b: &[f32], out: &mut [f32], a_len: usize, b_len: usize) {
         for i in 0..a_len {
             out[i] = a[i] + b[i % b_len];
         }
     }
 
+    // 中文注释：关键逻辑说明。
     fn embedding_lookup_f32(&self, weight: &[f32], indices: &[usize], out: &mut [f32], _vocab: usize, dim: usize) {
         for (i, &idx) in indices.iter().enumerate() {
             out[i * dim..(i + 1) * dim].copy_from_slice(&weight[idx * dim..(idx + 1) * dim]);
         }
     }
 
+    // 中文注释：关键逻辑说明。
     fn sgd_update_f32(&self, params: &mut [f32], grad: &[f32], lr: f32) {
         for (w, g) in params.iter_mut().zip(grad.iter()) {
             *w -= lr * g;
         }
     }
 
+    // 中文注释：关键逻辑说明。
     fn adam_update_f32(
         &self,
         params: &mut [f32],

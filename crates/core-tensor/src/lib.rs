@@ -19,29 +19,37 @@ use std::sync::OnceLock;
 
 /// Trait object for dispatching compute to registered backends.
 pub trait BackendDispatch: Send + Sync {
+    // 后端逐元素加法内核接口。
     fn add_f32(&self, a: &[f32], b: &[f32], out: &mut [f32]);
+    // 后端逐元素乘法内核接口。
     fn mul_f32(&self, a: &[f32], b: &[f32], out: &mut [f32]);
+    // 后端逐元素取负内核接口。
     fn neg_f32(&self, a: &[f32], out: &mut [f32]);
+    // 后端逐元素指数内核接口。
     fn exp_f32(&self, a: &[f32], out: &mut [f32]);
+    // 后端逐元素对数内核接口。
     fn log_f32(&self, a: &[f32], out: &mut [f32]);
+    // 后端 ReLU 激活内核接口。
     fn relu_f32(&self, a: &[f32], out: &mut [f32]);
+    // 后端 GELU 激活内核接口。
     fn gelu_f32(&self, a: &[f32], out: &mut [f32]);
+    // 后端标量缩放内核接口。
     fn scale_f32(&self, a: &[f32], scalar: f32, out: &mut [f32]);
+    // 后端矩阵乘法内核接口。
     fn matmul_f32(&self, a: &[f32], b: &[f32], out: &mut [f32], m: usize, k: usize, n: usize);
 }
 
 static BACKEND_REGISTRY: OnceLock<RwLock<HashMap<Device, Arc<dyn BackendDispatch>>>> = OnceLock::new();
 
+// 延迟初始化并返回全局后端注册表。
 fn registry() -> &'static RwLock<HashMap<Device, Arc<dyn BackendDispatch>>> {
     BACKEND_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
 }
-
-/// Register a backend for a specific device.
+/// 注册指定设备的后端实现，用于后续算子分发。
 pub fn register_backend(device: Device, backend: Arc<dyn BackendDispatch>) {
     registry().write().unwrap().insert(device, backend);
 }
-
-/// Get the registered backend for a device, if any.
+/// 按设备查询已注册后端；未注册时返回 `None`。
 pub fn get_backend(device: &Device) -> Option<Arc<dyn BackendDispatch>> {
     registry().read().unwrap().get(device).cloned()
 }
@@ -70,6 +78,7 @@ pub enum TensorError {
 pub type Result<T> = std::result::Result<T, TensorError>;
 
 pub trait Op: std::fmt::Debug + Send + Sync {
+    // 根据上游梯度计算当前节点对输入的梯度。
     fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>>;
 }
 
@@ -95,7 +104,7 @@ pub enum DType {
 }
 
 // ============ F16/BF16 conversion utilities ============
-
+/// 将 `f32` 量化为 IEEE754 half(`f16`) 位表示。
 pub fn f32_to_f16(val: f32) -> u16 {
     let bits = val.to_bits();
     let sign = (bits >> 16) & 0x8000;
@@ -121,7 +130,7 @@ pub fn f32_to_f16(val: f32) -> u16 {
 
     (sign | ((new_exp as u32) << 10) | (mant >> 13)) as u16
 }
-
+/// 将 `f16` 位表示还原为 `f32`。
 pub fn f16_to_f32(bits: u16) -> f32 {
     let sign = ((bits >> 15) & 1) as u32;
     let exp = ((bits >> 10) & 0x1F) as u32;
@@ -148,11 +157,11 @@ pub fn f16_to_f32(bits: u16) -> f32 {
     let f32_exp = exp + 127 - 15;
     f32::from_bits((sign << 31) | (f32_exp << 23) | (mant << 13))
 }
-
+/// 将 `f32` 转换为 `bf16` 位表示（保留高 16 位）。
 pub fn f32_to_bf16(val: f32) -> u16 {
     (val.to_bits() >> 16) as u16
 }
-
+/// 将 `bf16` 位表示还原为 `f32`。
 pub fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
@@ -160,12 +169,17 @@ pub fn bf16_to_f32(bits: u16) -> f32 {
 /// Trait for opaque device memory buffers (GPU, NPU, etc.).
 /// Implementors hold device-side memory and provide host transfer.
 pub trait DeviceBuffer: Send + Sync + fmt::Debug {
+    // 返回该缓冲区所属设备。
     fn device(&self) -> Device;
+    // 返回缓冲区内元素数量。
     fn len(&self) -> usize;
+    // 是否为空缓冲区（默认实现基于 len）。
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+    // 将设备侧数据拷回主机内存。
     fn to_host(&self) -> Vec<f32>;
+    // 从主机数据创建指定设备上的缓冲区实例。
     fn from_host(data: &[f32], device: Device) -> std::result::Result<Box<dyn DeviceBuffer>, String>
     where
         Self: Sized;
@@ -177,21 +191,22 @@ pub enum Storage {
 }
 
 impl Storage {
+    /// 用主机内存构造 `Storage::Cpu`。
     pub fn cpu(data: Vec<f32>) -> Self {
         Storage::Cpu(data)
     }
-
+    /// 判断当前存储是否位于 CPU。
     pub fn is_cpu(&self) -> bool {
         matches!(self, Storage::Cpu(_))
     }
-
+    /// 以不可变切片形式借用 CPU 存储；设备存储会 panic。
     pub fn as_cpu_slice(&self) -> &[f32] {
         match self {
             Storage::Cpu(v) => v,
             Storage::Device(_) => panic!("cannot borrow device storage as CPU slice; call to_cpu_vec() first"),
         }
     }
-
+    /// 尝试以不可变切片借用 CPU 存储；设备存储返回错误。
     pub fn try_as_cpu_slice(&self) -> Result<&[f32]> {
         match self {
             Storage::Cpu(v) => Ok(v),
@@ -200,14 +215,14 @@ impl Storage {
             )),
         }
     }
-
+    /// 以可变切片形式借用 CPU 存储；设备存储会 panic。
     pub fn as_cpu_slice_mut(&mut self) -> &mut [f32] {
         match self {
             Storage::Cpu(v) => v,
             Storage::Device(_) => panic!("cannot mutably borrow device storage as CPU slice"),
         }
     }
-
+    /// 尝试以可变切片借用 CPU 存储；设备存储返回错误。
     pub fn try_as_cpu_slice_mut(&mut self) -> Result<&mut [f32]> {
         match self {
             Storage::Cpu(v) => Ok(v),
@@ -216,25 +231,25 @@ impl Storage {
             )),
         }
     }
-
+    /// 将任意存储统一导出为 CPU `Vec<f32>`。
     pub fn to_cpu_vec(&self) -> Vec<f32> {
         match self {
             Storage::Cpu(v) => v.clone(),
             Storage::Device(buf) => buf.to_host(),
         }
     }
-
+    /// 返回存储元素数量。
     pub fn len(&self) -> usize {
         match self {
             Storage::Cpu(v) => v.len(),
             Storage::Device(buf) => buf.len(),
         }
     }
-
+    /// 判断存储是否为空。
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-
+    /// 返回存储所在设备。
     pub fn device(&self) -> Device {
         match self {
             Storage::Cpu(_) => Device::CPU,
@@ -244,6 +259,7 @@ impl Storage {
 }
 
 impl fmt::Debug for Storage {
+    // 自定义调试输出，便于快速查看张量关键元数据。
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Storage::Cpu(v) => f.debug_tuple("Cpu").field(v).finish(),
@@ -269,6 +285,7 @@ pub struct TensorInner {
 pub struct Tensor(pub Arc<RwLock<TensorInner>>);
 
 impl Tensor {
+    /// 根据数据与形状创建 `Tensor`，默认 `dtype=F32` 且不追踪梯度。
     pub fn new(data: Vec<f32>, shape: Vec<usize>) -> Self {
         let strides = compute_strides(&shape);
         let inner = TensorInner {
@@ -284,39 +301,37 @@ impl Tensor {
         };
         Tensor(Arc::new(RwLock::new(inner)))
     }
-
+    /// 创建张量并显式设置 `requires_grad`。
     pub fn with_grad(data: Vec<f32>, shape: Vec<usize>, requires_grad: bool) -> Self {
         let t = Self::new(data, shape);
         t.0.write().unwrap().requires_grad = requires_grad;
         t
     }
-
+    /// 返回张量数据的 CPU 拷贝。
     pub fn data(&self) -> Vec<f32> {
         self.0.read().unwrap().storage.read().unwrap().to_cpu_vec()
     }
-
+    /// 返回张量形状。
     pub fn shape(&self) -> Vec<usize> {
         self.0.read().unwrap().shape.clone()
     }
-
+    /// 返回张量步长。
     pub fn strides(&self) -> Vec<usize> {
         self.0.read().unwrap().strides.clone()
     }
-
+    /// 返回元素总数（shape 连乘）。
     pub fn numel(&self) -> usize {
         self.shape().iter().product()
     }
-
+    /// 返回张量设备信息。
     pub fn device(&self) -> Device {
         self.0.read().unwrap().device
     }
-
+    /// 返回张量数据类型。
     pub fn dtype(&self) -> DType {
         self.0.read().unwrap().dtype
     }
-
-    /// Convert tensor to a different dtype. Returns a new tensor with converted data.
-    /// Computation always happens in f32; this controls storage precision.
+    /// 将张量转换到目标 dtype；形状保持不变。
     pub fn to_dtype(&self, target: DType) -> Tensor {
         let current = self.dtype();
         if current == target {
@@ -338,25 +353,19 @@ impl Tensor {
         t.0.write().unwrap().dtype = target;
         t
     }
-
-    /// Shorthand for to_dtype(DType::F16)
+    /// 将张量转换为 `F16`。
     pub fn half(&self) -> Tensor {
         self.to_dtype(DType::F16)
     }
-
-    /// Shorthand for to_dtype(DType::BF16)
+    /// 将张量转换为 `BF16`。
     pub fn bfloat16(&self) -> Tensor {
         self.to_dtype(DType::BF16)
     }
-
-    /// Shorthand for to_dtype(DType::F32)
+    /// 将张量转换为 `F32`。
     pub fn float(&self) -> Tensor {
         self.to_dtype(DType::F32)
     }
-
-    /// Move tensor to a different device. Returns a new tensor on the target device.
-    /// Requires a BackendDispatch registered for the target device (for GPU upload).
-    /// Moving to CPU always works.
+    /// 将张量迁移到目标设备（当前实现为主机拷贝语义）。
     pub fn to_device(&self, target: Device) -> Tensor {
         let current = self.device();
         if current == target {
@@ -372,22 +381,20 @@ impl Tensor {
         }
         t
     }
-
-    /// Move tensor to GPU (Cuda device 0). Shorthand for to_device(Device::Cuda(0)).
+    /// 将张量迁移到默认 CUDA 设备 `Cuda(0)`。
     pub fn cuda(&self) -> Tensor {
         self.to_device(Device::Cuda(0))
     }
-
-    /// Move tensor to CPU. Shorthand for to_device(Device::CPU).
+    /// 将张量迁移到 CPU。
     pub fn cpu(&self) -> Tensor {
         self.to_device(Device::CPU)
     }
-
+    /// 判断张量是否为连续内存布局。
     pub fn is_contiguous(&self) -> bool {
         let inner = self.0.read().unwrap();
         inner.strides == compute_strides(&inner.shape)
     }
-
+    /// 按逻辑索引顺序提取连续数据；支持非连续视图重排。
     pub fn contiguous_data(&self) -> Vec<f32> {
         let inner = self.0.read().unwrap();
         let storage = inner.storage.read().unwrap();
@@ -418,11 +425,11 @@ impl Tensor {
         }
         result
     }
-
+    /// 返回是否追踪梯度。
     pub fn requires_grad(&self) -> bool {
         self.0.read().unwrap().requires_grad
     }
-
+    /// 将传入梯度累加到当前张量梯度缓冲。
     pub fn accum_grad(&self, grad_tensor: &Tensor) {
         let mut inner = self.0.write().unwrap();
         if !inner.requires_grad {
@@ -442,12 +449,12 @@ impl Tensor {
             inner.grad = Some(Tensor::new(incoming_data, inner.shape.clone()));
         }
     }
-
+    /// 返回当前累计梯度（若存在）。
     pub fn grad(&self) -> Option<Vec<f32>> {
         let inner = self.0.read().unwrap();
         inner.grad.as_ref().map(|g| g.data())
     }
-
+    /// 以当前张量为起点执行反向传播并沿计算图累计梯度。
     pub fn backward(&self) {
         let shape = self.shape();
         let size: usize = shape.iter().product();
@@ -482,6 +489,7 @@ impl Tensor {
     }
 }
 
+// 按行主序计算每个维度的步长。
 fn compute_strides(shape: &[usize]) -> Vec<usize> {
     let mut strides = vec![1; shape.len()];
     for i in (0..shape.len() - 1).rev() {
@@ -491,6 +499,7 @@ fn compute_strides(shape: &[usize]) -> Vec<usize> {
 }
 
 impl fmt::Debug for Tensor {
+    // 自定义调试输出，便于快速查看张量关键元数据。
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let inner = self.0.read().unwrap();
         f.debug_struct("Tensor")
@@ -507,6 +516,7 @@ impl fmt::Debug for Tensor {
 mod tests {
     use super::*;
 
+    // 测试：验证 f32_f16_roundtrip 的行为与数值正确性。
     #[test]
     fn test_f32_f16_roundtrip() {
         let vals = [0.0f32, 1.0, -1.0, 0.5, 65504.0, -65504.0, 1e-4];
@@ -522,6 +532,7 @@ mod tests {
         }
     }
 
+    // 测试：验证 f32_bf16_roundtrip 的行为与数值正确性。
     #[test]
     fn test_f32_bf16_roundtrip() {
         let vals = [0.0f32, 1.0, -1.0, 3.14, 1e10, -1e10];
@@ -537,12 +548,14 @@ mod tests {
         }
     }
 
+    // 测试：验证 tensor_dtype 的行为与数值正确性。
     #[test]
     fn test_tensor_dtype() {
         let t = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]);
         assert_eq!(t.dtype(), DType::F32);
     }
 
+    // 测试：验证 tensor_half 的行为与数值正确性。
     #[test]
     fn test_tensor_half() {
         let t = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]);
@@ -555,6 +568,7 @@ mod tests {
         assert!((d[2] - 3.0).abs() < 1e-3);
     }
 
+    // 测试：验证 tensor_bfloat16 的行为与数值正确性。
     #[test]
     fn test_tensor_bfloat16() {
         let t = Tensor::new(vec![1.0, 2.0, 3.0], vec![3]);
@@ -566,6 +580,7 @@ mod tests {
         assert!((d[2] - 3.0).abs() < 0.02);
     }
 
+    // 测试：验证 tensor_float_roundtrip 的行为与数值正确性。
     #[test]
     fn test_tensor_float_roundtrip() {
         let t = Tensor::new(vec![1.5, 2.5, 3.5], vec![3]);
@@ -576,6 +591,7 @@ mod tests {
         assert!((d[0] - 1.5).abs() < 1e-3);
     }
 
+    // 测试：验证 tensor_to_dtype_noop 的行为与数值正确性。
     #[test]
     fn test_tensor_to_dtype_noop() {
         let t = Tensor::new(vec![1.0], vec![1]);
@@ -584,6 +600,7 @@ mod tests {
         assert_eq!(same.data(), t.data());
     }
 
+    // 测试：验证 f16_precision_loss 的行为与数值正确性。
     #[test]
     fn test_f16_precision_loss() {
         // f16 has ~3 decimal digits of precision

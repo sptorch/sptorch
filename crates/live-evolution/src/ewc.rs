@@ -17,10 +17,7 @@ pub struct EWC {
 }
 
 impl EWC {
-    /// Create EWC from current model parameters and their gradients.
-    /// Call this after training on a task, before starting the next task.
-    /// `params` are the trained parameters, `grads` are gradients from a
-    /// representative forward pass on the old task data.
+    /// `new`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn new(params: &[Tensor], grads: &[Vec<f32>], lambda: f32) -> Self {
         let param_snapshot: Vec<Vec<f32>> = params.iter().map(|p| p.contiguous_data()).collect();
 
@@ -32,8 +29,7 @@ impl EWC {
             lambda,
         }
     }
-
-    /// Compute the EWC penalty: (lambda/2) * sum_i F_i * (theta_i - theta_star_i)^2
+    /// `penalty`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn penalty(&self, current_params: &[Tensor]) -> f32 {
         let mut total = 0.0f32;
         for (i, param) in current_params.iter().enumerate() {
@@ -47,9 +43,7 @@ impl EWC {
         }
         self.lambda * 0.5 * total
     }
-
-    /// Compute EWC gradient contribution for each parameter.
-    /// Returns: lambda * F_i * (theta_i - theta_star_i) for each param.
+    /// `penalty_grads`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn penalty_grads(&self, current_params: &[Tensor]) -> Vec<Vec<f32>> {
         current_params
             .iter()
@@ -66,8 +60,7 @@ impl EWC {
             })
             .collect()
     }
-
-    /// Apply EWC penalty gradients to existing parameter gradients (in-place addition).
+    /// `apply_penalty`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn apply_penalty(&self, params: &[Tensor]) {
         let penalty_grads = self.penalty_grads(params);
         for (param, pg) in params.iter().zip(penalty_grads.iter()) {
@@ -82,7 +75,7 @@ impl EWC {
             }
         }
     }
-
+    /// `num_params`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn num_params(&self) -> usize {
         self.param_snapshot.len()
     }
@@ -92,6 +85,7 @@ impl EWC {
 mod tests {
     use super::*;
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_ewc_zero_penalty_at_snapshot() {
         let params = vec![
@@ -106,6 +100,7 @@ mod tests {
         assert!(penalty.abs() < 1e-10);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_ewc_penalty_increases_with_drift() {
         let params = vec![Tensor::new(vec![1.0, 2.0], vec![2])];
@@ -119,6 +114,7 @@ mod tests {
         assert!((penalty - 0.5).abs() < 1e-6);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_ewc_penalty_grads() {
         let params = vec![Tensor::new(vec![1.0, 2.0], vec![2])];
@@ -133,6 +129,7 @@ mod tests {
         assert!((pg[0][1] - 4.0).abs() < 1e-6);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_ewc_high_fisher_resists_change() {
         let params = vec![Tensor::new(vec![1.0, 1.0], vec![2])];

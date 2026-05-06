@@ -1,7 +1,6 @@
 /// CPU-local allreduce utilities for single-machine multi-thread simulation.
 /// These are building blocks for the distributed allreduce over gRPC.
-
-/// Average multiple gradient vectors element-wise.
+/// 对多份同形状梯度做逐元素平均。
 pub fn average_gradients(grads: &[Vec<f32>]) -> Vec<f32> {
     if grads.is_empty() {
         return Vec::new();
@@ -19,10 +18,7 @@ pub fn average_gradients(grads: &[Vec<f32>]) -> Vec<f32> {
     }
     result
 }
-
-/// Simulate Ring-AllReduce on local vectors.
-/// In a real distributed setting each "rank" lives on a different machine;
-/// here we run the algorithm in-process to validate correctness.
+/// 在本地模拟 ring-allreduce（scatter-reduce + allgather）。
 pub fn ring_allreduce(local_grads: &mut [Vec<f32>]) {
     let world = local_grads.len();
     if world <= 1 {
@@ -71,6 +67,7 @@ pub fn ring_allreduce(local_grads: &mut [Vec<f32>]) {
 mod tests {
     use super::*;
 
+    // 测试：验证 average_gradients 的行为与数值正确性。
     #[test]
     fn test_average_gradients() {
         let g1 = vec![1.0, 2.0, 3.0];
@@ -79,6 +76,7 @@ mod tests {
         assert_eq!(avg, vec![2.0, 3.0, 4.0]);
     }
 
+    // 测试：验证 average_gradients_single 的行为与数值正确性。
     #[test]
     fn test_average_gradients_single() {
         let g = vec![1.0, 2.0];
@@ -86,6 +84,7 @@ mod tests {
         assert_eq!(avg, g);
     }
 
+    // 测试：验证 average_gradients_empty 的行为与数值正确性。
     #[test]
     fn test_average_gradients_empty() {
         let avg = average_gradients(&[]);

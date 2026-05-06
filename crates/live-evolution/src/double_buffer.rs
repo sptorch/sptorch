@@ -19,7 +19,7 @@ pub struct DoubleBufferParams {
 }
 
 impl DoubleBufferParams {
-    /// Create from an initial set of parameters. Clones them into both buffers.
+    /// `new`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn new(params: &[Tensor]) -> Self {
         let buf_a: Vec<Tensor> = params.iter().map(clone_tensor).collect();
         let buf_b: Vec<Tensor> = params.iter().map(clone_tensor).collect();
@@ -30,9 +30,7 @@ impl DoubleBufferParams {
             swap_lock: Arc::new(RwLock::new(())),
         }
     }
-
-    /// Get a reference to the active (inference) parameters.
-    /// Note: caller must not hold this reference across a `swap()` call.
+    /// `active_params`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn active_params(&self) -> &[Tensor] {
         if self.a_is_active.load(Ordering::Acquire) {
             &self.buf_a
@@ -40,9 +38,7 @@ impl DoubleBufferParams {
             &self.buf_b
         }
     }
-
-    /// Get a reference to the shadow (training) parameters.
-    /// Note: caller must not hold this reference across a `swap()` call.
+    /// `shadow_params`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn shadow_params(&self) -> &[Tensor] {
         if self.a_is_active.load(Ordering::Acquire) {
             &self.buf_b
@@ -50,8 +46,7 @@ impl DoubleBufferParams {
             &self.buf_a
         }
     }
-
-    /// Get a clone of the active parameters' data (safe across swap).
+    /// `active_params_snapshot`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn active_params_snapshot(&self) -> Vec<Vec<f32>> {
         let _guard = self.swap_lock.read().unwrap();
         let params = if self.a_is_active.load(Ordering::Acquire) {
@@ -61,17 +56,13 @@ impl DoubleBufferParams {
         };
         params.iter().map(|p| p.contiguous_data()).collect()
     }
-
-    /// Atomic swap: shadow becomes active, old active becomes new shadow.
-    /// Call this after a training step completes.
+    /// `swap`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn swap(&self) {
         let _guard = self.swap_lock.write().unwrap();
         let prev = self.a_is_active.load(Ordering::Acquire);
         self.a_is_active.store(!prev, Ordering::Release);
     }
-
-    /// Copy active params into shadow (reset shadow to current active state).
-    /// Useful before starting a new training epoch.
+    /// `sync_shadow_from_active`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn sync_shadow_from_active(&self) {
         let _guard = self.swap_lock.write().unwrap();
         let (src, dst) = if self.a_is_active.load(Ordering::Acquire) {
@@ -86,12 +77,13 @@ impl DoubleBufferParams {
             d_storage.as_cpu_slice_mut().copy_from_slice(&src_data);
         }
     }
-
+    /// `num_params`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn num_params(&self) -> usize {
         self.buf_a.len()
     }
 }
 
+// 中文注释：关键逻辑说明。
 fn clone_tensor(t: &Tensor) -> Tensor {
     let data = t.contiguous_data();
     let shape = t.shape();
@@ -102,6 +94,7 @@ fn clone_tensor(t: &Tensor) -> Tensor {
 mod tests {
     use super::*;
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_double_buffer_initial_state() {
         let p = vec![Tensor::new(vec![1.0, 2.0, 3.0], vec![3])];
@@ -111,6 +104,7 @@ mod tests {
         assert_eq!(db.shadow_params()[0].data(), vec![1.0, 2.0, 3.0]);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_double_buffer_swap() {
         let p = vec![Tensor::new(vec![1.0, 2.0], vec![2])];
@@ -138,6 +132,7 @@ mod tests {
         assert_eq!(db.shadow_params()[0].data(), vec![1.0, 2.0]);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_sync_shadow_from_active() {
         let p = vec![Tensor::new(vec![5.0, 6.0], vec![2])];

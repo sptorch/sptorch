@@ -23,6 +23,7 @@ pub struct CoordinatorService {
 }
 
 impl CoordinatorService {
+    /// 创建分布式协调器状态并设置期望 world size。
     pub fn new(world_size: u32) -> Self {
         CoordinatorService {
             state: Arc::new(Mutex::new(CoordinatorState {
@@ -37,7 +38,7 @@ impl CoordinatorService {
             barrier_ready: Arc::new(Notify::new()),
         }
     }
-
+    /// 将协调器包装为 gRPC `NodeService` 服务对象。
     pub fn into_server(self) -> NodeServiceServer<Self> {
         NodeServiceServer::new(self)
     }
@@ -45,6 +46,7 @@ impl CoordinatorService {
 
 #[tonic::async_trait]
 impl NodeService for CoordinatorService {
+    // 返回存活状态与当前全局 step，供 worker 做健康检查。
     async fn heartbeat(&self, _request: Request<HeartbeatRequest>) -> Result<Response<HeartbeatResponse>, Status> {
         let state = self.state.lock().await;
         Ok(Response::new(HeartbeatResponse {
@@ -53,6 +55,7 @@ impl NodeService for CoordinatorService {
         }))
     }
 
+    // 注册新节点并分配 rank，同时回传当前集群成员列表。
     async fn register(&self, request: Request<RegisterRequest>) -> Result<Response<RegisterResponse>, Status> {
         let req = request.into_inner();
         let mut state = self.state.lock().await;
@@ -66,6 +69,7 @@ impl NodeService for CoordinatorService {
         }))
     }
 
+    // 聚合同一参数分片的梯度；收齐 world_size 份后返回平均梯度。
     async fn all_reduce_gradients(&self, request: Request<GradientChunk>) -> Result<Response<GradientChunk>, Status> {
         let req = request.into_inner();
         let param_idx = req.param_index;
@@ -111,6 +115,7 @@ impl NodeService for CoordinatorService {
         }
     }
 
+    // 屏障同步：所有节点到齐后推进全局 step 并清理本轮梯度缓存。
     async fn barrier(&self, request: Request<BarrierRequest>) -> Result<Response<BarrierResponse>, Status> {
         let req = request.into_inner();
 
@@ -138,12 +143,14 @@ impl NodeService for CoordinatorService {
     }
 }
 
+// 将按 little-endian 存储的字节流解码为 f32 向量。
 fn bytes_to_f32(data: &[u8]) -> Vec<f32> {
     data.chunks_exact(4)
         .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
         .collect()
 }
 
+// 将 f32 向量编码为 little-endian 字节流。
 fn f32_to_bytes(data: &[f32]) -> Vec<u8> {
     data.iter().flat_map(|f| f.to_le_bytes()).collect()
 }

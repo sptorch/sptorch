@@ -12,6 +12,7 @@ pub struct IncrementalTrainer<O: Optimizer> {
 }
 
 impl<O: Optimizer> IncrementalTrainer<O> {
+    /// `new`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn new(optimizer: O, params: Vec<Tensor>, micro_batch_size: usize) -> Self {
         IncrementalTrainer {
             optimizer,
@@ -21,32 +22,29 @@ impl<O: Optimizer> IncrementalTrainer<O> {
             total_steps: 0,
         }
     }
-
-    /// Push a new training sample. Returns true if a micro-batch was triggered.
+    /// `push_sample`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn push_sample(&mut self, input_ids: Vec<usize>, target_ids: Vec<usize>) -> bool {
         self.buffer.push((input_ids, target_ids));
         self.buffer.len() >= self.micro_batch_size
     }
-
-    /// Drain the buffer and return accumulated samples for training.
+    /// `drain_batch`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn drain_batch(&mut self) -> Vec<(Vec<usize>, Vec<usize>)> {
         let batch: Vec<_> = self.buffer.drain(..).collect();
         batch
     }
-
-    /// Record that a training step was completed.
+    /// `step_completed`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn step_completed(&mut self) {
         self.total_steps += 1;
     }
-
+    /// `total_steps`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn total_steps(&self) -> u64 {
         self.total_steps
     }
-
+    /// `buffer_len`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn buffer_len(&self) -> usize {
         self.buffer.len()
     }
-
+    /// `optimizer_mut`：中文注释，说明函数用途、输入约束与输出语义。
     pub fn optimizer_mut(&mut self) -> &mut O {
         &mut self.optimizer
     }
@@ -57,6 +55,7 @@ mod tests {
     use super::*;
     use sptorch_optim::SGD;
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_incremental_trainer_buffering() {
         let params = vec![Tensor::with_grad(vec![1.0, 2.0], vec![2], true)];
@@ -76,6 +75,7 @@ mod tests {
         assert_eq!(trainer.buffer_len(), 0);
     }
 
+    // 中文注释：关键逻辑说明。
     #[test]
     fn test_incremental_trainer_step_count() {
         let params = vec![Tensor::with_grad(vec![1.0], vec![1], true)];

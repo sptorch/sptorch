@@ -11,8 +11,6 @@ members = [
     "crates/data",
     "crates/serialize",
     "crates/runtime-cuda",
-    "crates/cli-train",
-    "crates/cli-train-gpu",
     "crates/hal-ffi",
     "crates/mock-npu",
     "crates/distributed",

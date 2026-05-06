@@ -9,6 +9,7 @@ pub struct DataParallel {
 }
 
 impl DataParallel {
+    /// 创建数据并行执行器并声明可用 GPU 数量。
     pub fn new(num_gpus: usize) -> Self {
         let devices: Vec<Device> = (0..num_gpus).map(|i| Device::Cuda(i)).collect();
         DataParallel {
@@ -16,9 +17,7 @@ impl DataParallel {
             devices,
         }
     }
-
-    /// Split a batch of data evenly across devices.
-    /// Input shape: [batch, ...], returns Vec of [batch/world_size, ...] per device.
+    /// 按 batch 维切分输入并分配到不同设备。
     pub fn scatter(&self, data: &[f32], batch_size: usize, feature_dim: usize) -> Vec<(Vec<f32>, Device)> {
         let chunk_size = batch_size / self.world_size;
         let remainder = batch_size % self.world_size;
@@ -36,9 +35,7 @@ impl DataParallel {
 
         chunks
     }
-
-    /// Allreduce gradients across devices (simple average).
-    /// In a real multi-GPU setup this would use NCCL; here we simulate locally.
+    /// 对各卡参数梯度执行聚合平均。
     pub fn allreduce_grads(&self, param_grads: &[Vec<Vec<f32>>]) -> Vec<Vec<f32>> {
         if param_grads.is_empty() {
             return Vec::new();
@@ -61,12 +58,7 @@ impl DataParallel {
         averaged
     }
 }
-
-/// Simulate a DataParallel training step:
-/// 1. Scatter batch across devices
-/// 2. Forward + backward on each device (simulated)
-/// 3. Allreduce gradients
-/// 4. Update parameters
+/// 执行一次数据并行训练步骤（切分、前向、反向、梯度聚合）。
 pub fn data_parallel_step(
     dp: &DataParallel,
     params: &[Tensor],
@@ -90,6 +82,7 @@ pub fn data_parallel_step(
 mod tests {
     use super::*;
 
+    // 测试：验证 data_parallel_scatter 的行为与数值正确性。
     #[test]
     fn test_data_parallel_scatter() {
         let dp = DataParallel::new(2);
@@ -104,6 +97,7 @@ mod tests {
         assert_eq!(chunks[1].1, Device::Cuda(1));
     }
 
+    // 测试：验证 data_parallel_scatter_uneven 的行为与数值正确性。
     #[test]
     fn test_data_parallel_scatter_uneven() {
         let dp = DataParallel::new(3);
@@ -117,6 +111,7 @@ mod tests {
         assert_eq!(chunks[2].0.len(), 2); // 1 sample
     }
 
+    // 测试：验证 allreduce_grads 的行为与数值正确性。
     #[test]
     fn test_allreduce_grads() {
         let dp = DataParallel::new(2);
@@ -129,6 +124,7 @@ mod tests {
         assert_eq!(avg, vec![vec![2.0, 3.0, 4.0]]);
     }
 
+    // 测试：验证 data_parallel_step 的行为与数值正确性。
     #[test]
     fn test_data_parallel_step() {
         let dp = DataParallel::new(2);
@@ -148,6 +144,7 @@ mod tests {
         assert!((w[2] - 2.6).abs() < 1e-6);
     }
 
+    // 测试：验证 data_parallel_multi_param 的行为与数值正确性。
     #[test]
     fn test_data_parallel_multi_param() {
         let dp = DataParallel::new(3);
