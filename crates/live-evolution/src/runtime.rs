@@ -101,7 +101,7 @@ async fn run_loop() {
 
             match monitor.record_loss(loss) {
                 MonitorAction::Continue => {
-                    if trainer.total_steps() % 3 == 0 {
+                    if trainer.total_steps().is_multiple_of(3) {
                         emit_fence_sequence(version_id).await;
                         db.swap();
                         version_id = version_id.wrapping_add(1);

@@ -11,7 +11,7 @@ pub struct DataParallel {
 impl DataParallel {
     /// 创建数据并行执行器并声明可用 GPU 数量。
     pub fn new(num_gpus: usize) -> Self {
-        let devices: Vec<Device> = (0..num_gpus).map(|i| Device::Cuda(i)).collect();
+        let devices: Vec<Device> = (0..num_gpus).map(Device::Cuda).collect();
         DataParallel {
             world_size: devices.len(),
             devices,

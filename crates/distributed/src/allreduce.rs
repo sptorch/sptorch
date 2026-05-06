@@ -25,7 +25,7 @@ pub fn ring_allreduce(local_grads: &mut [Vec<f32>]) {
         return;
     }
     let n = local_grads[0].len();
-    let chunk = (n + world - 1) / world;
+    let chunk = n.div_ceil(world);
 
     // Scatter-reduce: each rank accumulates one chunk from all peers
     for step in 0..world - 1 {
@@ -55,8 +55,9 @@ pub fn ring_allreduce(local_grads: &mut [Vec<f32>]) {
             let end = (start + chunk).min(n);
             if start < n {
                 let next = (rank + 1) % world;
-                for i in start..end {
-                    local_grads[next][i] = local_grads[rank][i];
+                let src = local_grads[rank][start..end].to_vec();
+                for (dst, value) in local_grads[next][start..end].iter_mut().zip(src) {
+                    *dst = value;
                 }
             }
         }
