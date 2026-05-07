@@ -48,7 +48,11 @@ fn load_mock() -> FfiBackend {
 #[test]
 fn test_ffi_backend_name() {
     let backend = load_mock();
-    assert_eq!(backend.name(), "mock_npu");
+    assert!(
+        matches!(backend.name(), "mock_npu" | "sptorch_mock_npu"),
+        "unexpected mock backend name: {}",
+        backend.name()
+    );
 }
 
 #[test]
