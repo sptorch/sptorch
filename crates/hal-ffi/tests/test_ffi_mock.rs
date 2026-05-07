@@ -2,28 +2,45 @@ use sptorch_hal::{Backend, KernelProvider};
 use sptorch_hal_ffi::FfiBackend;
 use std::path::PathBuf;
 
-fn mock_npu_path() -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.pop(); // crates/
-    p.pop(); // project root
-    p.push("target");
-    p.push("debug");
-    if cfg!(target_os = "windows") {
-        p.push("sptorch_mock_npu.dll");
-    } else if cfg!(target_os = "macos") {
-        p.push("libmock_npu.dylib");
-    } else {
-        p.push("libmock_npu.so");
+fn target_debug_dir() -> PathBuf {
+    if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
+        return PathBuf::from(target_dir).join("debug");
     }
-    p
+
+    let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    dir.pop(); // crates/
+    dir.pop(); // project root
+    dir.join("target").join("debug")
+}
+
+fn mock_npu_candidates() -> Vec<PathBuf> {
+    let debug_dir = target_debug_dir();
+    let names: &[&str] = if cfg!(target_os = "windows") {
+        &["mock_npu.dll", "sptorch_mock_npu.dll"]
+    } else if cfg!(target_os = "macos") {
+        &["libmock_npu.dylib", "libsptorch_mock_npu.dylib"]
+    } else {
+        &["libmock_npu.so", "libsptorch_mock_npu.so"]
+    };
+
+    names.iter().map(|name| debug_dir.join(name)).collect()
+}
+
+fn mock_npu_path() -> PathBuf {
+    let candidates = mock_npu_candidates();
+    candidates
+        .iter()
+        .find(|path| path.exists())
+        .cloned()
+        .unwrap_or_else(|| candidates[0].clone())
 }
 
 fn load_mock() -> FfiBackend {
     let path = mock_npu_path();
     assert!(
         path.exists(),
-        "sptorch_mock_npu lib not found at {:?}. Run `cargo build -p sptorch-mock-npu` first.",
-        path
+        "sptorch_mock_npu lib not found. Tried {:?}. Run `cargo build -p sptorch-mock-npu` first.",
+        mock_npu_candidates()
     );
     FfiBackend::load(&path).expect("failed to load mock NPU backend")
 }
@@ -31,7 +48,7 @@ fn load_mock() -> FfiBackend {
 #[test]
 fn test_ffi_backend_name() {
     let backend = load_mock();
-    assert_eq!(backend.name(), "sptorch_mock_npu");
+    assert_eq!(backend.name(), "mock_npu");
 }
 
 #[test]
