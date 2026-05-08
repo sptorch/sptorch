@@ -119,6 +119,23 @@ impl fmt::Display for HalError {
 
 impl std::error::Error for HalError {}
 
+/// Minimal hardware fence snapshot shared by HAL, planners and Studio.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FenceState {
+    pub phase: String,
+    pub queue_depth: u32,
+    pub synced: bool,
+    pub message: String,
+}
+
+/// Minimal queue telemetry for heterogeneous backends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueState {
+    pub depth: u32,
+    pub capacity: u32,
+    pub draining: bool,
+}
+
 /// HAL 操作的标准返回类型。
 pub type HalResult<T> = Result<T, HalError>;
 
@@ -444,6 +461,25 @@ mod tests {
     use super::*;
 
     // 这组 CPU 测试定义了 HAL 的“金标准”数值语义，外部硬件后端应以它为对照。
+
+    #[test]
+    fn test_fence_and_queue_state_types() {
+        let fence = FenceState {
+            phase: "WaitFence".into(),
+            queue_depth: 7,
+            synced: false,
+            message: "draining kernel queue".into(),
+        };
+        let queue = QueueState {
+            depth: 7,
+            capacity: 16,
+            draining: true,
+        };
+        assert_eq!(fence.phase, "WaitFence");
+        assert_eq!(queue.depth, fence.queue_depth);
+        assert!(queue.draining);
+    }
+
     #[test]
     fn test_cpu_backend_add() {
         let backend = CpuBackend;

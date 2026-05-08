@@ -12,6 +12,7 @@
 //! - 维护最小 autograd 图，并用迭代队列执行反向传播。
 //! - 提供全局后端注册表，让算子可以按设备分发到外部后端。
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fmt;
@@ -19,6 +20,56 @@ use std::sync::OnceLock;
 use std::sync::{Arc, RwLock};
 
 use thiserror::Error;
+
+thread_local! {
+    static GRAD_ENABLED: Cell<bool> = const { Cell::new(true) };
+}
+
+/// 返回当前线程是否允许新算子挂接 autograd 计算图。
+///
+/// 这个开关只影响“新产生的 Tensor 是否记录 creator”，不会修改已经存在的
+/// `requires_grad` 标记。这样可以模拟 PyTorch 的 `no_grad` 语义：参数仍然是
+/// 可训练参数，但在推理或权重检查路径里不会额外挂图。
+pub fn is_grad_enabled() -> bool {
+    GRAD_ENABLED.with(Cell::get)
+}
+
+/// 临时切换当前线程的梯度记录模式，离开作用域时自动恢复。
+///
+/// 这是底层守卫；普通调用者优先使用 [`no_grad`]，需要手动跨多个语句控制时
+/// 再持有该 guard。使用线程局部状态是为了避免一个训练 worker 的推理检查影响
+/// 其他 worker 的 autograd 行为。
+pub struct GradModeGuard {
+    previous: bool,
+}
+
+impl Drop for GradModeGuard {
+    fn drop(&mut self) {
+        GRAD_ENABLED.with(|enabled| enabled.set(self.previous));
+    }
+}
+
+/// 设置当前线程的梯度记录模式，并返回可恢复旧状态的 guard。
+pub fn set_grad_enabled(enabled: bool) -> GradModeGuard {
+    let previous = GRAD_ENABLED.with(|state| {
+        let previous = state.get();
+        state.set(enabled);
+        previous
+    });
+    GradModeGuard { previous }
+}
+
+/// 在不记录新 autograd 节点的模式下执行闭包。
+///
+/// 这不是“关闭参数训练”，而是“本段计算不参与反向图”。它适合验证集推理、
+/// 指标计算、权重导出前的探针计算等场景。
+pub fn no_grad<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    let _guard = set_grad_enabled(false);
+    f()
+}
 
 // ============ Global Backend Registry ============
 
@@ -408,9 +459,29 @@ impl Tensor {
         self.0.read().unwrap().strides.clone()
     }
 
+    /// 返回张量视图在底层 storage 中的逻辑起始偏移。
+    pub fn offset(&self) -> usize {
+        self.0.read().unwrap().offset
+    }
+
     /// 返回逻辑元素总数，即 shape 各维乘积。
     pub fn numel(&self) -> usize {
         self.shape().iter().product()
+    }
+
+    /// 返回张量秩，也就是 shape 维度数量。
+    pub fn rank(&self) -> usize {
+        self.0.read().unwrap().shape.len()
+    }
+
+    /// 标量在本框架里用 `[1]` 表示；后续若引入零维张量，这里可以兼容扩展。
+    pub fn is_scalar(&self) -> bool {
+        self.numel() == 1
+    }
+
+    /// 判断两个张量是否具有完全相同的 shape。
+    pub fn same_shape(&self, other: &Tensor) -> bool {
+        self.shape() == other.shape()
     }
 
     /// 返回张量所在逻辑设备。
@@ -541,6 +612,45 @@ impl Tensor {
         self.0.read().unwrap().requires_grad
     }
 
+    /// 显式切换当前张量是否接收梯度。
+    ///
+    /// 关闭时会同时清空累计梯度和 creator，避免调用者误把旧图上的中间 Tensor
+    /// 当作新的叶子参数继续训练。开启时只允许未来的算子把它作为可训练输入，
+    /// 不会恢复已经丢弃的历史计算图。
+    pub fn set_requires_grad(&self, enabled: bool) {
+        let mut inner = self.0.write().unwrap();
+        inner.requires_grad = enabled;
+        if !enabled {
+            inner.grad = None;
+            inner.creator = None;
+        }
+    }
+
+    /// 返回一个共享数据但与当前计算图断开的 Tensor。
+    ///
+    /// detach 后的 Tensor 保留 shape、stride、offset、dtype、device 与 storage，
+    /// 但 `requires_grad=false` 且没有 creator。共享 storage 可以避免大权重复制；
+    /// 如果后续需要写时隔离，应在更高层引入 clone/copy 语义。
+    pub fn detach(&self) -> Tensor {
+        let inner = self.0.read().unwrap();
+        Tensor(Arc::new(RwLock::new(TensorInner {
+            storage: inner.storage.clone(),
+            shape: inner.shape.clone(),
+            strides: inner.strides.clone(),
+            offset: inner.offset,
+            dtype: inner.dtype,
+            device: inner.device,
+            requires_grad: false,
+            grad: None,
+            creator: None,
+        })))
+    }
+
+    /// 清空当前张量的累计梯度。
+    pub fn zero_grad(&self) {
+        self.0.write().unwrap().grad = None;
+    }
+
     /// 将传入梯度累加到当前张量的梯度槽。
     ///
     /// 同一个叶子节点可能通过多条路径影响 loss，因此这里必须累加而不是
@@ -615,10 +725,95 @@ impl Tensor {
 /// 按 row-major 连续布局计算每个维度的 stride。
 fn compute_strides(shape: &[usize]) -> Vec<usize> {
     let mut strides = vec![1; shape.len()];
+    if shape.is_empty() {
+        return strides;
+    }
     for i in (0..shape.len() - 1).rev() {
         strides[i] = strides[i + 1] * shape[i + 1];
     }
     strides
+}
+
+/// 计算两个 shape 的 PyTorch/Numpy 风格广播结果。
+///
+/// 规则从尾维开始对齐：相等维度直接保留，任一侧为 `1` 时扩展到另一侧；
+/// 其他组合不可广播。SPTorch 当前仍把标量表达为 `[1]`，因此该函数不额外
+/// 引入零维张量语义。
+pub fn broadcast_shape(a: &[usize], b: &[usize]) -> Result<Vec<usize>> {
+    let rank = a.len().max(b.len());
+    let mut out = vec![1; rank];
+    for i in 0..rank {
+        let a_dim = a.get(a.len().wrapping_sub(1 + i)).copied().unwrap_or(1);
+        let b_dim = b.get(b.len().wrapping_sub(1 + i)).copied().unwrap_or(1);
+        out[rank - 1 - i] = if a_dim == b_dim {
+            a_dim
+        } else if a_dim == 1 {
+            b_dim
+        } else if b_dim == 1 {
+            a_dim
+        } else {
+            return Err(TensorError::ShapeMismatch {
+                expected: a.to_vec(),
+                got: b.to_vec(),
+            });
+        };
+    }
+    Ok(out)
+}
+
+/// 判断两个 shape 是否可广播。
+pub fn can_broadcast(a: &[usize], b: &[usize]) -> bool {
+    broadcast_shape(a, b).is_ok()
+}
+
+/// 把已广播输出上的梯度归约回某个输入原始 shape。
+///
+/// 广播反向传播的核心是不沿着扩展维复制梯度，而是把这些维度求和。例如
+/// `[2, 3] + [3]` 中第二个输入在 batch 维被复用两次，所以它的梯度要按
+/// 第 0 维累加回 `[3]`。
+pub fn unbroadcast_grad(grad: &Tensor, target_shape: &[usize]) -> Tensor {
+    let grad_shape = grad.shape();
+    let grad_data = grad.contiguous_data();
+    let out_numel: usize = target_shape.iter().product();
+    let mut out = vec![0.0f32; out_numel];
+    if out_numel == 0 {
+        return Tensor::new(out, target_shape.to_vec());
+    }
+
+    let grad_rank = grad_shape.len();
+    let target_rank = target_shape.len();
+    let rank_offset = grad_rank.saturating_sub(target_rank);
+    let target_strides = compute_strides(target_shape);
+
+    for (flat_idx, value) in grad_data.iter().enumerate() {
+        let grad_indices = unravel_index(flat_idx, &grad_shape);
+        let mut target_flat = 0usize;
+        for target_dim in 0..target_rank {
+            let grad_dim = target_dim + rank_offset;
+            let coord = if target_shape[target_dim] == 1 {
+                0
+            } else {
+                grad_indices[grad_dim]
+            };
+            target_flat += coord * target_strides[target_dim];
+        }
+        out[target_flat] += value;
+    }
+
+    Tensor::new(out, target_shape.to_vec())
+}
+
+fn unravel_index(mut flat_idx: usize, shape: &[usize]) -> Vec<usize> {
+    let strides = compute_strides(shape);
+    let mut indices = vec![0; shape.len()];
+    for (dim, stride) in strides.iter().enumerate() {
+        if *stride == 0 {
+            continue;
+        }
+        indices[dim] = flat_idx / stride;
+        flat_idx %= stride;
+    }
+    indices
 }
 
 impl fmt::Debug for Tensor {
@@ -728,5 +923,64 @@ mod tests {
         let h = t.half();
         let d = h.data();
         assert!((d[0] - 1.001).abs() < 0.002);
+    }
+
+    #[test]
+    fn test_grad_mode_no_grad_restores_state() {
+        assert!(is_grad_enabled());
+        let result = no_grad(|| {
+            assert!(!is_grad_enabled());
+            42
+        });
+        assert_eq!(result, 42);
+        assert!(is_grad_enabled());
+    }
+
+    #[test]
+    fn test_detach_keeps_data_but_clears_autograd_state() {
+        let t = Tensor::with_grad(vec![1.0, 2.0], vec![2], true);
+        t.accum_grad(&Tensor::new(vec![3.0, 4.0], vec![2]));
+
+        let detached = t.detach();
+        assert_eq!(detached.data(), vec![1.0, 2.0]);
+        assert_eq!(detached.shape(), vec![2]);
+        assert!(!detached.requires_grad());
+        assert!(detached.grad().is_none());
+    }
+
+    #[test]
+    fn test_set_requires_grad_false_clears_grad() {
+        let t = Tensor::with_grad(vec![1.0], vec![1], true);
+        t.accum_grad(&Tensor::new(vec![2.0], vec![1]));
+        t.set_requires_grad(false);
+        assert!(!t.requires_grad());
+        assert!(t.grad().is_none());
+    }
+
+    #[test]
+    fn test_shape_helpers() {
+        let t = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
+        assert_eq!(t.rank(), 2);
+        assert_eq!(t.numel(), 6);
+        assert!(!t.is_scalar());
+        assert!(t.same_shape(&Tensor::new(vec![0.0; 6], vec![2, 3])));
+    }
+
+    #[test]
+    fn test_broadcast_shape_scalar_tail_and_batch() {
+        assert_eq!(broadcast_shape(&[2, 3], &[1]).unwrap(), vec![2, 3]);
+        assert_eq!(broadcast_shape(&[2, 3], &[3]).unwrap(), vec![2, 3]);
+        assert_eq!(broadcast_shape(&[4, 2, 3], &[1, 3]).unwrap(), vec![4, 2, 3]);
+        assert!(broadcast_shape(&[2, 3], &[2]).is_err());
+    }
+
+    #[test]
+    fn test_unbroadcast_grad_reduces_expanded_axes() {
+        let grad = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
+        let reduced = unbroadcast_grad(&grad, &[3]);
+        assert_eq!(reduced.data(), vec![5.0, 7.0, 9.0]);
+
+        let scalar = unbroadcast_grad(&grad, &[1]);
+        assert_eq!(scalar.data(), vec![21.0]);
     }
 }

@@ -108,13 +108,106 @@ pub fn load_checkpoint<P: AsRef<Path>>(path: P, params: &[Tensor]) -> io::Result
 
     Ok(())
 }
+/// 按参数名导出的稳定权重快照条目。
+#[derive(Debug, Clone)]
+pub struct StateDictEntry {
+    pub name: String,
+    pub shape: Vec<usize>,
+    pub dtype: sptorch_core_tensor::DType,
+    pub data: Vec<f32>,
+}
+
+/// 导出类似 PyTorch `state_dict` 的参数快照。
+///
+/// 参数名是稳定键，调用方应确保同一模型中名称唯一。这里返回的是内存
+/// 结构而不是文件格式，方便后续直接写入 JSON、checkpoint 或 safetensors。
+pub fn export_state_dict(params: &[(&str, Tensor)]) -> Vec<StateDictEntry> {
+    params
+        .iter()
+        .map(|(name, tensor)| StateDictEntry {
+            name: (*name).to_string(),
+            shape: tensor.shape(),
+            dtype: tensor.dtype(),
+            data: tensor.contiguous_data(),
+        })
+        .collect()
+}
+
+/// 按名称回写参数快照到模型张量。
+///
+/// 这个接口会严格检查名称、shape 和 dtype。只要其中任一项不匹配，就会
+/// 返回错误，避免把错误权重静默灌入模型。
+pub fn load_state_dict(params: &[(&str, Tensor)], entries: &[StateDictEntry]) -> io::Result<()> {
+    let by_name: std::collections::HashMap<&str, &StateDictEntry> =
+        entries.iter().map(|entry| (entry.name.as_str(), entry)).collect();
+
+    for (name, param) in params {
+        let entry = by_name.get(name).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("state_dict missing parameter '{name}'"),
+            )
+        })?;
+        if entry.shape != param.shape() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "shape mismatch for '{name}': state {:?}, model {:?}",
+                    entry.shape,
+                    param.shape()
+                ),
+            ));
+        }
+        if entry.dtype != param.dtype() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "dtype mismatch for '{name}': state {:?}, model {:?}",
+                    entry.dtype,
+                    param.dtype()
+                ),
+            ));
+        }
+        let inner = param.0.read().unwrap();
+        let mut storage = inner.storage.write().unwrap();
+        storage.as_cpu_slice_mut().copy_from_slice(&entry.data);
+    }
+
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
 
-    // 中文注释：关键逻辑说明。
+    #[test]
+    fn test_state_dict_roundtrip_by_name() {
+        let w = Tensor::with_grad(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], true);
+        let b = Tensor::with_grad(vec![5.0, 6.0], vec![2], true);
+        let state = export_state_dict(&[("linear.weight", w.clone()), ("linear.bias", b.clone())]);
+
+        let new_w = Tensor::with_grad(vec![0.0; 4], vec![2, 2], true);
+        let new_b = Tensor::with_grad(vec![0.0; 2], vec![2], true);
+        load_state_dict(
+            &[("linear.weight", new_w.clone()), ("linear.bias", new_b.clone())],
+            &state,
+        )
+        .unwrap();
+
+        assert_eq!(new_w.data(), vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(new_b.data(), vec![5.0, 6.0]);
+    }
+
+    #[test]
+    fn test_state_dict_rejects_shape_mismatch() {
+        let w = Tensor::new(vec![1.0, 2.0], vec![2]);
+        let state = export_state_dict(&[("w", w)]);
+        let target = Tensor::new(vec![0.0; 4], vec![4]);
+        let err = load_state_dict(&[("w", target)], &state).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
     #[test]
     fn test_save_load_roundtrip() {
         let p1 = Tensor::with_grad(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], true);
@@ -137,7 +230,6 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
-    // 中文注释：关键逻辑说明。
     #[test]
     fn test_load_shape_mismatch() {
         let p1 = Tensor::new(vec![1.0, 2.0], vec![2]);

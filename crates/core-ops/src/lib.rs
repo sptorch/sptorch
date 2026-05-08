@@ -5,11 +5,12 @@
 //! kernel。这里的目标是把数学语义写清楚，让 CPU fallback、CUDA 后端和未来
 //! Tank9k kernel 都能对齐同一套行为。
 //!
-//! 当前覆盖：add、mul、neg、sub、sum、mean、matmul、exp、log、reshape、
-//! transpose、softmax、log_softmax、cross_entropy_loss、embedding_lookup、relu、
-//! gelu、scale、masked_fill、batch_matmul、broadcast_add、concat。
+//! 当前覆盖：add、mul、neg、sub、sum、mean、sum_dim、mean_dim、matmul、exp、log、
+//! reshape、transpose、softmax、masked_softmax、log_softmax、cross_entropy_loss、
+//! embedding_lookup、relu、gelu、rms_norm、swiglu、scale、masked_fill、
+//! batch_matmul、broadcast_add、concat。
 
-use sptorch_core_tensor::{get_backend, Device, Node, Op, Tensor};
+use sptorch_core_tensor::{broadcast_shape, get_backend, is_grad_enabled, unbroadcast_grad, Device, Node, Op, Tensor};
 use std::sync::Arc;
 
 // ============ Backend-aware dispatch helper ============
@@ -46,6 +47,157 @@ fn dispatch_unary(
     } else {
         cpu_fn(a_data)
     }
+}
+
+fn should_track_grad(inputs: &[&Tensor]) -> bool {
+    is_grad_enabled() && inputs.iter().any(|t| t.requires_grad())
+}
+
+fn compute_strides(shape: &[usize]) -> Vec<usize> {
+    let mut strides = vec![1; shape.len()];
+    if shape.len() <= 1 {
+        return strides;
+    }
+    for i in (0..shape.len() - 1).rev() {
+        strides[i] = strides[i + 1] * shape[i + 1];
+    }
+    strides
+}
+
+fn unravel_index(mut flat_idx: usize, shape: &[usize]) -> Vec<usize> {
+    let strides = compute_strides(shape);
+    let mut indices = vec![0usize; shape.len()];
+    for (dim, stride) in strides.iter().enumerate() {
+        if *stride == 0 {
+            continue;
+        }
+        indices[dim] = flat_idx / stride;
+        flat_idx %= stride;
+    }
+    indices
+}
+
+fn broadcast_to_shape(data: &[f32], source_shape: &[usize], target_shape: &[usize]) -> Vec<f32> {
+    if source_shape == target_shape {
+        return data.to_vec();
+    }
+    let out_shape = broadcast_shape(source_shape, target_shape).expect("broadcast shape mismatch");
+    assert_eq!(out_shape, target_shape, "broadcast target shape mismatch");
+
+    let source_rank = source_shape.len();
+    let target_rank = target_shape.len();
+    let rank_offset = target_rank.saturating_sub(source_rank);
+    let source_strides = compute_strides(source_shape);
+    let mut out = vec![0.0f32; target_shape.iter().product()];
+
+    for idx in 0..out.len() {
+        let coord = unravel_index(idx, target_shape);
+        let mut src_idx = 0usize;
+        for d in 0..source_rank {
+            let dim = source_shape[d];
+            let c = coord[d + rank_offset];
+            let c = if dim == 1 { 0 } else { c };
+            src_idx += c * source_strides[d];
+        }
+        out[idx] = data[src_idx];
+    }
+    out
+}
+
+fn broadcast_binary_values(
+    a_data: &[f32],
+    a_shape: &[usize],
+    b_data: &[f32],
+    b_shape: &[usize],
+    f: impl Fn(f32, f32) -> f32,
+) -> (Vec<f32>, Vec<usize>) {
+    let out_shape = broadcast_shape(a_shape, b_shape).expect("broadcast shape mismatch");
+    let a_rank = a_shape.len();
+    let b_rank = b_shape.len();
+    let out_rank = out_shape.len();
+    let a_offset = out_rank.saturating_sub(a_rank);
+    let b_offset = out_rank.saturating_sub(b_rank);
+    let a_strides = compute_strides(a_shape);
+    let b_strides = compute_strides(b_shape);
+    let mut out = vec![0.0f32; out_shape.iter().product()];
+
+    for idx in 0..out.len() {
+        let coord = unravel_index(idx, &out_shape);
+
+        let mut a_idx = 0usize;
+        for d in 0..a_rank {
+            let dim = a_shape[d];
+            let c = coord[d + a_offset];
+            let c = if dim == 1 { 0 } else { c };
+            a_idx += c * a_strides[d];
+        }
+
+        let mut b_idx = 0usize;
+        for d in 0..b_rank {
+            let dim = b_shape[d];
+            let c = coord[d + b_offset];
+            let c = if dim == 1 { 0 } else { c };
+            b_idx += c * b_strides[d];
+        }
+
+        out[idx] = f(a_data[a_idx], b_data[b_idx]);
+    }
+
+    (out, out_shape)
+}
+
+fn reduced_shape(input_shape: &[usize], dim: usize, keepdim: bool) -> Vec<usize> {
+    if keepdim {
+        let mut shape = input_shape.to_vec();
+        shape[dim] = 1;
+        return shape;
+    }
+
+    let mut shape: Vec<usize> = input_shape
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &value)| if idx == dim { None } else { Some(value) })
+        .collect();
+    if shape.is_empty() {
+        shape.push(1);
+    }
+    shape
+}
+
+fn reduce_along_dim(data: &[f32], shape: &[usize], dim: usize, keepdim: bool, mean: bool) -> (Vec<f32>, Vec<usize>) {
+    assert!(!shape.is_empty(), "reduction requires a rank >= 1 tensor");
+    assert!(
+        dim < shape.len(),
+        "reduction dim {} out of range for rank {}",
+        dim,
+        shape.len()
+    );
+    let outer: usize = shape[..dim].iter().product();
+    let reduce_len = shape[dim];
+    let inner: usize = shape[dim + 1..].iter().product();
+    let mut out = vec![0.0f32; outer * inner];
+
+    for outer_idx in 0..outer {
+        for inner_idx in 0..inner {
+            let mut acc = 0.0f32;
+            let base = outer_idx * reduce_len * inner;
+            for reduce_idx in 0..reduce_len {
+                acc += data[base + reduce_idx * inner + inner_idx];
+            }
+            out[outer_idx * inner + inner_idx] = if mean { acc / reduce_len as f32 } else { acc };
+        }
+    }
+
+    (out, reduced_shape(shape, dim, keepdim))
+}
+
+fn expand_reduced_grad(grad_output: &Tensor, input_shape: &[usize], dim: usize, keepdim: bool) -> Vec<f32> {
+    let mut grad_shape = grad_output.shape();
+    if !keepdim && input_shape.len() > 1 {
+        grad_shape.insert(dim, 1);
+    }
+    let expanded = Tensor::new(grad_output.contiguous_data(), grad_shape);
+    broadcast_to_shape(&expanded.contiguous_data(), &expanded.shape(), input_shape)
 }
 
 // ============ GPU Accelerator (optional, via "cuda" feature) ============
@@ -128,35 +280,50 @@ fn dispatch_matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f3
 // ============ Add ============
 
 #[derive(Debug)]
-pub struct AddOp;
+pub struct AddOp {
+    a_shape: Vec<usize>,
+    b_shape: Vec<usize>,
+}
 
 impl Op for AddOp {
-    // 根据上游梯度计算当前节点对输入的梯度。
+    // 广播反向不能直接复制上游梯度，需要把扩展过的维度累加回输入原始 shape。
     fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
-        vec![Some(grad_output.clone()), Some(grad_output.clone())]
+        vec![
+            Some(unbroadcast_grad(grad_output, &self.a_shape)),
+            Some(unbroadcast_grad(grad_output, &self.b_shape)),
+        ]
     }
 }
-/// 逐元素加法：`a + b`，输入形状需要一致。
+
+/// 逐元素加法：`a + b`，支持标量、尾维和 batch 维广播。
 pub fn add(a: &Tensor, b: &Tensor) -> Tensor {
-    let a_data = a.data();
-    let b_data = b.data();
-    let shape = a.shape();
+    let a_data = a.contiguous_data();
+    let b_data = b.contiguous_data();
+    let a_shape = a.shape();
+    let b_shape = b.shape();
     let device = a.device();
 
-    let res_data = dispatch_binary(
-        &a_data,
-        &b_data,
-        &device,
-        |a, b| a.iter().zip(b.iter()).map(|(x, y)| x + y).collect(),
-        |backend, a, b, out| backend.add_f32(a, b, out),
-    );
+    let (res_data, shape) = if a_shape == b_shape {
+        (
+            dispatch_binary(
+                &a_data,
+                &b_data,
+                &device,
+                |a, b| a.iter().zip(b.iter()).map(|(x, y)| x + y).collect(),
+                |backend, a, b, out| backend.add_f32(a, b, out),
+            ),
+            a_shape.clone(),
+        )
+    } else {
+        broadcast_binary_values(&a_data, &a_shape, &b_data, &b_shape, |x, y| x + y)
+    };
     let res = Tensor::new(res_data, shape);
 
-    if a.requires_grad() || b.requires_grad() {
+    if should_track_grad(&[a, b]) {
         let mut inner = res.0.write().unwrap();
         inner.requires_grad = true;
         inner.creator = Some(Arc::new(Node {
-            op: Box::new(AddOp),
+            op: Box::new(AddOp { a_shape, b_shape }),
             inputs: vec![a.clone(), b.clone()],
         }));
     }
@@ -170,47 +337,61 @@ pub fn add(a: &Tensor, b: &Tensor) -> Tensor {
 pub struct MulOp {
     saved_a: Tensor,
     saved_b: Tensor,
+    a_shape: Vec<usize>,
+    b_shape: Vec<usize>,
 }
 
 impl Op for MulOp {
-    // 根据上游梯度计算当前节点对输入的梯度。
+    // 乘法反向先在输出 shape 上计算局部梯度，再把广播轴规约回各自输入。
     fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
-        let g = grad_output.data();
-        let a = self.saved_a.data();
-        let b = self.saved_b.data();
+        let out_shape = grad_output.shape();
+        let g = grad_output.contiguous_data();
+        let a = broadcast_to_shape(&self.saved_a.contiguous_data(), &self.a_shape, &out_shape);
+        let b = broadcast_to_shape(&self.saved_b.contiguous_data(), &self.b_shape, &out_shape);
 
         let da: Vec<f32> = g.iter().zip(b.iter()).map(|(g, b)| g * b).collect();
         let db: Vec<f32> = g.iter().zip(a.iter()).map(|(g, a)| g * a).collect();
 
         vec![
-            Some(Tensor::new(da, grad_output.shape())),
-            Some(Tensor::new(db, grad_output.shape())),
+            Some(unbroadcast_grad(&Tensor::new(da, out_shape.clone()), &self.a_shape)),
+            Some(unbroadcast_grad(&Tensor::new(db, out_shape), &self.b_shape)),
         ]
     }
 }
-/// 逐元素乘法：`a * b`，输入形状需要一致。
+
+/// 逐元素乘法：`a * b`，支持标量、尾维和 batch 维广播。
 pub fn mul(a: &Tensor, b: &Tensor) -> Tensor {
-    let a_data = a.data();
-    let b_data = b.data();
-    let shape = a.shape();
+    let a_data = a.contiguous_data();
+    let b_data = b.contiguous_data();
+    let a_shape = a.shape();
+    let b_shape = b.shape();
     let device = a.device();
 
-    let res_data = dispatch_binary(
-        &a_data,
-        &b_data,
-        &device,
-        |a, b| a.iter().zip(b.iter()).map(|(x, y)| x * y).collect(),
-        |backend, a, b, out| backend.mul_f32(a, b, out),
-    );
+    let (res_data, shape) = if a_shape == b_shape {
+        (
+            dispatch_binary(
+                &a_data,
+                &b_data,
+                &device,
+                |a, b| a.iter().zip(b.iter()).map(|(x, y)| x * y).collect(),
+                |backend, a, b, out| backend.mul_f32(a, b, out),
+            ),
+            a_shape.clone(),
+        )
+    } else {
+        broadcast_binary_values(&a_data, &a_shape, &b_data, &b_shape, |x, y| x * y)
+    };
     let res = Tensor::new(res_data, shape);
 
-    if a.requires_grad() || b.requires_grad() {
+    if should_track_grad(&[a, b]) {
         let mut inner = res.0.write().unwrap();
         inner.requires_grad = true;
         inner.creator = Some(Arc::new(Node {
             op: Box::new(MulOp {
                 saved_a: a.clone(),
                 saved_b: b.clone(),
+                a_shape,
+                b_shape,
             }),
             inputs: vec![a.clone(), b.clone()],
         }));
@@ -245,7 +426,7 @@ pub fn neg(a: &Tensor) -> Tensor {
     );
     let res = Tensor::new(res_data, shape);
 
-    if a.requires_grad() {
+    if should_track_grad(&[a]) {
         let mut inner = res.0.write().unwrap();
         inner.requires_grad = true;
         inner.creator = Some(Arc::new(Node {
@@ -284,11 +465,51 @@ pub fn sum(a: &Tensor) -> Tensor {
     let total: f32 = a_data.iter().sum();
     let res = Tensor::new(vec![total], vec![1]);
 
-    if a.requires_grad() {
+    if should_track_grad(&[a]) {
         let mut inner = res.0.write().unwrap();
         inner.requires_grad = true;
         inner.creator = Some(Arc::new(Node {
             op: Box::new(SumOp { input_shape: a.shape() }),
+            inputs: vec![a.clone()],
+        }));
+    }
+
+    res
+}
+
+#[derive(Debug)]
+pub struct SumDimOp {
+    input_shape: Vec<usize>,
+    dim: usize,
+    keepdim: bool,
+}
+
+impl Op for SumDimOp {
+    fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
+        let expanded = expand_reduced_grad(grad_output, &self.input_shape, self.dim, self.keepdim);
+        vec![Some(Tensor::new(expanded, self.input_shape.clone()))]
+    }
+}
+
+/// 沿指定维度求和，形状规则与 PyTorch 的 `sum(dim=...)` 对齐。
+///
+/// 当 `keepdim=false` 时，被规约的维度会从输出中移除；当 `keepdim=true` 时，
+/// 该维度保留为 1，方便后续广播回原始 shape。
+pub fn sum_dim(a: &Tensor, dim: usize, keepdim: bool) -> Tensor {
+    let data = a.contiguous_data();
+    let shape = a.shape();
+    let (out, out_shape) = reduce_along_dim(&data, &shape, dim, keepdim, false);
+    let res = Tensor::new(out, out_shape);
+
+    if should_track_grad(&[a]) {
+        let mut inner = res.0.write().unwrap();
+        inner.requires_grad = true;
+        inner.creator = Some(Arc::new(Node {
+            op: Box::new(SumDimOp {
+                input_shape: shape,
+                dim,
+                keepdim,
+            }),
             inputs: vec![a.clone()],
         }));
     }
@@ -322,13 +543,52 @@ pub fn mean(a: &Tensor) -> Tensor {
     let total: f32 = a_data.iter().sum();
     let res = Tensor::new(vec![total / n], vec![1]);
 
-    if a.requires_grad() {
+    if should_track_grad(&[a]) {
         let mut inner = res.0.write().unwrap();
         inner.requires_grad = true;
         inner.creator = Some(Arc::new(Node {
             op: Box::new(MeanOp {
                 input_shape: a.shape(),
                 numel: n,
+            }),
+            inputs: vec![a.clone()],
+        }));
+    }
+
+    res
+}
+
+#[derive(Debug)]
+pub struct MeanDimOp {
+    input_shape: Vec<usize>,
+    dim: usize,
+    keepdim: bool,
+}
+
+impl Op for MeanDimOp {
+    fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
+        let reduce_len = self.input_shape[self.dim] as f32;
+        let expanded = expand_reduced_grad(grad_output, &self.input_shape, self.dim, self.keepdim);
+        let da: Vec<f32> = expanded.iter().map(|v| *v / reduce_len).collect();
+        vec![Some(Tensor::new(da, self.input_shape.clone()))]
+    }
+}
+
+/// 沿指定维度求均值，输出 shape 规则与 `sum_dim` 一致。
+pub fn mean_dim(a: &Tensor, dim: usize, keepdim: bool) -> Tensor {
+    let data = a.contiguous_data();
+    let shape = a.shape();
+    let (out, out_shape) = reduce_along_dim(&data, &shape, dim, keepdim, true);
+    let res = Tensor::new(out, out_shape);
+
+    if should_track_grad(&[a]) {
+        let mut inner = res.0.write().unwrap();
+        inner.requires_grad = true;
+        inner.creator = Some(Arc::new(Node {
+            op: Box::new(MeanDimOp {
+                input_shape: shape,
+                dim,
+                keepdim,
             }),
             inputs: vec![a.clone()],
         }));
@@ -400,7 +660,7 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
 
     let res = Tensor::new(res_data, vec![m, n]);
 
-    if a.requires_grad() || b.requires_grad() {
+    if should_track_grad(&[a, b]) {
         let mut inner = res.0.write().unwrap();
         inner.requires_grad = true;
         inner.creator = Some(Arc::new(Node {
@@ -445,7 +705,7 @@ pub fn exp(a: &Tensor) -> Tensor {
     );
     let res = Tensor::new(res_data, shape);
 
-    if a.requires_grad() {
+    if should_track_grad(&[a]) {
         let mut inner = res.0.write().unwrap();
         inner.requires_grad = true;
         inner.creator = Some(Arc::new(Node {
@@ -487,7 +747,7 @@ pub fn log(a: &Tensor) -> Tensor {
     );
     let res = Tensor::new(res_data, shape);
 
-    if a.requires_grad() {
+    if should_track_grad(&[a]) {
         let mut inner = res.0.write().unwrap();
         inner.requires_grad = true;
         inner.creator = Some(Arc::new(Node {
@@ -528,7 +788,7 @@ pub fn reshape(a: &Tensor, new_shape: Vec<usize>) -> Tensor {
     let data = a.contiguous_data();
     let res = Tensor::new(data, new_shape.clone());
 
-    if a.requires_grad() {
+    if should_track_grad(&[a]) {
         let mut inner = res.0.write().unwrap();
         inner.requires_grad = true;
         inner.creator = Some(Arc::new(Node {
@@ -577,7 +837,7 @@ pub fn transpose(a: &Tensor) -> Tensor {
 
     let res = Tensor::new(out, vec![cols, rows]);
 
-    if a.requires_grad() {
+    if should_track_grad(&[a]) {
         let mut inner = res.0.write().unwrap();
         inner.requires_grad = true;
         inner.creator = Some(Arc::new(Node {
@@ -662,7 +922,7 @@ pub fn softmax(a: &Tensor) -> Tensor {
 
     let res = Tensor::new(out, shape.clone());
 
-    if a.requires_grad() {
+    if should_track_grad(&[a]) {
         let mut inner = res.0.write().unwrap();
         inner.requires_grad = true;
         inner.creator = Some(Arc::new(Node {
@@ -740,7 +1000,7 @@ pub fn log_softmax(a: &Tensor) -> Tensor {
     let sm_tensor = Tensor::new(sm, shape.clone());
     let res = Tensor::new(log_sm, shape.clone());
 
-    if a.requires_grad() {
+    if should_track_grad(&[a]) {
         let mut inner = res.0.write().unwrap();
         inner.requires_grad = true;
         inner.creator = Some(Arc::new(Node {
@@ -818,7 +1078,7 @@ pub fn cross_entropy_loss(logits: &Tensor, targets: &[usize]) -> Tensor {
         let sm_tensor = Tensor::new(sm, vec![num_classes]);
         let res = Tensor::new(vec![loss], vec![1]);
 
-        if logits.requires_grad() {
+        if should_track_grad(&[logits]) {
             let mut inner = res.0.write().unwrap();
             inner.requires_grad = true;
             inner.creator = Some(Arc::new(Node {
@@ -865,7 +1125,7 @@ pub fn cross_entropy_loss(logits: &Tensor, targets: &[usize]) -> Tensor {
         let sm_tensor = Tensor::new(sm, vec![batch, num_classes]);
         let res = Tensor::new(vec![loss], vec![1]);
 
-        if logits.requires_grad() {
+        if should_track_grad(&[logits]) {
             let mut inner = res.0.write().unwrap();
             inner.requires_grad = true;
             inner.creator = Some(Arc::new(Node {
@@ -927,7 +1187,7 @@ pub fn embedding_lookup(weight: &Tensor, indices: &[usize]) -> Tensor {
 
     let res = Tensor::new(out, vec![seq_len, embedding_dim]);
 
-    if weight.requires_grad() {
+    if should_track_grad(&[weight]) {
         let mut inner = res.0.write().unwrap();
         inner.requires_grad = true;
         inner.creator = Some(Arc::new(Node {
@@ -976,7 +1236,7 @@ pub fn relu(a: &Tensor) -> Tensor {
     );
     let res = Tensor::new(out, shape);
 
-    if a.requires_grad() {
+    if should_track_grad(&[a]) {
         let mut inner = res.0.write().unwrap();
         inner.requires_grad = true;
         inner.creator = Some(Arc::new(Node {
@@ -998,8 +1258,7 @@ pub struct GeluOp {
 impl Op for GeluOp {
     // 根据上游梯度计算当前节点对输入的梯度。
     fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
-        // GELU'(x) = 0.5*(1+tanh(k)) + 0.5*x*(1-tanh(k)^2)*k'
-        // where k = sqrt(2/pi)*(x + 0.044715*x^3), k' = sqrt(2/pi)*(1 + 0.134145*x^2)
+        // GELU 使用 tanh 近似公式；这里保留解析导数，避免反向再拆成更多基础算子。
         let g = grad_output.contiguous_data();
         let x = self.saved_input.contiguous_data();
         let sqrt_2_pi: f32 = (2.0 / std::f32::consts::PI).sqrt();
@@ -1035,7 +1294,7 @@ pub fn gelu(a: &Tensor) -> Tensor {
     );
     let res = Tensor::new(out, shape);
 
-    if a.requires_grad() {
+    if should_track_grad(&[a]) {
         let mut inner = res.0.write().unwrap();
         inner.requires_grad = true;
         inner.creator = Some(Arc::new(Node {
@@ -1076,11 +1335,272 @@ pub fn scale(a: &Tensor, scalar: f32) -> Tensor {
     };
     let res = Tensor::new(out, shape);
 
-    if a.requires_grad() {
+    if should_track_grad(&[a]) {
         let mut inner = res.0.write().unwrap();
         inner.requires_grad = true;
         inner.creator = Some(Arc::new(Node {
             op: Box::new(ScaleOp { scalar }),
+            inputs: vec![a.clone()],
+        }));
+    }
+
+    res
+}
+
+// ============ RMSNorm ============
+
+#[derive(Debug)]
+pub struct RmsNormOp {
+    input: Tensor,
+    weight: Tensor,
+    epsilon: f32,
+}
+
+impl Op for RmsNormOp {
+    fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
+        let x = self.input.contiguous_data();
+        let w = self.weight.contiguous_data();
+        let g = grad_output.contiguous_data();
+        let shape = self.input.shape();
+        let ndim = shape.len();
+        assert!(ndim >= 1);
+        let dim = shape[ndim - 1];
+        assert_eq!(self.weight.shape(), vec![dim]);
+
+        let outer = x.len() / dim;
+        let mut dx = vec![0.0f32; x.len()];
+        let mut dw = vec![0.0f32; dim];
+
+        for row in 0..outer {
+            let off = row * dim;
+            let mut mean_sq = 0.0f32;
+            for i in 0..dim {
+                mean_sq += x[off + i] * x[off + i];
+            }
+            mean_sq /= dim as f32;
+            let inv_rms = 1.0 / (mean_sq + self.epsilon).sqrt();
+
+            let mut dot = 0.0f32;
+            for i in 0..dim {
+                let x_hat = x[off + i] * inv_rms;
+                dot += g[off + i] * w[i] * x_hat;
+                dw[i] += g[off + i] * x_hat;
+            }
+            let coeff = inv_rms * inv_rms / dim as f32;
+            for i in 0..dim {
+                dx[off + i] = g[off + i] * w[i] * inv_rms - x[off + i] * coeff * dot;
+            }
+        }
+
+        vec![Some(Tensor::new(dx, shape)), Some(Tensor::new(dw, vec![dim]))]
+    }
+}
+
+/// 对最后一维执行 RMSNorm。
+///
+/// `weight` 需要与最后一维等长；`epsilon` 用于避免除零并稳定低方差输入。
+pub fn rms_norm(a: &Tensor, weight: &Tensor, epsilon: f32) -> Tensor {
+    let shape = a.shape();
+    assert!(!shape.is_empty(), "rms_norm requires rank >= 1");
+    assert_eq!(weight.shape(), vec![shape[shape.len() - 1]]);
+
+    let x = a.contiguous_data();
+    let w = weight.contiguous_data();
+    let dim = shape[shape.len() - 1];
+    let outer = x.len() / dim;
+    let mut out = vec![0.0f32; x.len()];
+
+    for row in 0..outer {
+        let off = row * dim;
+        let mut mean_sq = 0.0f32;
+        for i in 0..dim {
+            mean_sq += x[off + i] * x[off + i];
+        }
+        mean_sq /= dim as f32;
+        let inv_rms = 1.0 / (mean_sq + epsilon).sqrt();
+        for i in 0..dim {
+            out[off + i] = x[off + i] * inv_rms * w[i];
+        }
+    }
+
+    let res = Tensor::new(out, shape.clone());
+    if should_track_grad(&[a, weight]) {
+        let mut inner = res.0.write().unwrap();
+        inner.requires_grad = true;
+        inner.creator = Some(Arc::new(Node {
+            op: Box::new(RmsNormOp {
+                input: a.clone(),
+                weight: weight.clone(),
+                epsilon,
+            }),
+            inputs: vec![a.clone(), weight.clone()],
+        }));
+    }
+    res
+}
+
+// ============ SwiGLU ============
+
+#[derive(Debug)]
+pub struct SwiGluOp {
+    saved_x: Tensor,
+    saved_gate: Tensor,
+}
+
+impl Op for SwiGluOp {
+    fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
+        let x = self.saved_x.contiguous_data();
+        let gate = self.saved_gate.contiguous_data();
+        let g = grad_output.contiguous_data();
+        let sig: Vec<f32> = gate.iter().map(|v| 1.0 / (1.0 + (-v).exp())).collect();
+        let silu: Vec<f32> = gate.iter().zip(sig.iter()).map(|(v, s)| v * s).collect();
+
+        let dx: Vec<f32> = g.iter().zip(silu.iter()).map(|(gi, s)| gi * s).collect();
+        let dgate: Vec<f32> = g
+            .iter()
+            .zip(x.iter())
+            .zip(gate.iter())
+            .zip(sig.iter())
+            .map(|(((gi, xi), gate), s)| {
+                let silu_grad = s + gate * s * (1.0 - s);
+                gi * xi * silu_grad
+            })
+            .collect();
+
+        vec![
+            Some(Tensor::new(dx, self.saved_x.shape())),
+            Some(Tensor::new(dgate, self.saved_gate.shape())),
+        ]
+    }
+}
+
+/// SwiGLU 前向：`x * silu(gate)`。
+pub fn swiglu(x: &Tensor, gate: &Tensor) -> Tensor {
+    assert_eq!(x.shape(), gate.shape(), "swiglu requires matching shapes");
+    let x_data = x.contiguous_data();
+    let gate_data = gate.contiguous_data();
+    let out: Vec<f32> = x_data
+        .iter()
+        .zip(gate_data.iter())
+        .map(|(x, g)| {
+            let s = 1.0 / (1.0 + (-g).exp());
+            x * g * s
+        })
+        .collect();
+    let res = Tensor::new(out, x.shape());
+
+    if should_track_grad(&[x, gate]) {
+        let mut inner = res.0.write().unwrap();
+        inner.requires_grad = true;
+        inner.creator = Some(Arc::new(Node {
+            op: Box::new(SwiGluOp {
+                saved_x: x.clone(),
+                saved_gate: gate.clone(),
+            }),
+            inputs: vec![x.clone(), gate.clone()],
+        }));
+    }
+
+    res
+}
+
+// ============ Masked Softmax ============
+
+#[derive(Debug)]
+pub struct MaskedSoftmaxOp {
+    output: Tensor,
+    mask: Vec<bool>,
+}
+
+impl Op for MaskedSoftmaxOp {
+    fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
+        let s = self.output.contiguous_data();
+        let g = grad_output.contiguous_data();
+        let shape = grad_output.shape();
+        let mut da = vec![0.0f32; g.len()];
+
+        if shape.len() == 1 {
+            let dot: f32 = s.iter().zip(g.iter()).map(|(si, gi)| si * gi).sum();
+            for i in 0..g.len() {
+                if self.mask[i] {
+                    da[i] = s[i] * (g[i] - dot);
+                }
+            }
+        } else {
+            let cols = shape[shape.len() - 1];
+            let rows = g.len() / cols;
+            for row in 0..rows {
+                let off = row * cols;
+                let dot: f32 = (0..cols).map(|c| s[off + c] * g[off + c]).sum();
+                for c in 0..cols {
+                    if self.mask[off + c] {
+                        da[off + c] = s[off + c] * (g[off + c] - dot);
+                    }
+                }
+            }
+        }
+
+        vec![Some(Tensor::new(da, shape))]
+    }
+}
+
+/// 在 mask 允许的位置上做 softmax，屏蔽位置的概率置零。
+///
+/// `true` 表示保留该位置，`false` 表示遮挡。常用于 causal attention 和 padding mask。
+pub fn masked_softmax(a: &Tensor, mask: &[bool]) -> Tensor {
+    let shape = a.shape();
+    let data = a.contiguous_data();
+    assert_eq!(data.len(), mask.len(), "masked_softmax mask length mismatch");
+    let mut out = vec![0.0f32; data.len()];
+
+    let cols = if shape.len() == 1 {
+        data.len()
+    } else {
+        shape[shape.len() - 1]
+    };
+    let rows = data.len() / cols;
+    for row in 0..rows {
+        let off = row * cols;
+        let max_val = (0..cols)
+            .filter_map(|c| if mask[off + c] { Some(data[off + c]) } else { None })
+            .fold(f32::NEG_INFINITY, f32::max);
+        if max_val == f32::NEG_INFINITY {
+            continue;
+        }
+
+        let mut active_sum = 0.0f32;
+        for c in 0..cols {
+            if mask[off + c] {
+                let e = (data[off + c] - max_val).exp();
+                out[off + c] = e;
+                active_sum += e;
+            }
+        }
+        if active_sum > 0.0 {
+            for c in 0..cols {
+                if mask[off + c] {
+                    out[off + c] /= active_sum;
+                }
+            }
+        }
+    }
+    if shape.len() == 1 && out.iter().all(|v| *v == 0.0) {
+        for (i, &m) in mask.iter().enumerate() {
+            if m {
+                out[i] = 1.0 / mask.iter().filter(|&&v| v).count() as f32;
+            }
+        }
+    }
+    let res = Tensor::new(out, shape);
+
+    if should_track_grad(&[a]) {
+        let mut inner = res.0.write().unwrap();
+        inner.requires_grad = true;
+        inner.creator = Some(Arc::new(Node {
+            op: Box::new(MaskedSoftmaxOp {
+                output: res.clone(),
+                mask: mask.to_vec(),
+            }),
             inputs: vec![a.clone()],
         }));
     }
@@ -1119,7 +1639,7 @@ pub fn masked_fill(a: &Tensor, mask: &[bool], fill_value: f32) -> Tensor {
         .collect();
     let res = Tensor::new(out, shape);
 
-    if a.requires_grad() {
+    if should_track_grad(&[a]) {
         let mut inner = res.0.write().unwrap();
         inner.requires_grad = true;
         inner.creator = Some(Arc::new(Node {
@@ -1212,7 +1732,7 @@ pub fn batch_matmul(a: &Tensor, b: &Tensor) -> Tensor {
 
     let res = Tensor::new(out, vec![batch, m, n]);
 
-    if a.requires_grad() || b.requires_grad() {
+    if should_track_grad(&[a, b]) {
         let mut inner = res.0.write().unwrap();
         inner.requires_grad = true;
         inner.creator = Some(Arc::new(Node {
@@ -1229,63 +1749,9 @@ pub fn batch_matmul(a: &Tensor, b: &Tensor) -> Tensor {
 
 // ============ Broadcast Add [B, M, N] + [1, 1, N] or [M, N] + [N] ============
 
-#[derive(Debug)]
-pub struct BroadcastAddOp {
-    b_shape: Vec<usize>,
-}
-
-impl Op for BroadcastAddOp {
-    // 根据上游梯度计算当前节点对输入的梯度。
-    fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
-        let g = grad_output.contiguous_data();
-        let g_shape = grad_output.shape();
-
-        // dA = grad (same shape)
-        let da = Tensor::new(g.clone(), g_shape.clone());
-
-        // dB = sum over broadcast dims
-        let b_numel: usize = self.b_shape.iter().product();
-        let mut db_data = vec![0.0f32; b_numel];
-        for i in 0..g.len() {
-            db_data[i % b_numel] += g[i];
-        }
-
-        vec![Some(da), Some(Tensor::new(db_data, self.b_shape.clone()))]
-    }
-}
-/// 将一维偏置向量广播加到二维张量行上。
+/// Legacy wrapper kept for compatibility; the generic `add` path now owns broadcasting.
 pub fn broadcast_add(a: &Tensor, b: &Tensor) -> Tensor {
-    let a_data = a.contiguous_data();
-    let b_data = b.contiguous_data();
-    let a_shape = a.shape();
-    let b_shape = b.shape();
-    let b_numel = b_data.len();
-
-    assert_eq!(
-        a_data.len() % b_numel,
-        0,
-        "broadcast_add: a.numel()={} not divisible by b.numel()={}",
-        a_data.len(),
-        b_numel
-    );
-
-    let out: Vec<f32> = a_data
-        .iter()
-        .enumerate()
-        .map(|(i, &av)| av + b_data[i % b_numel])
-        .collect();
-    let res = Tensor::new(out, a_shape.clone());
-
-    if a.requires_grad() || b.requires_grad() {
-        let mut inner = res.0.write().unwrap();
-        inner.requires_grad = true;
-        inner.creator = Some(Arc::new(Node {
-            op: Box::new(BroadcastAddOp { b_shape }),
-            inputs: vec![a.clone(), b.clone()],
-        }));
-    }
-
-    res
+    add(a, b)
 }
 
 // ============ Concat along axis 0 ============
@@ -1337,7 +1803,7 @@ pub fn concat(tensors: &[&Tensor]) -> Tensor {
     out_shape[0] = total_dim0;
     let res = Tensor::new(all_data, out_shape);
 
-    let any_grad = tensors.iter().any(|t| t.requires_grad());
+    let any_grad = should_track_grad(tensors);
     if any_grad {
         let mut inner = res.0.write().unwrap();
         inner.requires_grad = true;
@@ -1464,6 +1930,28 @@ mod tests {
     }
 
     #[test]
+    fn test_sum_dim_forward_and_backward() {
+        let a = Tensor::with_grad(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], true);
+        let out = sum_dim(&a, 1, false);
+        assert_eq!(out.shape(), vec![2]);
+        assert_eq!(out.data(), vec![6.0, 15.0]);
+
+        sum(&out).backward();
+        assert_eq!(a.grad().unwrap(), vec![1.0; 6]);
+    }
+
+    #[test]
+    fn test_mean_dim_keepdim_forward_and_backward() {
+        let a = Tensor::with_grad(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], true);
+        let out = mean_dim(&a, 0, true);
+        assert_eq!(out.shape(), vec![1, 2]);
+        assert_eq!(out.data(), vec![2.0, 3.0]);
+
+        sum(&out).backward();
+        assert_eq!(a.grad().unwrap(), vec![0.5, 0.5, 0.5, 0.5]);
+    }
+
+    #[test]
     fn test_matmul_forward() {
         // [2,3] @ [3,2] = [2,2]
         let a = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
@@ -1496,6 +1984,40 @@ mod tests {
         z.backward();
         assert_eq!(x.grad().unwrap(), vec![1.0]);
         assert_eq!(y.grad().unwrap(), vec![1.0]);
+    }
+
+    #[test]
+    fn test_add_broadcast_tail_dim_backward() {
+        let a = Tensor::with_grad(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], true);
+        let b = Tensor::with_grad(vec![10.0, 20.0, 30.0], vec![3], true);
+        let c = add(&a, &b);
+        assert_eq!(c.shape(), vec![2, 3]);
+        assert_eq!(c.data(), vec![11.0, 22.0, 33.0, 14.0, 25.0, 36.0]);
+        sum(&c).backward();
+        assert_eq!(a.grad().unwrap(), vec![1.0; 6]);
+        assert_eq!(b.grad().unwrap(), vec![2.0, 2.0, 2.0]);
+    }
+
+    #[test]
+    fn test_mul_broadcast_scalar_backward() {
+        let a = Tensor::with_grad(vec![1.0, 2.0, 3.0], vec![3], true);
+        let b = Tensor::with_grad(vec![2.0], vec![1], true);
+        let c = mul(&a, &b);
+        assert_eq!(c.data(), vec![2.0, 4.0, 6.0]);
+        sum(&c).backward();
+        assert_eq!(a.grad().unwrap(), vec![2.0, 2.0, 2.0]);
+        assert_eq!(b.grad().unwrap(), vec![6.0]);
+    }
+
+    #[test]
+    fn test_no_grad_prevents_creator_attachment() {
+        let a = Tensor::with_grad(vec![1.0], vec![1], true);
+        let b = Tensor::with_grad(vec![2.0], vec![1], true);
+        let c = sptorch_core_tensor::no_grad(|| add(&a, &b));
+        assert!(!c.requires_grad());
+        c.backward();
+        assert!(a.grad().is_none());
+        assert!(b.grad().is_none());
     }
 
     #[test]
@@ -1586,6 +2108,28 @@ mod tests {
         assert!(numerical_grad_check(
             |inputs| sum(&mul(&inputs[0], &inputs[1])),
             &[&a, &b],
+            1e-3,
+            1e-2
+        ));
+    }
+
+    #[test]
+    fn test_grad_check_sum_dim() {
+        let a = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
+        assert!(numerical_grad_check(
+            |inputs| sum(&sum_dim(&inputs[0], 1, false)),
+            &[&a],
+            1e-3,
+            1e-2
+        ));
+    }
+
+    #[test]
+    fn test_grad_check_mean_dim() {
+        let a = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
+        assert!(numerical_grad_check(
+            |inputs| sum(&mean_dim(&inputs[0], 0, true)),
+            &[&a],
             1e-3,
             1e-2
         ));
@@ -1850,6 +2394,46 @@ mod tests {
         assert!(numerical_grad_check(|inputs| sum(&gelu(&inputs[0])), &[&a], 1e-3, 1e-2));
     }
 
+    #[test]
+    fn test_rms_norm_forward() {
+        let a = Tensor::new(vec![3.0, 4.0, 1.0, 2.0], vec![2, 2]);
+        let weight = Tensor::new(vec![1.0, 2.0], vec![2]);
+        let out = rms_norm(&a, &weight, 1e-6);
+        assert_eq!(out.shape(), vec![2, 2]);
+        let d = out.data();
+        assert!((d[0] - 0.8485).abs() < 1e-3);
+        assert!((d[1] - 2.2627).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_grad_check_rms_norm() {
+        let a = Tensor::new(vec![0.5, 1.0, -0.5, 2.0], vec![2, 2]);
+        let weight = Tensor::new(vec![1.0, 0.75], vec![2]);
+        assert!(numerical_grad_check(
+            |inputs| sum(&rms_norm(&inputs[0], &inputs[1], 1e-5)),
+            &[&a, &weight],
+            1e-3,
+            2e-2
+        ));
+    }
+
+    #[test]
+    fn test_swiglu_forward_and_gradcheck() {
+        let x = Tensor::new(vec![1.0, 2.0], vec![2]);
+        let gate = Tensor::new(vec![0.0, 1.0], vec![2]);
+        let out = swiglu(&x, &gate);
+        let d = out.data();
+        assert!((d[0] - 0.0).abs() < 1e-6);
+        assert!((d[1] - 1.4621).abs() < 1e-3);
+
+        assert!(numerical_grad_check(
+            |inputs| sum(&swiglu(&inputs[0], &inputs[1])),
+            &[&x, &gate],
+            1e-3,
+            2e-2
+        ));
+    }
+
     // scale 测试服务于梯度累积和混合精度缩放路径。
     #[test]
     fn test_scale_forward() {
@@ -1887,6 +2471,22 @@ mod tests {
         let loss = sum(&out);
         loss.backward();
         assert_eq!(a.grad().unwrap(), vec![1.0, 0.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn test_masked_softmax_forward_and_backward() {
+        let a = Tensor::with_grad(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], true);
+        let mask = vec![true, false, true, true];
+        let out = masked_softmax(&a, &mask);
+        let d = out.data();
+        assert_eq!(d[0], 1.0);
+        assert_eq!(d[1], 0.0);
+        assert!((d[2] + d[3] - 1.0).abs() < 1e-6);
+
+        sum(&out).backward();
+        let g = a.grad().unwrap();
+        assert!(g[1].abs() < 1e-6);
+        assert!(g.iter().all(|v| v.abs() < 1e-5));
     }
 
     // batch matmul 测试覆盖 batch stride 切片和对应梯度。

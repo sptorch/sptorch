@@ -61,15 +61,22 @@ impl SafeTensorsFile {
 
         Ok(SafeTensorsFile { tensors })
     }
-    /// `get`：中文注释，说明函数用途、输入约束与输出语义。
+    /// 按 safetensors 内部名称读取张量。
+    ///
+    /// 返回的是加载后缓存中的 Tensor 引用；名称不存在时返回 `None`，不做模糊匹配。
     pub fn get(&self, name: &str) -> Option<&Tensor> {
         self.tensors.get(name)
     }
-    /// `names`：中文注释，说明函数用途、输入约束与输出语义。
+
+    /// 返回文件中包含的所有权重名称。
     pub fn names(&self) -> Vec<&str> {
         self.tensors.keys().map(|s| s.as_str()).collect()
     }
-    /// `load_into`：中文注释，说明函数用途、输入约束与输出语义。
+
+    /// 按 `(参数下标, safetensors 名称)` 映射把权重写入现有参数。
+    ///
+    /// 该接口适合模型结构已经创建完毕后加载外部权重；写入前会检查 shape，
+    /// 防止名称对了但维度不一致的权重被静默写入。
     pub fn load_into(&self, params: &[Tensor], mapping: &[(usize, &str)]) -> io::Result<()> {
         for &(idx, name) in mapping {
             let src = self.tensors.get(name).ok_or_else(|| {
