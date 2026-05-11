@@ -15,5 +15,6 @@ members = [
     "crates/mock-npu",
     "crates/distributed",
     "crates/live-evolution",
+    "crates/benchmarks",
 ]
 resolver = "2"

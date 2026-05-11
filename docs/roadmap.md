@@ -240,12 +240,12 @@ External ecosystem repositories (not part of framework workspace):
 
 ### PX：工程成熟度 ⏳ 持续
 
-- [x] **补充全部 crate 文档注释**：18 个 lib.rs/main.rs 均添加模块级 `//!` 文档，公开 API 添加 `///` 注释
+- [x] **补充全部 crate 文档注释**：18 个 lib.rs/main.rs 均添加模块级 `//!` 文档，公开 API 添加 `///` 注释；工程成熟度 pass 已清理 data/optim/versioning/hal-ffi/runtime-cuda 的模板化占位注释
 - [x] **清理编译 warnings**：全部 0 warnings（包括 cli-train-gpu FwdCache dead_code）
 - [x] **README 全面更新**：从早期 2-crate 描述更新为 17 crate 全貌（架构、测试覆盖、快速开始）
 - [x] **GitHub Actions CI**：`ci.yml` 自动化 `cargo fmt --check` + `clippy` + `cargo test`（排除 CUDA 依赖 crate）
 - [x] **代码风格配置**：`.rustfmt.toml`（max_width=120, field_init_shorthand）
-- [ ] **benchmark 基线**：criterion benchmarks（matmul、forward pass、backward pass）
+- [x] **benchmark 基线**：criterion benchmarks（matmul、forward pass、backward pass）已落到 `sptorch-benchmarks`，并进入 CI 完整运行
 - [ ] **新后端扩展**：ROCm/Metal/WebGPU（HAL 架构已就绪）
 
 ---
@@ -349,12 +349,12 @@ External ecosystem repositories (not part of framework workspace):
 
 ### PX：工程成熟度 ⏳ 持续
 
-- [x] **补充全部 crate 文档注释**：18 个 lib.rs/main.rs 均添加模块级 `//!` 文档，公开 API 添加 `///` 注释
+- [x] **补充全部 crate 文档注释**：18 个 lib.rs/main.rs 均添加模块级 `//!` 文档，公开 API 添加 `///` 注释；工程成熟度 pass 已清理 data/optim/versioning/hal-ffi/runtime-cuda 的模板化占位注释
 - [x] **清理编译 warnings**：全部 0 warnings（包括 cli-train-gpu FwdCache dead_code）
 - [x] **README 全面更新**：从早期 2-crate 描述更新为 17 crate 全貌（架构、测试覆盖、快速开始）
 - [x] **GitHub Actions CI**：`ci.yml` 自动化 `cargo fmt --check` + `clippy` + `cargo test`（排除 CUDA 依赖 crate）
 - [x] **代码风格配置**：`.rustfmt.toml`（max_width=120, field_init_shorthand）
-- [ ] **benchmark 基线**：criterion benchmarks（matmul、forward pass、backward pass）
+- [x] **benchmark 基线**：criterion benchmarks（matmul、forward pass、backward pass）已落到 `sptorch-benchmarks`，并进入 CI 完整运行
 - [ ] **新后端扩展**：ROCm/Metal/WebGPU（HAL 架构已就绪）
 
 ---
@@ -823,7 +823,7 @@ External ecosystem repositories (not part of framework workspace):
 5. **SPTorch Studio**：Tauri 桌面应用，可视化训练/推理/Schema 管理
 
 ### 新增验收项（管理口径）
-1. **benchmark 基线补齐**：criterion 覆盖 matmul/forward/backward，形成可追踪性能基线
+1. **P8 硬件协议主线**：benchmark 基线已补齐，下一步推进 Tang9k 串口协议、MatMul 指令编码与 32×32 端到端验证
 2. **真实数据集评估**：在 Spider/WikiSQL 上给出 Text2SQL 准确率与错误类型分布
 3. **TokenTrie 线上约束验证**：`generate_constrained` 接入线上生成路径，验证 SQL 幻觉下降幅度
 

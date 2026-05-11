@@ -1,3 +1,10 @@
+//! CUDA runtime backend for SPTorch.
+//!
+//! 这个 crate 封装 cudarc、NVRTC 和 cuBLAS，用于验证 SPTorch 在 CUDA 设备上的
+//! 算子调度、GPU storage 往返和 MatMul 加速路径。它不是框架唯一硬件入口；
+//! HAL/FFI/Tank9k 路线仍通过独立 crate 接入。这里的 host-side 复合算子优先保证
+//! 语义清楚，后续再逐步下沉成真正 GPU kernel。
+
 use cudarc::cublas::{sys::cublasOperation_t, CudaBlas};
 use cudarc::driver::*;
 use std::sync::Arc;
@@ -10,7 +17,7 @@ pub enum CudaError {
 }
 
 impl From<DriverError> for CudaError {
-    // 中文注释：关键逻辑说明。
+    // 保留 cudarc 原始错误，方便调用方定位是驱动初始化、内存还是 kernel launch 失败。
     fn from(e: DriverError) -> Self {
         CudaError::Driver(e)
     }
@@ -22,7 +29,10 @@ pub struct CudaBackend {
 }
 
 impl CudaBackend {
-    /// `new`：中文注释，说明函数用途、输入约束与输出语义。
+    /// 创建指定 CUDA ordinal 的后端。
+    ///
+    /// 这里会同时初始化 CUDA device 和 cuBLAS handle；若机器没有可用 CUDA runtime，
+    /// 错误会向上传递，调用方可选择回退到 CPU。
     pub fn new(ordinal: usize) -> Result<Self, CudaError> {
         let dev = CudaDevice::new(ordinal)?;
         let blas = Arc::new(CudaBlas::new(dev.clone()).map_err(|e| CudaError::Cublas(e.to_string()))?);
@@ -39,7 +49,9 @@ pub struct GpuTensor {
 }
 
 impl GpuTensor {
-    /// `from_host`：中文注释，说明函数用途、输入约束与输出语义。
+    /// 从主机 f32 切片创建 GPU Tensor。
+    ///
+    /// `shape` 只作为布局元数据保存，调用方必须保证它的元素乘积与 `data.len()` 一致。
     pub fn from_host(backend: &CudaBackend, data: &[f32], shape: Vec<usize>) -> Result<Self, CudaError> {
         let numel = data.len();
         let gpu_data = backend.dev.htod_sync_copy(data)?;
@@ -49,12 +61,14 @@ impl GpuTensor {
             numel,
         })
     }
-    /// `to_host`：中文注释，说明函数用途、输入约束与输出语义。
+    /// 将 GPU 数据同步拷回主机。
+    ///
+    /// 这是同步 D2H 路径，适合测试和框架边界验证；热路径应尽量避免频繁调用。
     pub fn to_host(&self, backend: &CudaBackend) -> Result<Vec<f32>, CudaError> {
         let host = backend.dev.dtoh_sync_copy(&self.data)?;
         Ok(host)
     }
-    /// `zeros`：中文注释，说明函数用途、输入约束与输出语义。
+    /// 在 GPU 上分配指定 shape 的零初始化缓冲。
     pub fn zeros(backend: &CudaBackend, shape: Vec<usize>) -> Result<Self, CudaError> {
         let numel: usize = shape.iter().product();
         let gpu_data = backend.dev.alloc_zeros::<f32>(numel)?;
@@ -152,7 +166,9 @@ fn launch_cfg(n: usize) -> LaunchConfig {
 }
 
 impl CudaBackend {
-    /// `load_kernels`：中文注释，说明函数用途、输入约束与输出语义。
+    /// 编译并加载逐元素 CUDA kernel。
+    ///
+    /// 使用模块名 `elem` 缓存加载结果；重复调用会快速返回，避免每个算子重复 NVRTC 编译。
     pub fn load_kernels(&self) -> Result<(), CudaError> {
         if self.dev.has_func("elem", "add_kernel") {
             return Ok(());
@@ -161,7 +177,7 @@ impl CudaBackend {
         self.dev.load_ptx(ptx, "elem", KERNEL_NAMES)?;
         Ok(())
     }
-    /// `gpu_add`：中文注释，说明函数用途、输入约束与输出语义。
+    /// GPU 逐元素加法，要求两个输入元素数完全一致。
     pub fn gpu_add(&self, a: &GpuTensor, b: &GpuTensor) -> Result<GpuTensor, CudaError> {
         assert_eq!(a.numel, b.numel);
         let mut out = GpuTensor::zeros(self, a.shape.clone())?;
@@ -170,7 +186,7 @@ impl CudaBackend {
         unsafe { f.launch(cfg, (&a.data, &b.data, &mut out.data, a.numel as u32)) }?;
         Ok(out)
     }
-    /// `gpu_mul`：中文注释，说明函数用途、输入约束与输出语义。
+    /// GPU 逐元素乘法，主要服务 autograd 中 Hadamard 梯度路径。
     pub fn gpu_mul(&self, a: &GpuTensor, b: &GpuTensor) -> Result<GpuTensor, CudaError> {
         assert_eq!(a.numel, b.numel);
         let mut out = GpuTensor::zeros(self, a.shape.clone())?;
@@ -179,7 +195,7 @@ impl CudaBackend {
         unsafe { f.launch(cfg, (&a.data, &b.data, &mut out.data, a.numel as u32)) }?;
         Ok(out)
     }
-    /// `gpu_neg`：中文注释，说明函数用途、输入约束与输出语义。
+    /// GPU 逐元素取负。
     pub fn gpu_neg(&self, a: &GpuTensor) -> Result<GpuTensor, CudaError> {
         let mut out = GpuTensor::zeros(self, a.shape.clone())?;
         let f = self.dev.get_func("elem", "neg_kernel").unwrap();
@@ -187,7 +203,7 @@ impl CudaBackend {
         unsafe { f.launch(cfg, (&a.data, &mut out.data, a.numel as u32)) }?;
         Ok(out)
     }
-    /// `gpu_scale`：中文注释，说明函数用途、输入约束与输出语义。
+    /// GPU 标量缩放，常用于梯度平均、loss scale 和 attention 分数缩放。
     pub fn gpu_scale(&self, a: &GpuTensor, scalar: f32) -> Result<GpuTensor, CudaError> {
         let mut out = GpuTensor::zeros(self, a.shape.clone())?;
         let f = self.dev.get_func("elem", "scale_kernel").unwrap();
@@ -195,7 +211,7 @@ impl CudaBackend {
         unsafe { f.launch(cfg, (&a.data, &mut out.data, scalar, a.numel as u32)) }?;
         Ok(out)
     }
-    /// `gpu_exp`：中文注释，说明函数用途、输入约束与输出语义。
+    /// GPU 指数函数；调用方负责输入范围，避免溢出污染后续 softmax。
     pub fn gpu_exp(&self, a: &GpuTensor) -> Result<GpuTensor, CudaError> {
         let mut out = GpuTensor::zeros(self, a.shape.clone())?;
         let f = self.dev.get_func("elem", "exp_kernel").unwrap();
@@ -203,7 +219,7 @@ impl CudaBackend {
         unsafe { f.launch(cfg, (&a.data, &mut out.data, a.numel as u32)) }?;
         Ok(out)
     }
-    /// `gpu_log`：中文注释，说明函数用途、输入约束与输出语义。
+    /// GPU 自然对数；调用方必须保证输入位于正数定义域。
     pub fn gpu_log(&self, a: &GpuTensor) -> Result<GpuTensor, CudaError> {
         let mut out = GpuTensor::zeros(self, a.shape.clone())?;
         let f = self.dev.get_func("elem", "log_kernel").unwrap();
@@ -211,7 +227,7 @@ impl CudaBackend {
         unsafe { f.launch(cfg, (&a.data, &mut out.data, a.numel as u32)) }?;
         Ok(out)
     }
-    /// `gpu_gelu`：中文注释，说明函数用途、输入约束与输出语义。
+    /// GPU GELU tanh 近似，匹配 Transformer 常用激活函数。
     pub fn gpu_gelu(&self, a: &GpuTensor) -> Result<GpuTensor, CudaError> {
         let mut out = GpuTensor::zeros(self, a.shape.clone())?;
         let f = self.dev.get_func("elem", "gelu_kernel").unwrap();
@@ -219,7 +235,7 @@ impl CudaBackend {
         unsafe { f.launch(cfg, (&a.data, &mut out.data, a.numel as u32)) }?;
         Ok(out)
     }
-    /// `gpu_relu`：中文注释，说明函数用途、输入约束与输出语义。
+    /// GPU ReLU 激活，负数截断为 0。
     pub fn gpu_relu(&self, a: &GpuTensor) -> Result<GpuTensor, CudaError> {
         let mut out = GpuTensor::zeros(self, a.shape.clone())?;
         let f = self.dev.get_func("elem", "relu_kernel").unwrap();
@@ -227,7 +243,10 @@ impl CudaBackend {
         unsafe { f.launch(cfg, (&a.data, &mut out.data, a.numel as u32)) }?;
         Ok(out)
     }
-    /// `gpu_matmul`：中文注释，说明函数用途、输入约束与输出语义。
+    /// 使用 cuBLAS 执行 row-major 矩阵乘法 `A[m,k] @ B[k,n]`。
+    ///
+    /// cuBLAS 原生按 column-major 解释矩阵，因此这里通过交换维度参数来得到与
+    /// CPU row-major fallback 一致的输出布局。
     pub fn gpu_matmul(&self, a: &GpuTensor, b: &GpuTensor) -> Result<GpuTensor, CudaError> {
         let (m, k) = (a.shape[0], a.shape[1]);
         let n = b.shape[1];
@@ -259,7 +278,7 @@ impl CudaBackend {
 
         Ok(out)
     }
-    /// `gpu_sgd_update`：中文注释，说明函数用途、输入约束与输出语义。
+    /// 在 GPU 上原地执行 SGD 更新：`param -= lr * grad`。
     pub fn gpu_sgd_update(&self, param: &mut GpuTensor, grad: &GpuTensor, lr: f32) -> Result<(), CudaError> {
         assert_eq!(param.numel, grad.numel);
         let f = self.dev.get_func("elem", "sgd_kernel").unwrap();
@@ -267,7 +286,7 @@ impl CudaBackend {
         unsafe { f.launch(cfg, (&mut param.data, &grad.data, lr, param.numel as u32)) }?;
         Ok(())
     }
-    /// `gpu_accum`：中文注释，说明函数用途、输入约束与输出语义。
+    /// 在 GPU 上把 `b` 累加到 `a`，用于梯度累积或中间缓冲合并。
     pub fn gpu_accum(&self, a: &mut GpuTensor, b: &GpuTensor) -> Result<(), CudaError> {
         assert_eq!(a.numel, b.numel);
         let f = self.dev.get_func("elem", "accum_kernel").unwrap();
@@ -277,7 +296,9 @@ impl CudaBackend {
     }
 
     // ============ 复合操作 (host-side orchestration + GPU kernels) ============
-    /// `gpu_transpose`：中文注释，说明函数用途、输入约束与输出语义。
+    /// 转置二维 GPU Tensor。
+    ///
+    /// 当前实现通过 host 往返完成，语义正确但不是性能目标；后续应替换为专用 kernel。
     pub fn gpu_transpose(&self, a: &GpuTensor) -> Result<GpuTensor, CudaError> {
         assert_eq!(a.shape.len(), 2);
         let (m, n) = (a.shape[0], a.shape[1]);
@@ -290,7 +311,10 @@ impl CudaBackend {
         }
         GpuTensor::from_host(self, &out, vec![n, m])
     }
-    /// `gpu_broadcast_add`：中文注释，说明函数用途、输入约束与输出语义。
+    /// 执行简化 broadcast add。
+    ///
+    /// 当前通过 host 侧循环实现，主要用于保持 GPU 训练闭环可用。完整广播语义由
+    /// core-ops 的 CPU 参考路径定义。
     pub fn gpu_broadcast_add(&self, a: &GpuTensor, b: &GpuTensor) -> Result<GpuTensor, CudaError> {
         let a_host = a.to_host(self)?;
         let b_host = b.to_host(self)?;
@@ -302,7 +326,7 @@ impl CudaBackend {
             .collect();
         GpuTensor::from_host(self, &out, a.shape.clone())
     }
-    /// `gpu_softmax`：中文注释，说明函数用途、输入约束与输出语义。
+    /// 稳定 softmax，支持一维向量或二维 `[rows, cols]` 按行归一化。
     pub fn gpu_softmax(&self, a: &GpuTensor) -> Result<GpuTensor, CudaError> {
         let data = a.to_host(self)?;
         let shape = &a.shape;
@@ -326,7 +350,10 @@ impl CudaBackend {
         };
         GpuTensor::from_host(self, &out, a.shape.clone())
     }
-    /// `gpu_cross_entropy`：中文注释，说明函数用途、输入约束与输出语义。
+    /// 计算交叉熵 loss 并返回 softmax 缓冲。
+    ///
+    /// 该路径通过 host 编排实现，目的是让 GPU 训练示例可以端到端跑通，而不是最终
+    /// 高性能 fused kernel。
     pub fn gpu_cross_entropy(&self, logits: &GpuTensor, targets: &[usize]) -> Result<(f32, GpuTensor), CudaError> {
         let data = logits.to_host(self)?;
         let shape = &logits.shape;
@@ -349,7 +376,7 @@ impl CudaBackend {
         let sm_gpu = GpuTensor::from_host(self, &sm, vec![seq_len, vocab])?;
         Ok((loss, sm_gpu))
     }
-    /// `gpu_cross_entropy_backward`：中文注释，说明函数用途、输入约束与输出语义。
+    /// 基于 softmax 输出和目标 token 计算交叉熵梯度。
     pub fn gpu_cross_entropy_backward(&self, sm: &GpuTensor, targets: &[usize]) -> Result<GpuTensor, CudaError> {
         let mut grad = sm.to_host(self)?;
         let (seq_len, vocab) = (sm.shape[0], sm.shape[1]);
@@ -362,7 +389,7 @@ impl CudaBackend {
         }
         GpuTensor::from_host(self, &grad, sm.shape.clone())
     }
-    /// `gpu_embedding`：中文注释，说明函数用途、输入约束与输出语义。
+    /// 执行 embedding 查表，权重布局为 `[num_embeddings, dim]`。
     pub fn gpu_embedding(&self, weight: &GpuTensor, indices: &[usize]) -> Result<GpuTensor, CudaError> {
         let w = weight.to_host(self)?;
         let dim = weight.shape[1];
@@ -373,7 +400,7 @@ impl CudaBackend {
         }
         GpuTensor::from_host(self, &out, vec![seq_len, dim])
     }
-    /// `gpu_embedding_backward`：中文注释，说明函数用途、输入约束与输出语义。
+    /// 累加 embedding 权重梯度；重复 token 的梯度会加到同一行。
     pub fn gpu_embedding_backward(
         &self,
         grad: &GpuTensor,
@@ -390,7 +417,7 @@ impl CudaBackend {
         }
         GpuTensor::from_host(self, &dw, vec![num_emb, dim])
     }
-    /// `gpu_masked_fill`：中文注释，说明函数用途、输入约束与输出语义。
+    /// 按 bool mask 写入填充值，常用于 causal attention mask。
     pub fn gpu_masked_fill(&self, a: &GpuTensor, mask: &[bool], fill_value: f32) -> Result<GpuTensor, CudaError> {
         let mut data = a.to_host(self)?;
         for (i, &m) in mask.iter().enumerate() {
@@ -400,7 +427,9 @@ impl CudaBackend {
         }
         GpuTensor::from_host(self, &data, a.shape.clone())
     }
-    /// `gpu_reshape`：中文注释，说明函数用途、输入约束与输出语义。
+    /// 改写 shape 元数据并保留元素顺序。
+    ///
+    /// 当前通过 host copy 克隆数据，后续可以演进为共享 device storage 的 view。
     pub fn gpu_reshape(&self, a: &GpuTensor, new_shape: Vec<usize>) -> Result<GpuTensor, CudaError> {
         let new_numel: usize = new_shape.iter().product();
         assert_eq!(a.numel, new_numel);
@@ -408,12 +437,12 @@ impl CudaBackend {
         let host = a.to_host(self)?;
         GpuTensor::from_host(self, &host, new_shape)
     }
-    /// `gpu_sum`：中文注释，说明函数用途、输入约束与输出语义。
+    /// 对 GPU Tensor 求和；当前同步回主机聚合，作为 correctness fallback。
     pub fn gpu_sum(&self, a: &GpuTensor) -> Result<f32, CudaError> {
         let host = a.to_host(self)?;
         Ok(host.iter().sum())
     }
-    /// `gpu_layer_norm`：中文注释，说明函数用途、输入约束与输出语义。
+    /// 执行 LayerNorm forward，最后一维与 `gamma/beta` 长度一致。
     pub fn gpu_layer_norm(
         &self,
         input: &GpuTensor,
@@ -438,7 +467,9 @@ impl CudaBackend {
         }
         GpuTensor::from_host(self, &out, input.shape.clone())
     }
-    /// `gpu_batch_matmul`：中文注释，说明函数用途、输入约束与输出语义。
+    /// 执行 `[batch,m,k] @ [batch,k,n]` 的批量矩阵乘。
+    ///
+    /// 首版逐 batch 调用 `gpu_matmul`，用于验证语义；后续可替换为 cuBLAS strided batched GEMM。
     pub fn gpu_batch_matmul(&self, a: &GpuTensor, b: &GpuTensor) -> Result<GpuTensor, CudaError> {
         let (batch, m, k) = (a.shape[0], a.shape[1], a.shape[2]);
         let n = b.shape[2];
@@ -463,14 +494,14 @@ impl CudaBackend {
 mod tests {
     use super::*;
 
-    // 中文注释：关键逻辑说明。
+    // CUDA 测试共享初始化：创建 device 并加载 NVRTC kernel，失败会直接暴露环境问题。
     fn setup() -> CudaBackend {
         let backend = CudaBackend::new(0).expect("Failed to create CUDA backend");
         backend.load_kernels().expect("Failed to load kernels");
         backend
     }
 
-    // 中文注释：关键逻辑说明。
+    // H2D/D2H 往返是所有 GPU 算子正确性的前提。
     #[test]
     fn test_host_roundtrip() {
         let b = setup();
@@ -480,7 +511,7 @@ mod tests {
         assert_eq!(host, data);
     }
 
-    // 中文注释：关键逻辑说明。
+    // add 覆盖最小二元 kernel launch。
     #[test]
     fn test_gpu_add() {
         let b = setup();
@@ -490,7 +521,7 @@ mod tests {
         assert_eq!(out.to_host(&b).unwrap(), vec![6.0, 8.0, 10.0, 12.0]);
     }
 
-    // 中文注释：关键逻辑说明。
+    // mul 验证逐元素乘法和输出缓冲写回。
     #[test]
     fn test_gpu_mul() {
         let b = setup();
@@ -500,7 +531,7 @@ mod tests {
         assert_eq!(out.to_host(&b).unwrap(), vec![6.0, 12.0, 20.0, 30.0]);
     }
 
-    // 中文注释：关键逻辑说明。
+    // neg 验证一元 kernel 的符号处理。
     #[test]
     fn test_gpu_neg() {
         let b = setup();
@@ -509,7 +540,7 @@ mod tests {
         assert_eq!(out.to_host(&b).unwrap(), vec![-1.0, 2.0, -3.0]);
     }
 
-    // 中文注释：关键逻辑说明。
+    // scale 覆盖标量参数传入 CUDA kernel 的路径。
     #[test]
     fn test_gpu_scale() {
         let b = setup();
@@ -518,7 +549,7 @@ mod tests {
         assert_eq!(out.to_host(&b).unwrap(), vec![2.5, 5.0, 7.5]);
     }
 
-    // 中文注释：关键逻辑说明。
+    // exp/log 数值测试帮助发现设备数学库或 kernel 编译异常。
     #[test]
     fn test_gpu_exp() {
         let b = setup();
@@ -529,7 +560,7 @@ mod tests {
         assert!((r[1] - std::f32::consts::E).abs() < 1e-5);
     }
 
-    // 中文注释：关键逻辑说明。
+    // log 与 exp 互补验证基础非线性算子。
     #[test]
     fn test_gpu_log() {
         let b = setup();
@@ -540,7 +571,7 @@ mod tests {
         assert!((r[1] - 1.0).abs() < 1e-5);
     }
 
-    // 中文注释：关键逻辑说明。
+    // GELU 用几个代表点检查 tanh 近似没有符号或尺度错误。
     #[test]
     fn test_gpu_gelu() {
         let b = setup();
@@ -552,7 +583,7 @@ mod tests {
         assert!(r[2] > 0.8); // gelu(1) ~ 0.841
     }
 
-    // 中文注释：关键逻辑说明。
+    // ReLU 明确检查负数截断和正数直通。
     #[test]
     fn test_gpu_relu() {
         let b = setup();
@@ -561,7 +592,7 @@ mod tests {
         assert_eq!(out.to_host(&b).unwrap(), vec![0.0, 0.0, 1.0, 2.0]);
     }
 
-    // 中文注释：关键逻辑说明。
+    // 小矩阵 MatMul 与手算结果对齐，防止 cuBLAS row-major 参数传错。
     #[test]
     fn test_gpu_matmul() {
         let b = setup();
@@ -571,7 +602,7 @@ mod tests {
         assert_eq!(out.to_host(&b).unwrap(), vec![58.0, 64.0, 139.0, 154.0]);
     }
 
-    // 中文注释：关键逻辑说明。
+    // 方阵路径补充覆盖 m/k/n 相等时的 cuBLAS 参数。
     #[test]
     fn test_gpu_matmul_square() {
         let b = setup();
@@ -581,7 +612,7 @@ mod tests {
         assert_eq!(out.to_host(&b).unwrap(), vec![19.0, 22.0, 43.0, 50.0]);
     }
 
-    // 中文注释：关键逻辑说明。
+    // 较大矩阵与 CPU baseline 对齐，用来捕捉 leading dimension 或布局错误。
     #[test]
     fn test_gpu_vs_cpu_matmul_large() {
         let b = setup();
@@ -624,7 +655,7 @@ use std::sync::OnceLock;
 
 static CUDA_BACKEND: OnceLock<Option<CudaBackend>> = OnceLock::new();
 
-// 中文注释：关键逻辑说明。
+// 懒初始化全局 CUDA 后端；初始化失败时缓存 None，避免每次 dispatch 重复探测设备。
 fn get_or_init_cuda() -> Option<&'static CudaBackend> {
     CUDA_BACKEND
         .get_or_init(|| match CudaBackend::new(0) {
@@ -639,7 +670,9 @@ fn get_or_init_cuda() -> Option<&'static CudaBackend> {
         })
         .as_ref()
 }
-/// `register_cuda_backend`：中文注释，说明函数用途、输入约束与输出语义。
+/// 将 CUDA dispatch 注册到 core-tensor 的全局后端表。
+///
+/// 如果当前机器没有可用 CUDA 或 kernel 编译失败，本函数静默跳过注册，让上层继续走 CPU。
 pub fn register_cuda_backend() {
     if get_or_init_cuda().is_some() {
         let dispatch = Arc::new(CudaDispatch);
@@ -651,7 +684,7 @@ pub fn register_cuda_backend() {
 struct CudaDispatch;
 
 impl BackendDispatch for CudaDispatch {
-    // 中文注释：关键逻辑说明。
+    // BackendDispatch 输入已经是连续 host 切片，这里临时上传到 GPU 执行。
     fn add_f32(&self, a: &[f32], b: &[f32], out: &mut [f32]) {
         let backend = get_or_init_cuda().unwrap();
         let ga = GpuTensor::from_host(backend, a, vec![a.len()]).unwrap();
@@ -660,7 +693,7 @@ impl BackendDispatch for CudaDispatch {
         out.copy_from_slice(&gc.to_host(backend).unwrap());
     }
 
-    // 中文注释：关键逻辑说明。
+    // 乘法 dispatch 保持与 add 相同的数据往返模型，便于 CPU/GPU 对比测试。
     fn mul_f32(&self, a: &[f32], b: &[f32], out: &mut [f32]) {
         let backend = get_or_init_cuda().unwrap();
         let ga = GpuTensor::from_host(backend, a, vec![a.len()]).unwrap();
@@ -669,7 +702,7 @@ impl BackendDispatch for CudaDispatch {
         out.copy_from_slice(&gc.to_host(backend).unwrap());
     }
 
-    // 中文注释：关键逻辑说明。
+    // 取负用于验证一元 kernel dispatch 和梯度符号传播。
     fn neg_f32(&self, a: &[f32], out: &mut [f32]) {
         let backend = get_or_init_cuda().unwrap();
         let ga = GpuTensor::from_host(backend, a, vec![a.len()]).unwrap();
@@ -677,7 +710,7 @@ impl BackendDispatch for CudaDispatch {
         out.copy_from_slice(&gc.to_host(backend).unwrap());
     }
 
-    // 中文注释：关键逻辑说明。
+    // exp dispatch 暂不做定义域裁剪，保持与 CPU exp 语义一致。
     fn exp_f32(&self, a: &[f32], out: &mut [f32]) {
         let backend = get_or_init_cuda().unwrap();
         let ga = GpuTensor::from_host(backend, a, vec![a.len()]).unwrap();
@@ -685,7 +718,7 @@ impl BackendDispatch for CudaDispatch {
         out.copy_from_slice(&gc.to_host(backend).unwrap());
     }
 
-    // 中文注释：关键逻辑说明。
+    // log dispatch 的输入合法性由上层算子负责。
     fn log_f32(&self, a: &[f32], out: &mut [f32]) {
         let backend = get_or_init_cuda().unwrap();
         let ga = GpuTensor::from_host(backend, a, vec![a.len()]).unwrap();
@@ -693,7 +726,7 @@ impl BackendDispatch for CudaDispatch {
         out.copy_from_slice(&gc.to_host(backend).unwrap());
     }
 
-    // 中文注释：关键逻辑说明。
+    // ReLU dispatch 是 GPU 激活函数 smoke test 的核心路径。
     fn relu_f32(&self, a: &[f32], out: &mut [f32]) {
         let backend = get_or_init_cuda().unwrap();
         let ga = GpuTensor::from_host(backend, a, vec![a.len()]).unwrap();
@@ -701,7 +734,7 @@ impl BackendDispatch for CudaDispatch {
         out.copy_from_slice(&gc.to_host(backend).unwrap());
     }
 
-    // 中文注释：关键逻辑说明。
+    // GELU dispatch 确保 Transformer MLP 可走 GPU kernel。
     fn gelu_f32(&self, a: &[f32], out: &mut [f32]) {
         let backend = get_or_init_cuda().unwrap();
         let ga = GpuTensor::from_host(backend, a, vec![a.len()]).unwrap();
@@ -709,7 +742,7 @@ impl BackendDispatch for CudaDispatch {
         out.copy_from_slice(&gc.to_host(backend).unwrap());
     }
 
-    // 中文注释：关键逻辑说明。
+    // scale dispatch 覆盖 attention 缩放和梯度缩放的 GPU 路径。
     fn scale_f32(&self, a: &[f32], scalar: f32, out: &mut [f32]) {
         let backend = get_or_init_cuda().unwrap();
         let ga = GpuTensor::from_host(backend, a, vec![a.len()]).unwrap();
@@ -717,7 +750,7 @@ impl BackendDispatch for CudaDispatch {
         out.copy_from_slice(&gc.to_host(backend).unwrap());
     }
 
-    // 中文注释：关键逻辑说明。
+    // MatMul dispatch 是 CUDA 后端主要加速点，上层仍看到 row-major 输出。
     fn matmul_f32(&self, a: &[f32], b: &[f32], out: &mut [f32], m: usize, k: usize, n: usize) {
         let backend = get_or_init_cuda().unwrap();
         let ga = GpuTensor::from_host(backend, a, vec![m, k]).unwrap();

@@ -1,0 +1,21 @@
+﻿[package]
+name = "sptorch-benchmarks"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "sptorch_benchmarks"
+path = "src/lib.rs"
+
+[dependencies]
+sptorch-core-tensor = { version = "0.1.0", path = "../core-tensor" }
+sptorch-core-ops = { version = "0.1.0", path = "../core-ops" }
+sptorch-nn = { version = "0.1.0", path = "../nn" }
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false }
+
+[[bench]]
+name = "training_baselines"
+harness = false

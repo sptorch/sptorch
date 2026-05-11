@@ -1,24 +1,40 @@
-//! Versioned tensor protocol for SPTorch Studio.
+//! SPTorch 的版本化张量协议。
+//!
+//! 这个 crate 是框架、Studio 和 live-evolution 之间共享的“线格式契约”。它只定义
+//! 可序列化的状态快照和事件载荷，不持有真实 Tensor，也不读取硬件指针。这样可以
+//! 保证 IDE、训练进程和未来硬件遥测服务在不同进程中仍能用同一套版本语义对齐。
 
 use serde::{Deserialize, Serialize};
 
+/// 实时指标事件名。
 pub const EVENT_METRICS: &str = "studio://metrics";
+/// 版本提交事件名。
 pub const EVENT_VERSION_COMMIT: &str = "studio://version-commit";
+/// 硬件 fence 状态事件名。
 pub const EVENT_FENCE: &str = "studio://fence";
+/// 后端在线状态和队列深度事件名。
 pub const EVENT_HARDWARE_STATE: &str = "studio://hardware-state";
 
+/// 层参数更新策略。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum UpdatePolicy {
+    /// 单缓冲：直接更新活跃参数，节省显存但不提供影子版本。
     Single,
+    /// 双缓冲：更新 shadow 参数，提交时通过版本切换保证推理一致性。
     Double,
 }
 
+/// 单个模型层的更新策略配置。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LayerPolicy {
     pub layer_name: String,
     pub policy: UpdatePolicy,
 }
 
+/// 张量活跃缓冲和影子缓冲的逻辑指针。
+///
+/// v1 使用稳定字符串标识，不承诺是真实物理地址；真实硬件地址应留在 HAL/驱动侧，
+/// 避免跨进程 UI 暴露不安全指针。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BufferPointers {
     pub active_ptr: String,
@@ -27,6 +43,7 @@ pub struct BufferPointers {
     pub shadow_version: Option<u64>,
 }
 
+/// 前端可展示的张量布局快照。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TensorLayoutSnapshot {
     pub tensor_id: String,
@@ -39,6 +56,7 @@ pub struct TensorLayoutSnapshot {
     pub pointers: BufferPointers,
 }
 
+/// 版本链中的一个提交节点。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VersionNode {
     pub version_id: u64,
@@ -47,6 +65,7 @@ pub struct VersionNode {
     pub reason: String,
 }
 
+/// 版本化存储的完整可观测快照。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VersionedStorage {
     pub global_version: u64,
@@ -56,6 +75,7 @@ pub struct VersionedStorage {
     pub tensors: Vec<TensorLayoutSnapshot>,
 }
 
+/// 原子切换/fence 状态机阶段。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum FencePhase {
     Idle,
@@ -67,6 +87,7 @@ pub enum FencePhase {
     Error,
 }
 
+/// 一次硬件同步或影子缓冲切换的进度快照。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FenceState {
     pub phase: FencePhase,
@@ -75,6 +96,7 @@ pub struct FenceState {
     pub message: String,
 }
 
+/// 实时训练/演化指标。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EvolutionMetrics {
     pub ts_ms: u64,
@@ -87,6 +109,7 @@ pub struct EvolutionMetrics {
     pub fence: Option<FenceState>,
 }
 
+/// 硬件后端的最小在线状态。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HardwareState {
     pub backend: String,
@@ -98,7 +121,7 @@ pub struct HardwareState {
 mod tests {
     use super::*;
 
-    // 中文注释：关键逻辑说明。
+    // VersionedStorage 是 Studio 和引擎之间最重要的 JSON 契约，roundtrip 失败说明协议破坏。
     #[test]
     fn test_versioned_storage_json_roundtrip() {
         let storage = VersionedStorage {
@@ -144,7 +167,7 @@ mod tests {
         assert_eq!(out, storage);
     }
 
-    // 中文注释：关键逻辑说明。
+    // Metrics payload 覆盖梯度累积、scale 因子和 fence，避免 UI 订阅字段漂移。
     #[test]
     fn test_evolution_metrics_json_roundtrip() {
         let m = EvolutionMetrics {

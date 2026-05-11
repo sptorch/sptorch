@@ -35,6 +35,7 @@ crates/
   distributed/      gRPC coordinator/worker, AllReduce, Barrier, hardware-aware parallel plans
   live-evolution/   Double-buffer parameters, EWC, online monitoring and rollback
   versioning/       Versioned tensor protocol shared with Studio
+  benchmarks/       Internal Criterion performance baselines (publish = false)
 ```
 
 External ecosystem repositories:
@@ -59,6 +60,9 @@ cargo test --workspace
 
 # Framework checks
 cargo check --workspace
+
+# Performance baselines used by CI as a trend sentinel
+cargo bench -p sptorch-benchmarks
 ```
 
 Product and IDE commands are owned by their independent repositories:
