@@ -8,6 +8,7 @@
 //! [`CpuBackend`] 是正确性优先的参考实现：它不是性能目标，而是所有硬件
 //! 后端对齐数学语义、边界行为和测试期望的标尺。
 
+pub mod serial;
 pub mod topology;
 
 use sptorch_core_tensor::DType;

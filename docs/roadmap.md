@@ -207,6 +207,7 @@ External ecosystem repositories (not part of framework workspace):
 **周验收里程碑（执行口径）**：
 1. **Week 1（协议与最小链路）**
    - 交付：串口帧协议 v1（帧头/长度/校验/错误码）与最小 Rust 收发 demo
+   - 进度：`sptorch-hal::serial` 已落地固定 16 字节帧头、payload 长度、FNV-1a checksum、8 字节对齐 padding、loopback 传输器和 32×32 MatMul tile 指令 payload
    - 验收：主机↔Tang 9k 往返回环测试稳定通过，连续 10k 帧零崩溃
 2. **Week 2（算子指令映射）**
    - 交付：`matmul` 指令编码与 32×32 tile 切片/回收逻辑
@@ -823,7 +824,7 @@ External ecosystem repositories (not part of framework workspace):
 5. **SPTorch Studio**：Tauri 桌面应用，可视化训练/推理/Schema 管理
 
 ### 新增验收项（管理口径）
-1. **P8 硬件协议主线**：benchmark 基线已补齐，下一步推进 Tang9k 串口协议、MatMul 指令编码与 32×32 端到端验证
+1. **P8 硬件协议主线**：benchmark 基线已补齐，`hal::serial` 已具备串口帧协议、10k loopback 与 32×32 MatMul 指令编码 scaffold；下一步推进 serial backend 注册和 32×32 端到端验证
 2. **真实数据集评估**：在 Spider/WikiSQL 上给出 Text2SQL 准确率与错误类型分布
 3. **TokenTrie 线上约束验证**：`generate_constrained` 接入线上生成路径，验证 SQL 幻觉下降幅度
 
@@ -907,5 +908,6 @@ bdf6661 GPU Attention模型: 单头attention+手动backward, loss 3.13→2.38
 
 - [x] Tank9k multi-board topology model: `sptorch-hal::topology` now represents board nodes, serial/PCIe/Ethernet links, link roles, queue-depth hints, online state, and connectivity diagnostics.
 - [x] Multi-board planning primitives: HAL can derive deterministic ring order, estimate Ring-AllReduce transfer cost, and generate 32x32 MatMul shard plans for Tank9k-style validation.
+- [x] Tang9k serial protocol scaffold: `sptorch-hal::serial` defines v1 aligned frames, checksum validation, 10k-frame loopback testing, and 32x32 MatMul command payloads.
 - [x] Hardware-aware distributed dry-run: `sptorch-distributed::hardware_parallel` turns a topology into a validation plan combining MatMul sharding and Ring-AllReduce, so multi-board bring-up can be tested before real serial/PCIe DMA is connected.
 

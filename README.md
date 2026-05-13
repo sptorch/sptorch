@@ -50,6 +50,7 @@ External ecosystem repositories:
 
 - Tank9k/Tang 9k bring-up is now treated as a framework capability, not a product feature.
 - `sptorch-hal::topology` models multi-board nodes, serial/PCIe/Ethernet links, connectivity validation, ring allreduce estimates, and matmul shard plans.
+- `sptorch-hal::serial` provides the first Tang9k protocol scaffold: aligned frames, checksum validation, loopback testing, and 32x32 MatMul command payloads.
 - `sptorch-distributed::hardware_parallel` turns a hardware topology into dry-run validation plans for multi-board matmul + allreduce before real serial/PCIe DMA is wired in.
 
 ## Quick Start
