@@ -57,16 +57,47 @@ impl SerialOpcode {
 /// DDR 地址不可达，后续应通过 `SerialOpcode::Error` 的 payload 返回，而不是混进解析错误。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SerialProtocolError {
-    FrameTooShort { actual: usize },
-    InvalidAlignment { actual: usize, alignment: usize },
-    BadMagic { found: [u8; 2] },
+    FrameTooShort {
+        actual: usize,
+    },
+    InvalidAlignment {
+        actual: usize,
+        alignment: usize,
+    },
+    BadMagic {
+        found: [u8; 2],
+    },
     UnsupportedVersion(u8),
     UnknownOpcode(u8),
-    PayloadTooLarge { actual: usize, max: usize },
-    LengthMismatch { expected: usize, actual: usize },
-    ChecksumMismatch { expected: u32, actual: u32 },
+    PayloadTooLarge {
+        actual: usize,
+        max: usize,
+    },
+    LengthMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    ChecksumMismatch {
+        expected: u32,
+        actual: u32,
+    },
     NonZeroPadding,
-    InvalidMatmulPayloadLen { actual: usize },
+    InvalidMatmulPayloadLen {
+        actual: usize,
+    },
+    InvalidMatmulShape {
+        m: usize,
+        k: usize,
+        n: usize,
+    },
+    InvalidMatmulLayout {
+        reason: String,
+    },
+    MatmulAddressOverflow {
+        base: u64,
+        element_index: usize,
+        elem_size_bytes: u64,
+    },
 }
 
 impl fmt::Display for SerialProtocolError {
@@ -95,6 +126,18 @@ impl fmt::Display for SerialProtocolError {
             Self::InvalidMatmulPayloadLen { actual } => {
                 write!(f, "MatMul32x32 payload must be 32 bytes, got {actual}")
             }
+            Self::InvalidMatmulShape { m, k, n } => {
+                write!(f, "MatMul32x32 shape must be non-zero and divisible by 32, got [{m}, {k}, {n}]")
+            }
+            Self::InvalidMatmulLayout { reason } => write!(f, "invalid MatMul32x32 memory layout: {reason}"),
+            Self::MatmulAddressOverflow {
+                base,
+                element_index,
+                elem_size_bytes,
+            } => write!(
+                f,
+                "MatMul32x32 address overflow: base=0x{base:016x}, element_index={element_index}, elem_size_bytes={elem_size_bytes}"
+            ),
         }
     }
 }
@@ -251,6 +294,13 @@ pub struct Matmul32x32Command {
     pub flags: u32,
 }
 
+/// 首个 K tile 需要清空输出 tile，再写入部分和。
+pub const MATMUL32X32_FLAG_CLEAR_OUTPUT: u32 = 0x0000_0001;
+/// 非首个 K tile 在同一个输出 tile 上累加部分和。
+pub const MATMUL32X32_FLAG_ACCUMULATE: u32 = 0x0000_0002;
+/// 当前指令是该输出 tile 的最后一个 K 分片，可触发硬件侧 done/flush。
+pub const MATMUL32X32_FLAG_LAST_K_TILE: u32 = 0x0000_0004;
+
 impl Matmul32x32Command {
     pub const M: usize = 32;
     pub const K: usize = 32;
@@ -304,6 +354,189 @@ impl Matmul32x32Command {
     }
 }
 
+/// 主机对 Tang9k 板端 MatMul 缓冲区的 row-major 视图。
+///
+/// `a_*`、`b_*`、`out_*` 都是设备侧字节偏移，不是主机虚拟地址。stride 使用“元素数”
+/// 而不是字节数，是为了和 Tensor/矩阵 shape 的语义保持一致，最终乘以 `elem_size_bytes`
+/// 的动作集中在协议规划层完成。第一轮只接受 row-major 连续或带行 padding 的布局。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MatmulMemoryLayout {
+    pub a_base: u64,
+    pub b_base: u64,
+    pub out_base: u64,
+    pub a_row_stride: usize,
+    pub b_row_stride: usize,
+    pub out_row_stride: usize,
+    pub elem_size_bytes: u64,
+}
+
+impl MatmulMemoryLayout {
+    /// 构造标准 row-major 连续布局。
+    pub fn row_major(
+        m: usize,
+        k: usize,
+        n: usize,
+        a_base: u64,
+        b_base: u64,
+        out_base: u64,
+        elem_size_bytes: u64,
+    ) -> Self {
+        let _ = m;
+        Self {
+            a_base,
+            b_base,
+            out_base,
+            a_row_stride: k,
+            b_row_stride: n,
+            out_row_stride: n,
+            elem_size_bytes,
+        }
+    }
+
+    fn validate(&self, k: usize, n: usize) -> Result<(), SerialProtocolError> {
+        if self.elem_size_bytes == 0 {
+            return Err(SerialProtocolError::InvalidMatmulLayout {
+                reason: "elem_size_bytes must be greater than zero".into(),
+            });
+        }
+        if self.a_row_stride < k {
+            return Err(SerialProtocolError::InvalidMatmulLayout {
+                reason: format!("a_row_stride {} is smaller than k {}", self.a_row_stride, k),
+            });
+        }
+        if self.b_row_stride < n {
+            return Err(SerialProtocolError::InvalidMatmulLayout {
+                reason: format!("b_row_stride {} is smaller than n {}", self.b_row_stride, n),
+            });
+        }
+        if self.out_row_stride < n {
+            return Err(SerialProtocolError::InvalidMatmulLayout {
+                reason: format!("out_row_stride {} is smaller than n {}", self.out_row_stride, n),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// 一组可以顺序发送到 Tang9k 的 32x32 MatMul 指令。
+///
+/// 指令顺序采用 `m_tile -> n_tile -> k_tile`：先锁定一个输出 tile，再遍历所有 K 分片。
+/// 这样硬件侧可以用 flags 判断“清零输出、累加部分和、最后 flush”，不需要额外维护复杂的
+/// 输出 tile 生命周期表。它不是最终高性能调度器，但足够支撑 Week 2 的端到端协议验收。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Matmul32x32Plan {
+    pub m: usize,
+    pub k: usize,
+    pub n: usize,
+    pub tiles_m: usize,
+    pub tiles_k: usize,
+    pub tiles_n: usize,
+    pub commands: Vec<Matmul32x32Command>,
+}
+
+impl Matmul32x32Plan {
+    pub fn command_count(&self) -> usize {
+        self.commands.len()
+    }
+
+    /// 将指令序列包装成连续 sequence 的串行帧。
+    ///
+    /// sequence 使用 `wrapping_add`，和多数硬件队列计数器一样允许自然回绕；真实 backend
+    /// 如果需要窗口确认，可以在发送层追加更严格的 outstanding 限制。
+    pub fn frames(&self, first_sequence: u32) -> Vec<SerialFrame> {
+        self.commands
+            .iter()
+            .enumerate()
+            .map(|(idx, command)| command.into_frame(first_sequence.wrapping_add(idx as u32)))
+            .collect()
+    }
+}
+
+/// 为 row-major MatMul 生成 Tang9k 32x32 tile 指令序列。
+///
+/// v1 要求 `m`、`k`、`n` 都是 32 的倍数。这个限制看起来保守，但它能让 Verilog PE 阵列、
+/// Rust CPU baseline 和串口协议先共享最小确定语义；边缘 tile padding/裁剪应在下一轮扩展，
+/// 避免第一版硬件 bring-up 同时背上 shape 边界和链路稳定性两个风险。
+pub fn plan_matmul32x32_commands(
+    m: usize,
+    k: usize,
+    n: usize,
+    layout: MatmulMemoryLayout,
+) -> Result<Matmul32x32Plan, SerialProtocolError> {
+    if m == 0
+        || k == 0
+        || n == 0
+        || m % Matmul32x32Command::M != 0
+        || k % Matmul32x32Command::K != 0
+        || n % Matmul32x32Command::N != 0
+    {
+        return Err(SerialProtocolError::InvalidMatmulShape { m, k, n });
+    }
+    layout.validate(k, n)?;
+
+    let tiles_m = m / Matmul32x32Command::M;
+    let tiles_k = k / Matmul32x32Command::K;
+    let tiles_n = n / Matmul32x32Command::N;
+    let mut commands = Vec::with_capacity(tiles_m * tiles_k * tiles_n);
+    let mut tile_id = 0u32;
+
+    for m_tile in 0..tiles_m {
+        let row_start = m_tile * Matmul32x32Command::M;
+        for n_tile in 0..tiles_n {
+            let col_start = n_tile * Matmul32x32Command::N;
+            for k_tile in 0..tiles_k {
+                let k_start = k_tile * Matmul32x32Command::K;
+                let mut flags = if k_tile == 0 {
+                    MATMUL32X32_FLAG_CLEAR_OUTPUT
+                } else {
+                    MATMUL32X32_FLAG_ACCUMULATE
+                };
+                if k_tile + 1 == tiles_k {
+                    flags |= MATMUL32X32_FLAG_LAST_K_TILE;
+                }
+
+                let a_element = row_start
+                    .checked_mul(layout.a_row_stride)
+                    .and_then(|base| base.checked_add(k_start))
+                    .ok_or_else(|| SerialProtocolError::InvalidMatmulLayout {
+                        reason: "A tile element index overflow".into(),
+                    })?;
+                let b_element = k_start
+                    .checked_mul(layout.b_row_stride)
+                    .and_then(|base| base.checked_add(col_start))
+                    .ok_or_else(|| SerialProtocolError::InvalidMatmulLayout {
+                        reason: "B tile element index overflow".into(),
+                    })?;
+                let out_element = row_start
+                    .checked_mul(layout.out_row_stride)
+                    .and_then(|base| base.checked_add(col_start))
+                    .ok_or_else(|| SerialProtocolError::InvalidMatmulLayout {
+                        reason: "output tile element index overflow".into(),
+                    })?;
+
+                commands.push(Matmul32x32Command {
+                    tile_id,
+                    a_offset: checked_device_offset(layout.a_base, a_element, layout.elem_size_bytes)?,
+                    b_offset: checked_device_offset(layout.b_base, b_element, layout.elem_size_bytes)?,
+                    out_offset: checked_device_offset(layout.out_base, out_element, layout.elem_size_bytes)?,
+                    flags,
+                });
+                tile_id = tile_id.wrapping_add(1);
+            }
+        }
+    }
+
+    Ok(Matmul32x32Plan {
+        m,
+        k,
+        n,
+        tiles_m,
+        tiles_k,
+        tiles_n,
+        commands,
+    })
+}
+
 /// 纯内存 loopback 传输器，用来在没有 Tang9k 板卡时压测帧收发稳定性。
 #[derive(Debug, Default)]
 pub struct LoopbackSerialTransport {
@@ -335,6 +568,28 @@ fn validate_payload_len(len: usize) -> Result<(), SerialProtocolError> {
         });
     }
     Ok(())
+}
+
+fn checked_device_offset(base: u64, element_index: usize, elem_size_bytes: u64) -> Result<u64, SerialProtocolError> {
+    let element_index_u64 = u64::try_from(element_index).map_err(|_| SerialProtocolError::MatmulAddressOverflow {
+        base,
+        element_index,
+        elem_size_bytes,
+    })?;
+    let byte_offset =
+        element_index_u64
+            .checked_mul(elem_size_bytes)
+            .ok_or(SerialProtocolError::MatmulAddressOverflow {
+                base,
+                element_index,
+                elem_size_bytes,
+            })?;
+    base.checked_add(byte_offset)
+        .ok_or(SerialProtocolError::MatmulAddressOverflow {
+            base,
+            element_index,
+            elem_size_bytes,
+        })
 }
 
 fn align_up(value: usize, alignment: usize) -> usize {
@@ -418,6 +673,93 @@ mod tests {
         assert_eq!(decoded_frame.opcode, SerialOpcode::Matmul32x32);
         assert_eq!(decoded_frame.sequence, 99);
         assert_eq!(decoded_command, command);
+    }
+
+    #[test]
+    fn matmul32x32_plan_tiles_64_cube_in_stable_order() {
+        let layout = MatmulMemoryLayout::row_major(64, 64, 64, 0x1000, 0x2000, 0x3000, 4);
+        let plan = plan_matmul32x32_commands(64, 64, 64, layout).unwrap();
+
+        assert_eq!(plan.tiles_m, 2);
+        assert_eq!(plan.tiles_k, 2);
+        assert_eq!(plan.tiles_n, 2);
+        assert_eq!(plan.command_count(), 8);
+
+        let first = plan.commands[0];
+        assert_eq!(first.tile_id, 0);
+        assert_eq!(first.a_offset, 0x1000);
+        assert_eq!(first.b_offset, 0x2000);
+        assert_eq!(first.out_offset, 0x3000);
+        assert_eq!(first.flags, MATMUL32X32_FLAG_CLEAR_OUTPUT);
+
+        let second_k = plan.commands[1];
+        assert_eq!(second_k.a_offset, 0x1000 + 32 * 4);
+        assert_eq!(second_k.b_offset, 0x2000 + 32 * 64 * 4);
+        assert_eq!(second_k.out_offset, 0x3000);
+        assert_eq!(
+            second_k.flags,
+            MATMUL32X32_FLAG_ACCUMULATE | MATMUL32X32_FLAG_LAST_K_TILE
+        );
+
+        let next_n_tile = plan.commands[2];
+        assert_eq!(next_n_tile.b_offset, 0x2000 + 32 * 4);
+        assert_eq!(next_n_tile.out_offset, 0x3000 + 32 * 4);
+
+        let next_m_tile = plan.commands[4];
+        assert_eq!(next_m_tile.a_offset, 0x1000 + 32 * 64 * 4);
+        assert_eq!(next_m_tile.out_offset, 0x3000 + 32 * 64 * 4);
+    }
+
+    #[test]
+    fn matmul32x32_plan_frames_are_sequenced_and_decodable() {
+        let layout = MatmulMemoryLayout::row_major(32, 32, 64, 0x1000, 0x2000, 0x3000, 4);
+        let plan = plan_matmul32x32_commands(32, 32, 64, layout).unwrap();
+        let frames = plan.frames(500);
+
+        assert_eq!(frames.len(), 2);
+        for (idx, frame) in frames.iter().enumerate() {
+            let decoded = SerialFrame::decode(&frame.encode().unwrap()).unwrap();
+            let command = Matmul32x32Command::decode_payload(&decoded.payload).unwrap();
+            assert_eq!(decoded.sequence, 500 + idx as u32);
+            assert_eq!(decoded.opcode, SerialOpcode::Matmul32x32);
+            assert_eq!(command.tile_id, idx as u32);
+        }
+    }
+
+    #[test]
+    fn matmul32x32_plan_rejects_non_tile_aligned_shape() {
+        let layout = MatmulMemoryLayout::row_major(33, 32, 32, 0, 0, 0, 4);
+        let err = plan_matmul32x32_commands(33, 32, 32, layout).unwrap_err();
+        assert!(matches!(
+            err,
+            SerialProtocolError::InvalidMatmulShape { m: 33, k: 32, n: 32 }
+        ));
+    }
+
+    #[test]
+    fn matmul32x32_plan_supports_row_padding_strides() {
+        let layout = MatmulMemoryLayout {
+            a_base: 0x1000,
+            b_base: 0x2000,
+            out_base: 0x3000,
+            a_row_stride: 80,
+            b_row_stride: 96,
+            out_row_stride: 128,
+            elem_size_bytes: 4,
+        };
+        let plan = plan_matmul32x32_commands(64, 64, 64, layout).unwrap();
+
+        assert_eq!(plan.commands[1].a_offset, 0x1000 + 32 * 4);
+        assert_eq!(plan.commands[1].b_offset, 0x2000 + 32 * 96 * 4);
+        assert_eq!(plan.commands[4].a_offset, 0x1000 + 32 * 80 * 4);
+        assert_eq!(plan.commands[4].out_offset, 0x3000 + 32 * 128 * 4);
+    }
+
+    #[test]
+    fn matmul32x32_plan_rejects_address_overflow() {
+        let layout = MatmulMemoryLayout::row_major(64, 32, 32, u64::MAX - 4, 0, 0, 4);
+        let err = plan_matmul32x32_commands(64, 32, 32, layout).unwrap_err();
+        assert!(matches!(err, SerialProtocolError::MatmulAddressOverflow { .. }));
     }
 
     #[test]
