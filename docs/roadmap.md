@@ -215,7 +215,7 @@ External ecosystem repositories (not part of framework workspace):
    - 验收：CPU 参考结果对齐（容差阈值固定），错误可定位到 tile 级
 3. **Week 3（hal-ffi 接入）**
    - 交付：`serial_backend` 注册到 `BACKEND_REGISTRY`，`dispatch_matmul` 可路由到硬件
-   - 进度：`sptorch-hal-ffi::serial_backend` 已提供 Tang9k serial dry-run backend，可注册到 `core-tensor` dispatch 表，`core-ops::matmul` 能生成并 loopback 校验 serial tile frames；真实 UART/DMA 发送层待接入
+   - 进度：`sptorch-hal-ffi::serial_backend` 已提供 Tang9k serial dry-run backend，可注册到 `core-tensor` dispatch 表，`core-ops::matmul` 能生成并 loopback 校验 serial tile frames；`Tang9kSerialTransport` 已抽象发送/接收边界，真实 UART/DMA 发送层待实现
    - 验收：不改上层 API 即可切换 CPU/serial backend，核心回归测试通过
 4. **Week 4（端到端点亮）**
    - 交付：`sptorch -> serial_backend -> Tang 9k -> result` 全链路打通
@@ -826,7 +826,7 @@ External ecosystem repositories (not part of framework workspace):
 5. **SPTorch Studio**：Tauri 桌面应用，可视化训练/推理/Schema 管理
 
 ### 新增验收项（管理口径）
-1. **P8 硬件协议主线**：benchmark 基线已补齐，`hal::serial` 已具备串口帧协议、10k loopback、32×32 MatMul 指令编码与 tile 指令流规划；`hal-ffi::serial_backend` 已完成 dispatch dry-run 注册，下一步推进真实 UART/DMA 发送层和 32×32 端到端验证
+1. **P8 硬件协议主线**：benchmark 基线已补齐，`hal::serial` 已具备串口帧协议、10k loopback、32×32 MatMul 指令编码与 tile 指令流规划；`hal-ffi::serial_backend` 已完成 dispatch dry-run 注册和 transport 边界抽象，下一步推进真实 UART/DMA 发送层和 32×32 端到端验证
 2. **真实数据集评估**：在 Spider/WikiSQL 上给出 Text2SQL 准确率与错误类型分布
 3. **TokenTrie 线上约束验证**：`generate_constrained` 接入线上生成路径，验证 SQL 幻觉下降幅度
 
@@ -913,5 +913,6 @@ bdf6661 GPU Attention模型: 单头attention+手动backward, loss 3.13→2.38
 - [x] Tang9k serial protocol scaffold: `sptorch-hal::serial` defines v1 aligned frames, checksum validation, 10k-frame loopback testing, and 32x32 MatMul command payloads.
 - [x] Tang9k MatMul tile command planner: `plan_matmul32x32_commands` maps row-major board memory layouts into deterministic 32x32 tile command streams with clear/accumulate/last-k flags.
 - [x] Tang9k serial backend dry-run: `sptorch-hal-ffi::serial_backend` registers into core dispatch and lets `core-ops::matmul` exercise serial tile frames before real UART/DMA is connected.
+- [x] Tang9k transport boundary: `Tang9kSerialTransport` isolates the send/receive layer so loopback, UART, or DMA transports can share the same MatMul dispatch path.
 - [x] Hardware-aware distributed dry-run: `sptorch-distributed::hardware_parallel` turns a topology into a validation plan combining MatMul sharding and Ring-AllReduce, so multi-board bring-up can be tested before real serial/PCIe DMA is connected.
 

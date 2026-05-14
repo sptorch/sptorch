@@ -31,6 +31,35 @@ pub struct Tang9kSerialTrace {
     pub queue_depth_after_submit: u32,
 }
 
+/// Tang9k serial backend 的传输层边界。
+///
+/// dry-run 默认用 loopback，但真实 UART/DMA 也应该实现这个 trait：调用方给出已经编码好的
+/// [`SerialFrame`]，传输层负责发送、等待响应并返回对端帧。把这个边界抽出来后，调度层可以继续
+/// 复用 tile planner、sequence 管理和 trace 记录，而不用知道底层是内存回环、串口还是 DMA。
+pub trait Tang9kSerialTransport: Send + Sync + std::fmt::Debug {
+    fn exchange(&self, frame: &SerialFrame) -> Result<SerialFrame, SerialProtocolError>;
+}
+
+/// 默认 loopback 传输层，用于 CI、dry-run 和没有板卡时的 bring-up 演练。
+#[derive(Debug, Default)]
+pub struct LoopbackTang9kTransport {
+    loopback: Mutex<LoopbackSerialTransport>,
+}
+
+impl LoopbackTang9kTransport {
+    pub fn frames_seen(&self) -> usize {
+        self.loopback.lock().unwrap().frames_seen()
+    }
+}
+
+impl Tang9kSerialTransport for LoopbackTang9kTransport {
+    fn exchange(&self, frame: &SerialFrame) -> Result<SerialFrame, SerialProtocolError> {
+        let mut loopback = self.loopback.lock().unwrap();
+        let echoed = loopback.exchange(&frame.encode()?)?;
+        SerialFrame::decode(&echoed)
+    }
+}
+
 /// Tang9k serial backend 的纯 Rust dry-run 实现。
 ///
 /// elementwise kernel 先保持 CPU 语义；MatMul 会额外生成并 loopback 校验 Tang9k 指令帧。
@@ -38,6 +67,7 @@ pub struct Tang9kSerialTrace {
 #[derive(Debug)]
 pub struct Tang9kSerialDryRunBackend {
     device: Device,
+    transport: Arc<dyn Tang9kSerialTransport>,
     next_sequence: Mutex<u32>,
     last_trace: Mutex<Option<Tang9kSerialTrace>>,
 }
@@ -50,8 +80,13 @@ impl Default for Tang9kSerialDryRunBackend {
 
 impl Tang9kSerialDryRunBackend {
     pub fn new(device: Device) -> Self {
+        Self::with_transport(device, Arc::new(LoopbackTang9kTransport::default()))
+    }
+
+    pub fn with_transport(device: Device, transport: Arc<dyn Tang9kSerialTransport>) -> Self {
         Self {
             device,
+            transport,
             next_sequence: Mutex::new(0),
             last_trace: Mutex::new(None),
         }
@@ -92,11 +127,16 @@ impl Tang9kSerialDryRunBackend {
         };
         let frames = plan.frames(first_sequence);
 
-        let mut transport = LoopbackSerialTransport::new();
         for frame in &frames {
-            let encoded = frame.encode()?;
-            let echoed = transport.exchange(&encoded)?;
-            SerialFrame::decode(&echoed)?;
+            let echoed = self.transport.exchange(frame)?;
+            if echoed.sequence != frame.sequence || echoed.opcode != frame.opcode {
+                return Err(SerialProtocolError::InvalidMatmulLayout {
+                    reason: format!(
+                        "serial transport echoed mismatched frame: sent {:?}/{} got {:?}/{}",
+                        frame.opcode, frame.sequence, echoed.opcode, echoed.sequence
+                    ),
+                });
+            }
         }
 
         *self.last_trace.lock().unwrap() = Some(Tang9kSerialTrace {
@@ -161,7 +201,7 @@ impl BackendDispatch for Tang9kSerialDryRunBackend {
 
     fn matmul_f32(&self, a: &[f32], b: &[f32], out: &mut [f32], m: usize, k: usize, n: usize) {
         self.record_serial_plan(m, k, n)
-            .expect("Tang9k serial dry-run only supports non-zero 32x32-aligned MatMul shapes");
+            .expect("Tang9k serial dry-run failed to submit MatMul frames");
 
         for row in 0..m {
             for col in 0..n {
@@ -185,6 +225,19 @@ pub fn register_tang9k_serial_dry_run_backend() -> Arc<Tang9kSerialDryRunBackend
 /// 注册指定逻辑设备号的 Tang9k serial dry-run backend。
 pub fn register_tang9k_serial_dry_run_backend_for(device: Device) -> Arc<Tang9kSerialDryRunBackend> {
     let backend = Arc::new(Tang9kSerialDryRunBackend::new(device));
+    backend.register();
+    backend
+}
+
+/// 使用自定义传输层注册 Tang9k serial dry-run backend。
+///
+/// 这个入口是未来接真实串口的最小替换点：先把 UART/DMA 实现包成 [`Tang9kSerialTransport`]，
+/// 再通过这里注册，`core-ops::matmul` 的上层 API 不需要变化。
+pub fn register_tang9k_serial_dry_run_backend_with_transport(
+    device: Device,
+    transport: Arc<dyn Tang9kSerialTransport>,
+) -> Arc<Tang9kSerialDryRunBackend> {
+    let backend = Arc::new(Tang9kSerialDryRunBackend::with_transport(device, transport));
     backend.register();
     backend
 }
