@@ -12,12 +12,18 @@
 
 use std::fmt;
 
-const MAGIC: [u8; 2] = [b'S', b'P'];
-const VERSION: u8 = 1;
-const HEADER_LEN: usize = 16;
-const CHECKSUM_LEN: usize = 4;
-const ALIGNMENT: usize = 8;
-const MAX_PAYLOAD_LEN: usize = 64 * 1024;
+/// Tang9k serial v1 帧魔数，固定为 ASCII `"SP"`。
+pub const SERIAL_MAGIC: [u8; 2] = [b'S', b'P'];
+/// 当前线协议版本。版本号进入帧头，Verilog 与 host backend 必须显式校验。
+pub const SERIAL_VERSION: u8 = 1;
+/// 固定帧头长度，单位字节。
+pub const SERIAL_HEADER_LEN: usize = 16;
+/// checksum 字段长度，单位字节。
+pub const SERIAL_CHECKSUM_LEN: usize = 4;
+/// 整帧对齐粒度，单位字节。v1 选择 8 字节是为了照顾 64-bit DMA/FIFO 读取。
+pub const SERIAL_ALIGNMENT: usize = 8;
+/// v1 最大 payload 长度。控制指令应远小于该值，大 payload 应走 DMA 数据区。
+pub const SERIAL_MAX_PAYLOAD_LEN: usize = 64 * 1024;
 
 /// Tang9k 串行协议 v1 的 opcode。
 ///
@@ -51,6 +57,85 @@ impl SerialOpcode {
     }
 }
 
+/// Tang9k serial v1 的标准状态码。
+///
+/// 状态码用于 `Ack` / `Error` payload，也可被硬件日志直接记录。解析错误仍然由 Rust
+/// 侧的 [`SerialProtocolError`] 表达；状态码描述的是“对端理解了帧以后”的执行结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum SerialStatusCode {
+    Ok = 0x0000,
+    BadFrame = 0x0001,
+    UnsupportedOpcode = 0x0002,
+    InvalidPayload = 0x0003,
+    Busy = 0x0004,
+    HardwareFault = 0x0005,
+}
+
+impl SerialStatusCode {
+    pub fn from_u16(value: u16) -> Result<Self, SerialProtocolError> {
+        match value {
+            0x0000 => Ok(Self::Ok),
+            0x0001 => Ok(Self::BadFrame),
+            0x0002 => Ok(Self::UnsupportedOpcode),
+            0x0003 => Ok(Self::InvalidPayload),
+            0x0004 => Ok(Self::Busy),
+            0x0005 => Ok(Self::HardwareFault),
+            other => Err(SerialProtocolError::UnknownStatusCode(other)),
+        }
+    }
+}
+
+/// `Ack` / `Error` 帧的标准 payload。
+///
+/// 布局固定为 8 字节：
+/// - `0..2`: [`SerialStatusCode`]，little-endian `u16`
+/// - `2..4`: reserved，必须为 0
+/// - `4..8`: detail，little-endian `u32`
+///
+/// `detail` 的语义由 opcode 决定：例如 MatMul 可以写 tile id，链路层错误可以写硬件错误寄存器。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SerialStatusPayload {
+    pub code: SerialStatusCode,
+    pub detail: u32,
+}
+
+impl SerialStatusPayload {
+    pub const LEN: usize = 8;
+
+    pub fn ok() -> Self {
+        Self {
+            code: SerialStatusCode::Ok,
+            detail: 0,
+        }
+    }
+
+    pub fn encode(self) -> [u8; Self::LEN] {
+        let mut payload = [0u8; Self::LEN];
+        payload[0..2].copy_from_slice(&(self.code as u16).to_le_bytes());
+        payload[4..8].copy_from_slice(&self.detail.to_le_bytes());
+        payload
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, SerialProtocolError> {
+        if payload.len() != Self::LEN {
+            return Err(SerialProtocolError::InvalidStatusPayloadLen { actual: payload.len() });
+        }
+        let reserved = u16::from_le_bytes(payload[2..4].try_into().expect("payload length checked"));
+        if reserved != 0 {
+            return Err(SerialProtocolError::NonZeroReservedField {
+                field: "status_payload.reserved",
+            });
+        }
+        Ok(Self {
+            code: SerialStatusCode::from_u16(u16::from_le_bytes(
+                payload[0..2].try_into().expect("payload length checked"),
+            ))?,
+            detail: u32::from_le_bytes(payload[4..8].try_into().expect("payload length checked")),
+        })
+    }
+}
+
 /// 串行帧解析和编码阶段可能暴露的协议错误。
 ///
 /// 这些错误是“主机侧可以立刻判断”的问题；真实硬件执行失败，例如 PE 阵列溢出、
@@ -69,6 +154,7 @@ pub enum SerialProtocolError {
     },
     UnsupportedVersion(u8),
     UnknownOpcode(u8),
+    UnknownStatusCode(u16),
     PayloadTooLarge {
         actual: usize,
         max: usize,
@@ -84,6 +170,12 @@ pub enum SerialProtocolError {
     NonZeroPadding,
     InvalidMatmulPayloadLen {
         actual: usize,
+    },
+    InvalidStatusPayloadLen {
+        actual: usize,
+    },
+    NonZeroReservedField {
+        field: &'static str,
     },
     InvalidMatmulShape {
         m: usize,
@@ -110,6 +202,7 @@ impl fmt::Display for SerialProtocolError {
             Self::BadMagic { found } => write!(f, "bad serial magic: {:02x?}", found),
             Self::UnsupportedVersion(version) => write!(f, "unsupported serial protocol version: {version}"),
             Self::UnknownOpcode(opcode) => write!(f, "unknown serial opcode: 0x{opcode:02x}"),
+            Self::UnknownStatusCode(code) => write!(f, "unknown serial status code: 0x{code:04x}"),
             Self::PayloadTooLarge { actual, max } => {
                 write!(f, "serial payload too large: {actual} bytes, max {max}")
             }
@@ -126,6 +219,10 @@ impl fmt::Display for SerialProtocolError {
             Self::InvalidMatmulPayloadLen { actual } => {
                 write!(f, "MatMul32x32 payload must be 32 bytes, got {actual}")
             }
+            Self::InvalidStatusPayloadLen { actual } => {
+                write!(f, "serial status payload must be 8 bytes, got {actual}")
+            }
+            Self::NonZeroReservedField { field } => write!(f, "reserved serial field must be zero: {field}"),
             Self::InvalidMatmulShape { m, k, n } => {
                 write!(f, "MatMul32x32 shape must be non-zero and divisible by 32, got [{m}, {k}, {n}]")
             }
@@ -196,12 +293,12 @@ impl SerialFrame {
     pub fn encode(&self) -> Result<Vec<u8>, SerialProtocolError> {
         validate_payload_len(self.payload.len())?;
 
-        let body_len = HEADER_LEN + self.payload.len() + CHECKSUM_LEN;
-        let padded_len = align_up(body_len, ALIGNMENT);
+        let body_len = SERIAL_HEADER_LEN + self.payload.len() + SERIAL_CHECKSUM_LEN;
+        let padded_len = align_up(body_len, SERIAL_ALIGNMENT);
         let mut encoded = Vec::with_capacity(padded_len);
 
-        encoded.extend_from_slice(&MAGIC);
-        encoded.push(VERSION);
+        encoded.extend_from_slice(&SERIAL_MAGIC);
+        encoded.push(SERIAL_VERSION);
         encoded.push(self.opcode.as_u8());
         encoded.extend_from_slice(&self.sequence.to_le_bytes());
         encoded.extend_from_slice(&(self.payload.len() as u32).to_le_bytes());
@@ -220,21 +317,21 @@ impl SerialFrame {
     /// 这里要求传入的是“一帧”的完整字节，而不是任意长的 stream buffer。后续真正接 UART 时，
     /// stream framing 可以先按 header 中的长度切帧，再调用这个函数做严格校验。
     pub fn decode(bytes: &[u8]) -> Result<Self, SerialProtocolError> {
-        if bytes.len() < HEADER_LEN + CHECKSUM_LEN {
+        if bytes.len() < SERIAL_HEADER_LEN + SERIAL_CHECKSUM_LEN {
             return Err(SerialProtocolError::FrameTooShort { actual: bytes.len() });
         }
-        if bytes.len() % ALIGNMENT != 0 {
+        if bytes.len() % SERIAL_ALIGNMENT != 0 {
             return Err(SerialProtocolError::InvalidAlignment {
                 actual: bytes.len(),
-                alignment: ALIGNMENT,
+                alignment: SERIAL_ALIGNMENT,
             });
         }
 
         let found_magic = [bytes[0], bytes[1]];
-        if found_magic != MAGIC {
+        if found_magic != SERIAL_MAGIC {
             return Err(SerialProtocolError::BadMagic { found: found_magic });
         }
-        if bytes[2] != VERSION {
+        if bytes[2] != SERIAL_VERSION {
             return Err(SerialProtocolError::UnsupportedVersion(bytes[2]));
         }
 
@@ -244,8 +341,15 @@ impl SerialFrame {
         validate_payload_len(payload_len)?;
         let flags = u16::from_le_bytes(bytes[12..14].try_into().expect("slice length checked by header"));
 
-        let body_len = HEADER_LEN + payload_len + CHECKSUM_LEN;
-        let padded_len = align_up(body_len, ALIGNMENT);
+        let reserved = u16::from_le_bytes(bytes[14..16].try_into().expect("slice length checked by header"));
+        if reserved != 0 {
+            return Err(SerialProtocolError::NonZeroReservedField {
+                field: "frame_header.reserved",
+            });
+        }
+
+        let body_len = SERIAL_HEADER_LEN + payload_len + SERIAL_CHECKSUM_LEN;
+        let padded_len = align_up(body_len, SERIAL_ALIGNMENT);
         if bytes.len() != padded_len {
             return Err(SerialProtocolError::LengthMismatch {
                 expected: padded_len,
@@ -253,9 +357,9 @@ impl SerialFrame {
             });
         }
 
-        let checksum_offset = HEADER_LEN + payload_len;
+        let checksum_offset = SERIAL_HEADER_LEN + payload_len;
         let actual_checksum = u32::from_le_bytes(
-            bytes[checksum_offset..checksum_offset + CHECKSUM_LEN]
+            bytes[checksum_offset..checksum_offset + SERIAL_CHECKSUM_LEN]
                 .try_into()
                 .expect("checksum slice length checked by frame length"),
         );
@@ -267,7 +371,10 @@ impl SerialFrame {
             });
         }
 
-        if bytes[checksum_offset + CHECKSUM_LEN..].iter().any(|&byte| byte != 0) {
+        if bytes[checksum_offset + SERIAL_CHECKSUM_LEN..]
+            .iter()
+            .any(|&byte| byte != 0)
+        {
             return Err(SerialProtocolError::NonZeroPadding);
         }
 
@@ -275,7 +382,7 @@ impl SerialFrame {
             opcode,
             sequence,
             flags,
-            payload: bytes[HEADER_LEN..checksum_offset].to_vec(),
+            payload: bytes[SERIAL_HEADER_LEN..checksum_offset].to_vec(),
         })
     }
 }
@@ -561,10 +668,10 @@ impl LoopbackSerialTransport {
 }
 
 fn validate_payload_len(len: usize) -> Result<(), SerialProtocolError> {
-    if len > MAX_PAYLOAD_LEN {
+    if len > SERIAL_MAX_PAYLOAD_LEN {
         return Err(SerialProtocolError::PayloadTooLarge {
             actual: len,
-            max: MAX_PAYLOAD_LEN,
+            max: SERIAL_MAX_PAYLOAD_LEN,
         });
     }
     Ok(())
@@ -623,14 +730,14 @@ mod tests {
     fn serial_frame_is_eight_byte_aligned() {
         let frame = SerialFrame::new(SerialOpcode::Ack, 7, vec![1, 2, 3]);
         let encoded = frame.encode().unwrap();
-        assert_eq!(encoded.len() % ALIGNMENT, 0);
+        assert_eq!(encoded.len() % SERIAL_ALIGNMENT, 0);
     }
 
     #[test]
     fn serial_frame_rejects_length_mismatch() {
         let frame = SerialFrame::new(SerialOpcode::Ping, 1, b"abc".to_vec());
         let mut encoded = frame.encode().unwrap();
-        encoded.extend_from_slice(&[0u8; ALIGNMENT]);
+        encoded.extend_from_slice(&[0u8; SERIAL_ALIGNMENT]);
         let err = SerialFrame::decode(&encoded).unwrap_err();
         assert!(matches!(err, SerialProtocolError::LengthMismatch { .. }));
     }
@@ -639,7 +746,7 @@ mod tests {
     fn serial_frame_rejects_checksum_corruption() {
         let frame = SerialFrame::new(SerialOpcode::Ping, 1, b"abc".to_vec());
         let mut encoded = frame.encode().unwrap();
-        encoded[HEADER_LEN] ^= 0x55;
+        encoded[SERIAL_HEADER_LEN] ^= 0x55;
         let err = SerialFrame::decode(&encoded).unwrap_err();
         assert!(matches!(err, SerialProtocolError::ChecksumMismatch { .. }));
     }
@@ -652,6 +759,51 @@ mod tests {
         *last = 1;
         let err = SerialFrame::decode(&encoded).unwrap_err();
         assert_eq!(err, SerialProtocolError::NonZeroPadding);
+    }
+
+    #[test]
+    fn serial_frame_rejects_non_zero_header_reserved() {
+        let frame = SerialFrame::new(SerialOpcode::Ping, 1, b"abc".to_vec());
+        let mut encoded = frame.encode().unwrap();
+        encoded[14] = 1;
+        let err = SerialFrame::decode(&encoded).unwrap_err();
+        assert_eq!(
+            err,
+            SerialProtocolError::NonZeroReservedField {
+                field: "frame_header.reserved"
+            }
+        );
+    }
+
+    #[test]
+    fn serial_status_payload_roundtrips() {
+        let payload = SerialStatusPayload {
+            code: SerialStatusCode::Busy,
+            detail: 42,
+        };
+        let encoded = payload.encode();
+        assert_eq!(SerialStatusPayload::decode(&encoded).unwrap(), payload);
+    }
+
+    #[test]
+    fn serial_status_payload_rejects_reserved_bits() {
+        let mut encoded = SerialStatusPayload::ok().encode();
+        encoded[2] = 1;
+        let err = SerialStatusPayload::decode(&encoded).unwrap_err();
+        assert_eq!(
+            err,
+            SerialProtocolError::NonZeroReservedField {
+                field: "status_payload.reserved"
+            }
+        );
+    }
+
+    #[test]
+    fn serial_status_payload_rejects_unknown_status_code() {
+        let mut encoded = [0u8; SerialStatusPayload::LEN];
+        encoded[0..2].copy_from_slice(&0xffffu16.to_le_bytes());
+        let err = SerialStatusPayload::decode(&encoded).unwrap_err();
+        assert_eq!(err, SerialProtocolError::UnknownStatusCode(0xffff));
     }
 
     #[test]
