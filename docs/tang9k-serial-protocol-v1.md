@@ -151,12 +151,27 @@ Compatibility:
 - New opcodes should be appended, not renumbered.
 - New payload fields require either a new opcode or a new protocol version.
 
+## Golden Vectors
+
+The repository includes byte-level conformance vectors in `crates/hal/tests/tang9k_serial_golden.rs`.
+
+Golden coverage:
+
+- `Ping` frame with flags, payload, checksum, and padding.
+- `Ack` frame using `SerialStatusPayload { Busy, detail = 0x11223344 }`.
+- `Matmul32x32Command` payload and full frame.
+- Stream decoder behavior with leading noise and multiple golden frames in one byte stream.
+
+Any non-Rust implementation should reproduce these exact bytes before being treated as protocol-compatible.
+
 ## Current Acceptance Tests
 
 - `cargo test -p sptorch-hal`
 - `cargo test -p sptorch-hal-ffi --test test_serial_backend`
+- `cargo test -p sptorch-hal --test tang9k_serial_golden`
 - 10k-frame loopback stability.
 - 32x32 and 64x64 MatMul tile planning.
 - Frame corruption rejection: checksum, padding, reserved fields, unknown status code.
 - Stream framing: fragmented frames, noise recovery, split magic prefixes, multiple frames per chunk, oversized declared payload rejection.
+- Golden vectors: byte-for-byte frame, payload, checksum, padding, and stream framing compatibility.
 - Dispatch dry-run: `core-ops::matmul` -> `Tang9kSerialDryRunBackend` -> `Tang9kSerialTransport`.
