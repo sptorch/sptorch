@@ -114,11 +114,27 @@ This lets the target keep one output tile lifecycle at a time: clear on the firs
 - A response frame must echo the command sequence unless a future extension explicitly defines asynchronous completion queues.
 - Transport layers must not silently accept mismatched opcode or sequence echoes.
 
+## Stream Framing
+
+UART and USB-CDC transports expose a byte stream, not frame boundaries. Host transports should use `SerialStreamDecoder` before interpreting a response.
+
+Rules:
+
+- The decoder may receive arbitrary byte chunks.
+- Bytes before the first `magic` sequence are treated as noise and discarded.
+- A partial `magic` prefix at the end of a chunk must be preserved for the next chunk.
+- A complete header is required before calculating the expected frame length.
+- `payload_len` must be validated before allocating or waiting for a full payload.
+- Once enough bytes are buffered, the full frame must still pass `SerialFrame::decode`.
+
+This split keeps recovery behavior consistent across loopback, UART, and future DMA-backed transports.
+
 ## Implementation Standards
 
 Host implementations:
 
 - Must use `sptorch-hal::serial` constants instead of duplicating magic/version/header lengths.
+- Must use `SerialStreamDecoder` or equivalent behavior for byte-stream transports.
 - Must parse a full frame with `SerialFrame::decode` after stream framing.
 - Must keep large tensor data out of control payloads; use offsets into device memory instead.
 - Must preserve traceability: record at least tile plan, generated frames, and queue depth around submit.
@@ -142,4 +158,5 @@ Compatibility:
 - 10k-frame loopback stability.
 - 32x32 and 64x64 MatMul tile planning.
 - Frame corruption rejection: checksum, padding, reserved fields, unknown status code.
+- Stream framing: fragmented frames, noise recovery, split magic prefixes, multiple frames per chunk, oversized declared payload rejection.
 - Dispatch dry-run: `core-ops::matmul` -> `Tang9kSerialDryRunBackend` -> `Tang9kSerialTransport`.

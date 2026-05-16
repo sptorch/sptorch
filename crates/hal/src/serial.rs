@@ -168,6 +168,10 @@ pub enum SerialProtocolError {
         actual: u32,
     },
     NonZeroPadding,
+    IncompleteFrame {
+        needed: usize,
+        actual: usize,
+    },
     InvalidMatmulPayloadLen {
         actual: usize,
     },
@@ -216,6 +220,9 @@ impl fmt::Display for SerialProtocolError {
                 )
             }
             Self::NonZeroPadding => f.write_str("serial frame padding must be zero-filled"),
+            Self::IncompleteFrame { needed, actual } => {
+                write!(f, "serial stream needs {needed} bytes for a full frame, got {actual}")
+            }
             Self::InvalidMatmulPayloadLen { actual } => {
                 write!(f, "MatMul32x32 payload must be 32 bytes, got {actual}")
             }
@@ -384,6 +391,100 @@ impl SerialFrame {
             flags,
             payload: bytes[SERIAL_HEADER_LEN..checksum_offset].to_vec(),
         })
+    }
+}
+
+/// 面向 UART/USB-CDC 的增量帧切分器。
+///
+/// 串口读取通常只保证“字节顺序正确”，不保证一次 read 正好是一帧。这个解码器维护一个内部
+/// 缓冲区：先寻找 `SERIAL_MAGIC`，再根据 header 中的 payload 长度计算完整帧长度，等字节到齐后
+/// 调用 [`SerialFrame::decode`] 做严格校验。magic 前的噪声会被丢弃，便于设备复位或日志串扰后恢复。
+#[derive(Debug, Default)]
+pub struct SerialStreamDecoder {
+    buffer: Vec<u8>,
+}
+
+impl SerialStreamDecoder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn buffered_len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// 追加一段串口字节，并尽可能解析出完整帧。
+    pub fn push_bytes(&mut self, bytes: &[u8]) -> Result<Vec<SerialFrame>, SerialProtocolError> {
+        self.buffer.extend_from_slice(bytes);
+        let mut frames = Vec::new();
+
+        loop {
+            self.discard_until_magic();
+            if self.buffer.len() < SERIAL_HEADER_LEN {
+                break;
+            }
+
+            let payload_len =
+                u32::from_le_bytes(self.buffer[8..12].try_into().expect("header length checked")) as usize;
+            validate_payload_len(payload_len)?;
+            let frame_len = encoded_frame_len(payload_len);
+            if self.buffer.len() < frame_len {
+                break;
+            }
+
+            let frame_bytes: Vec<u8> = self.buffer.drain(..frame_len).collect();
+            frames.push(SerialFrame::decode(&frame_bytes)?);
+        }
+
+        Ok(frames)
+    }
+
+    /// 当前缓冲区已经看到 header 但还缺完整帧时，返回缺口信息。
+    pub fn pending_need(&mut self) -> Result<Option<(usize, usize)>, SerialProtocolError> {
+        self.discard_until_magic();
+        if self.buffer.is_empty() {
+            return Ok(None);
+        }
+        if self.buffer.len() < SERIAL_HEADER_LEN {
+            return Ok(Some((SERIAL_HEADER_LEN, self.buffer.len())));
+        }
+        let payload_len = u32::from_le_bytes(self.buffer[8..12].try_into().expect("header length checked")) as usize;
+        validate_payload_len(payload_len)?;
+        let needed = encoded_frame_len(payload_len);
+        if self.buffer.len() >= needed {
+            Ok(None)
+        } else {
+            Ok(Some((needed, self.buffer.len())))
+        }
+    }
+
+    /// 丢弃所有未完成的缓冲字节。
+    pub fn clear(&mut self) {
+        self.buffer.clear();
+    }
+
+    fn discard_until_magic(&mut self) {
+        if self.buffer.len() < SERIAL_MAGIC.len() {
+            return;
+        }
+        if let Some(pos) = self
+            .buffer
+            .windows(SERIAL_MAGIC.len())
+            .position(|window| window == SERIAL_MAGIC)
+        {
+            if pos > 0 {
+                self.buffer.drain(..pos);
+            }
+        } else {
+            let keep = self
+                .buffer
+                .last()
+                .copied()
+                .filter(|byte| *byte == SERIAL_MAGIC[0])
+                .into_iter()
+                .collect::<Vec<_>>();
+            self.buffer = keep;
+        }
     }
 }
 
@@ -677,6 +778,10 @@ fn validate_payload_len(len: usize) -> Result<(), SerialProtocolError> {
     Ok(())
 }
 
+fn encoded_frame_len(payload_len: usize) -> usize {
+    align_up(SERIAL_HEADER_LEN + payload_len + SERIAL_CHECKSUM_LEN, SERIAL_ALIGNMENT)
+}
+
 fn checked_device_offset(base: u64, element_index: usize, elem_size_bytes: u64) -> Result<u64, SerialProtocolError> {
     let element_index_u64 = u64::try_from(element_index).map_err(|_| SerialProtocolError::MatmulAddressOverflow {
         base,
@@ -804,6 +909,78 @@ mod tests {
         encoded[0..2].copy_from_slice(&0xffffu16.to_le_bytes());
         let err = SerialStatusPayload::decode(&encoded).unwrap_err();
         assert_eq!(err, SerialProtocolError::UnknownStatusCode(0xffff));
+    }
+
+    #[test]
+    fn serial_stream_decoder_waits_for_fragmented_frame() {
+        let frame = SerialFrame::new(SerialOpcode::Ping, 7, b"fragmented".to_vec());
+        let encoded = frame.encode().unwrap();
+        let split = 5;
+        let mut decoder = SerialStreamDecoder::new();
+
+        assert!(decoder.push_bytes(&encoded[..split]).unwrap().is_empty());
+        assert_eq!(decoder.pending_need().unwrap().unwrap().1, split);
+
+        let frames = decoder.push_bytes(&encoded[split..]).unwrap();
+        assert_eq!(frames, vec![frame]);
+        assert_eq!(decoder.buffered_len(), 0);
+    }
+
+    #[test]
+    fn serial_stream_decoder_recovers_after_noise() {
+        let frame = SerialFrame::new(SerialOpcode::Pong, 8, b"clean".to_vec());
+        let mut stream = vec![0xaa, 0xbb, b'S'];
+        stream.extend_from_slice(&[0x00, 0x11]);
+        stream.extend_from_slice(&frame.encode().unwrap());
+
+        let mut decoder = SerialStreamDecoder::new();
+        let frames = decoder.push_bytes(&stream).unwrap();
+        assert_eq!(frames, vec![frame]);
+        assert_eq!(decoder.buffered_len(), 0);
+    }
+
+    #[test]
+    fn serial_stream_decoder_parses_multiple_frames() {
+        let first = SerialFrame::new(SerialOpcode::Ping, 1, b"a".to_vec());
+        let second = SerialFrame::new(SerialOpcode::Ack, 2, SerialStatusPayload::ok().encode());
+        let mut stream = first.encode().unwrap();
+        stream.extend_from_slice(&second.encode().unwrap());
+
+        let mut decoder = SerialStreamDecoder::new();
+        let frames = decoder.push_bytes(&stream).unwrap();
+        assert_eq!(frames, vec![first, second]);
+    }
+
+    #[test]
+    fn serial_stream_decoder_preserves_split_magic_prefix() {
+        let frame = SerialFrame::new(SerialOpcode::Ping, 3, Vec::new());
+        let mut decoder = SerialStreamDecoder::new();
+
+        assert!(decoder.push_bytes(&[0xff, b'S']).unwrap().is_empty());
+        assert_eq!(decoder.buffered_len(), 1);
+
+        let encoded = frame.encode().unwrap();
+        let frames = decoder.push_bytes(&encoded[1..]).unwrap();
+        assert_eq!(frames, vec![frame]);
+    }
+
+    #[test]
+    fn serial_stream_decoder_rejects_oversized_declared_payload() {
+        let mut header = vec![0u8; SERIAL_HEADER_LEN];
+        header[0..2].copy_from_slice(&SERIAL_MAGIC);
+        header[2] = SERIAL_VERSION;
+        header[3] = SerialOpcode::Ping as u8;
+        header[8..12].copy_from_slice(&((SERIAL_MAX_PAYLOAD_LEN as u32) + 1).to_le_bytes());
+
+        let mut decoder = SerialStreamDecoder::new();
+        let err = decoder.push_bytes(&header).unwrap_err();
+        assert_eq!(
+            err,
+            SerialProtocolError::PayloadTooLarge {
+                actual: SERIAL_MAX_PAYLOAD_LEN + 1,
+                max: SERIAL_MAX_PAYLOAD_LEN
+            }
+        );
     }
 
     #[test]
