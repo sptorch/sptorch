@@ -24,6 +24,11 @@ pub const SERIAL_CHECKSUM_LEN: usize = 4;
 pub const SERIAL_ALIGNMENT: usize = 8;
 /// v1 最大 payload 长度。控制指令应远小于该值，大 payload 应走 DMA 数据区。
 pub const SERIAL_MAX_PAYLOAD_LEN: usize = 64 * 1024;
+/// host 侧 dry-run 默认命令队列容量。
+///
+/// 这个值不是 Tang9k 硬件承诺，而是给 Rust 层先建立“提交窗口”概念：真实 UART/DMA
+/// 接入后可以把它替换成板端 FIFO 深度或运行时查询值。
+pub const SERIAL_DEFAULT_QUEUE_CAPACITY: u32 = 64;
 
 /// Tang9k 串行协议 v1 的 opcode。
 ///
@@ -194,6 +199,23 @@ pub enum SerialProtocolError {
         element_index: usize,
         elem_size_bytes: u64,
     },
+    QueueFull {
+        capacity: u32,
+    },
+    UnexpectedResponseOpcode {
+        actual: SerialOpcode,
+    },
+    SequenceMismatch {
+        expected: u32,
+        actual: u32,
+    },
+    CommandRejected {
+        command_opcode: SerialOpcode,
+        response_opcode: SerialOpcode,
+        sequence: u32,
+        status: SerialStatusCode,
+        detail: u32,
+    },
 }
 
 impl fmt::Display for SerialProtocolError {
@@ -241,6 +263,23 @@ impl fmt::Display for SerialProtocolError {
             } => write!(
                 f,
                 "MatMul32x32 address overflow: base=0x{base:016x}, element_index={element_index}, elem_size_bytes={elem_size_bytes}"
+            ),
+            Self::QueueFull { capacity } => write!(f, "serial submit queue is full, capacity={capacity}"),
+            Self::UnexpectedResponseOpcode { actual } => {
+                write!(f, "serial response must be Ack or Error, got {actual:?}")
+            }
+            Self::SequenceMismatch { expected, actual } => {
+                write!(f, "serial response sequence mismatch: expected {expected}, got {actual}")
+            }
+            Self::CommandRejected {
+                command_opcode,
+                response_opcode,
+                sequence,
+                status,
+                detail,
+            } => write!(
+                f,
+                "serial command {command_opcode:?} seq={sequence} rejected by {response_opcode:?}: status={status:?}, detail=0x{detail:08x}"
             ),
         }
     }
@@ -294,6 +333,19 @@ impl SerialFrame {
             flags,
             payload: payload.into(),
         }
+    }
+
+    /// 构造标准 `Ack` 响应帧。
+    ///
+    /// 真实硬件和 dry-run 都应该用相同的状态载荷布局。把这个构造器放在协议层，
+    /// 可以避免每个 backend 自己手写 `SerialStatusPayload::encode()` 时漏掉 reserved 规则。
+    pub fn ack(sequence: u32, status: SerialStatusPayload) -> Self {
+        Self::new(SerialOpcode::Ack, sequence, status.encode())
+    }
+
+    /// 构造标准 `Error` 响应帧。
+    pub fn error(sequence: u32, status: SerialStatusPayload) -> Self {
+        Self::new(SerialOpcode::Error, sequence, status.encode())
     }
 
     /// 将帧编码为可直接写入串行链路的字节序列。
@@ -390,6 +442,144 @@ impl SerialFrame {
             sequence,
             flags,
             payload: bytes[SERIAL_HEADER_LEN..checksum_offset].to_vec(),
+        })
+    }
+}
+
+/// 验证设备侧对一条 host 命令的响应。
+///
+/// v1 暂不定义异步完成队列，因此响应必须回显原命令的 sequence；成功只能表示为
+/// `Ack + SerialStatusCode::Ok`。`Ack + Busy` 也会被视为拒绝，因为它代表目标队列没有接收
+/// 当前命令，host 必须重试或退避，不能把它当作已经提交成功。
+pub fn validate_status_response(
+    command: &SerialFrame,
+    response: &SerialFrame,
+) -> Result<SerialStatusPayload, SerialProtocolError> {
+    if response.sequence != command.sequence {
+        return Err(SerialProtocolError::SequenceMismatch {
+            expected: command.sequence,
+            actual: response.sequence,
+        });
+    }
+
+    match response.opcode {
+        SerialOpcode::Ack | SerialOpcode::Error => {
+            let status = SerialStatusPayload::decode(&response.payload)?;
+            if response.opcode == SerialOpcode::Ack && status.code == SerialStatusCode::Ok {
+                Ok(status)
+            } else {
+                Err(SerialProtocolError::CommandRejected {
+                    command_opcode: command.opcode,
+                    response_opcode: response.opcode,
+                    sequence: command.sequence,
+                    status: status.code,
+                    detail: status.detail,
+                })
+            }
+        }
+        actual => Err(SerialProtocolError::UnexpectedResponseOpcode { actual }),
+    }
+}
+
+/// 一次 host 命令提交的可观测结果。
+///
+/// 这里保留 command/response 和队列深度，是为了让测试、日志、Studio 或未来硬件 bring-up
+/// 能回答一个很实际的问题：命令是在发出前被背压挡住、发出后被板端拒绝，还是正常进入队列并完成。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SerialSubmitReport {
+    pub command: SerialFrame,
+    pub response: SerialFrame,
+    pub status: SerialStatusPayload,
+    pub queue_depth_before: u32,
+    pub queue_depth_after_enqueue: u32,
+    pub queue_depth_after_submit: u32,
+}
+
+/// host 侧同步提交队列模型。
+///
+/// 第一版 UART/DMA 接入前，我们先用这个小队列固定三个不变量：
+/// - sequence 由 host 单调分配，允许 `u32` 自然回绕；
+/// - 超过容量时必须显式返回 `Busy/QueueFull` 语义，不能静默丢帧；
+/// - 无论响应成功、拒绝还是传输错误，队列深度都必须恢复，避免 dry-run 掩盖资源泄漏。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SerialSubmitQueue {
+    next_sequence: u32,
+    queue_depth: u32,
+    capacity: u32,
+    high_watermark: u32,
+}
+
+impl Default for SerialSubmitQueue {
+    fn default() -> Self {
+        Self::new(SERIAL_DEFAULT_QUEUE_CAPACITY)
+    }
+}
+
+impl SerialSubmitQueue {
+    pub fn new(capacity: u32) -> Self {
+        Self {
+            next_sequence: 0,
+            queue_depth: 0,
+            capacity,
+            high_watermark: 0,
+        }
+    }
+
+    pub fn capacity(&self) -> u32 {
+        self.capacity
+    }
+
+    pub fn next_sequence(&self) -> u32 {
+        self.next_sequence
+    }
+
+    pub fn queue_depth(&self) -> u32 {
+        self.queue_depth
+    }
+
+    pub fn high_watermark(&self) -> u32 {
+        self.high_watermark
+    }
+
+    /// 为一批即将发送的帧预留连续 sequence。
+    ///
+    /// 预留 sequence 不等于提交命令；它只决定帧号。真正的队列深度变化发生在 [`Self::submit`]。
+    pub fn reserve_sequences(&mut self, count: usize) -> u32 {
+        let first = self.next_sequence;
+        self.next_sequence = self.next_sequence.wrapping_add(count as u32);
+        first
+    }
+
+    /// 同步提交一条命令并校验响应。
+    pub fn submit<F>(&mut self, frame: &SerialFrame, exchange: F) -> Result<SerialSubmitReport, SerialProtocolError>
+    where
+        F: FnOnce(&SerialFrame) -> Result<SerialFrame, SerialProtocolError>,
+    {
+        if self.queue_depth >= self.capacity {
+            return Err(SerialProtocolError::QueueFull {
+                capacity: self.capacity,
+            });
+        }
+
+        let queue_depth_before = self.queue_depth;
+        self.queue_depth += 1;
+        self.high_watermark = self.high_watermark.max(self.queue_depth);
+        let queue_depth_after_enqueue = self.queue_depth;
+
+        let response = exchange(frame);
+        self.queue_depth -= 1;
+        let queue_depth_after_submit = self.queue_depth;
+
+        let response = response?;
+        let status = validate_status_response(frame, &response)?;
+
+        Ok(SerialSubmitReport {
+            command: frame.clone(),
+            response,
+            status,
+            queue_depth_before,
+            queue_depth_after_enqueue,
+            queue_depth_after_submit,
         })
     }
 }
@@ -909,6 +1099,96 @@ mod tests {
         encoded[0..2].copy_from_slice(&0xffffu16.to_le_bytes());
         let err = SerialStatusPayload::decode(&encoded).unwrap_err();
         assert_eq!(err, SerialProtocolError::UnknownStatusCode(0xffff));
+    }
+
+    #[test]
+    fn status_response_accepts_ack_ok_only() {
+        let command = SerialFrame::new(SerialOpcode::Matmul32x32, 7, vec![0; Matmul32x32Command::PAYLOAD_LEN]);
+        let response = SerialFrame::ack(7, SerialStatusPayload::ok());
+
+        let status = validate_status_response(&command, &response).unwrap();
+        assert_eq!(status.code, SerialStatusCode::Ok);
+    }
+
+    #[test]
+    fn status_response_rejects_busy_ack() {
+        let command = SerialFrame::new(SerialOpcode::Matmul32x32, 7, vec![0; Matmul32x32Command::PAYLOAD_LEN]);
+        let response = SerialFrame::ack(
+            7,
+            SerialStatusPayload {
+                code: SerialStatusCode::Busy,
+                detail: 0x1234,
+            },
+        );
+
+        let err = validate_status_response(&command, &response).unwrap_err();
+        assert_eq!(
+            err,
+            SerialProtocolError::CommandRejected {
+                command_opcode: SerialOpcode::Matmul32x32,
+                response_opcode: SerialOpcode::Ack,
+                sequence: 7,
+                status: SerialStatusCode::Busy,
+                detail: 0x1234,
+            }
+        );
+    }
+
+    #[test]
+    fn submit_queue_tracks_depth_and_high_watermark() {
+        let mut queue = SerialSubmitQueue::new(2);
+        let first_sequence = queue.reserve_sequences(2);
+        let frames = [
+            SerialFrame::new(SerialOpcode::Ping, first_sequence, Vec::new()),
+            SerialFrame::new(SerialOpcode::Ping, first_sequence.wrapping_add(1), Vec::new()),
+        ];
+
+        let first = queue
+            .submit(&frames[0], |frame| {
+                Ok(SerialFrame::ack(frame.sequence, SerialStatusPayload::ok()))
+            })
+            .unwrap();
+        let second = queue
+            .submit(&frames[1], |frame| {
+                Ok(SerialFrame::ack(frame.sequence, SerialStatusPayload::ok()))
+            })
+            .unwrap();
+
+        assert_eq!(first.command.sequence, 0);
+        assert_eq!(second.command.sequence, 1);
+        assert_eq!(queue.next_sequence(), 2);
+        assert_eq!(queue.queue_depth(), 0);
+        assert_eq!(queue.high_watermark(), 1);
+        assert_eq!(first.queue_depth_before, 0);
+        assert_eq!(first.queue_depth_after_enqueue, 1);
+        assert_eq!(first.queue_depth_after_submit, 0);
+    }
+
+    #[test]
+    fn submit_queue_drains_after_transport_error() {
+        let mut queue = SerialSubmitQueue::new(1);
+        let frame = SerialFrame::new(SerialOpcode::Ping, 0, Vec::new());
+
+        let err = queue
+            .submit(&frame, |_| Err(SerialProtocolError::BadMagic { found: [0x00, 0x00] }))
+            .unwrap_err();
+
+        assert_eq!(err, SerialProtocolError::BadMagic { found: [0x00, 0x00] });
+        assert_eq!(queue.queue_depth(), 0);
+        assert_eq!(queue.high_watermark(), 1);
+    }
+
+    #[test]
+    fn submit_queue_rejects_full_capacity() {
+        let mut queue = SerialSubmitQueue::new(0);
+        let frame = SerialFrame::new(SerialOpcode::Ping, 0, Vec::new());
+
+        let err = queue
+            .submit(&frame, |_| Ok(SerialFrame::ack(0, SerialStatusPayload::ok())))
+            .unwrap_err();
+
+        assert_eq!(err, SerialProtocolError::QueueFull { capacity: 0 });
+        assert_eq!(queue.queue_depth(), 0);
     }
 
     #[test]

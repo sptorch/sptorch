@@ -112,7 +112,24 @@ This lets the target keep one output tile lifecycle at a time: clear on the firs
 - Sequence numbers are `u32`.
 - Host-side dry-run uses wrapping increment.
 - A response frame must echo the command sequence unless a future extension explicitly defines asynchronous completion queues.
-- Transport layers must not silently accept mismatched opcode or sequence echoes.
+- A command is accepted only by `Ack + SerialStatusCode::Ok`.
+- `Ack + Busy` means the target queue did not accept the command; host code must retry or apply backpressure instead of treating it as success.
+- `Error` frames always represent command rejection, even when the embedded status code is `Ok`.
+- Transport layers must not silently accept mismatched opcode or sequence responses.
+
+## Host Submit Queue
+
+The Rust host model uses `SerialSubmitQueue` as the normative dry-run lifecycle before real UART/DMA exists.
+
+Rules:
+
+- The queue owns host sequence allocation and may wrap naturally at `u32::MAX`.
+- Queue capacity is explicit; a full queue must fail with `QueueFull` rather than dropping frames.
+- Submission depth increases only while a frame is outstanding.
+- Submission depth must return to the previous value after success, command rejection, or transport failure.
+- Host trace records should include the command frame, response frame, decoded status, queue depth before enqueue, queue depth after enqueue, and queue depth after submit.
+
+This keeps dry-run behavior honest: a loopback backend cannot accidentally pass by echoing command frames, and a real transport can be swapped in without changing the dispatch contract.
 
 ## Stream Framing
 
@@ -138,11 +155,13 @@ Host implementations:
 - Must parse a full frame with `SerialFrame::decode` after stream framing.
 - Must keep large tensor data out of control payloads; use offsets into device memory instead.
 - Must preserve traceability: record at least tile plan, generated frames, and queue depth around submit.
+- Must validate `Ack/Ok` with `validate_status_response` or equivalent logic before reporting command success.
 
 Target implementations:
 
 - Must validate `magic`, `version`, `opcode`, `payload_len`, reserved fields, checksum, and padding before execution.
 - Must reply with `Ack` or `Error` using `SerialStatusPayload`.
+- Must return `Busy` when the command FIFO cannot accept work; it must not accept and silently drop the frame.
 - Must not reinterpret reserved bytes until a new protocol version is defined.
 
 Compatibility:
@@ -174,4 +193,5 @@ Any non-Rust implementation should reproduce these exact bytes before being trea
 - Frame corruption rejection: checksum, padding, reserved fields, unknown status code.
 - Stream framing: fragmented frames, noise recovery, split magic prefixes, multiple frames per chunk, oversized declared payload rejection.
 - Golden vectors: byte-for-byte frame, payload, checksum, padding, and stream framing compatibility.
-- Dispatch dry-run: `core-ops::matmul` -> `Tang9kSerialDryRunBackend` -> `Tang9kSerialTransport`.
+- Submit lifecycle: host queue sequence allocation, ACK/OK validation, Busy rejection, depth drain after transport failure, and queue high-watermark telemetry.
+- Dispatch dry-run: `core-ops::matmul` -> `Tang9kSerialDryRunBackend` -> `SerialSubmitQueue` -> `Tang9kSerialTransport`.

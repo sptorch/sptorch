@@ -51,8 +51,9 @@ External ecosystem repositories:
 - Tank9k/Tang 9k bring-up is now treated as a framework capability, not a product feature.
 - `sptorch-hal::topology` models multi-board nodes, serial/PCIe/Ethernet links, connectivity validation, ring allreduce estimates, and matmul shard plans.
 - `sptorch-hal::serial` provides the first Tang9k protocol scaffold: aligned frames, checksum validation, loopback testing, and 32x32 MatMul command payloads.
+- `sptorch-hal::serial::SerialSubmitQueue` models host-side sequence allocation, ACK/OK response validation, queue depth, and Busy backpressure before real UART/DMA is wired in.
 - `sptorch-hal::serial::plan_matmul32x32_commands` turns row-major board memory layouts into deterministic Tang9k tile command streams.
-- `sptorch-hal-ffi::serial_backend` registers a Tang9k serial dry-run backend into core dispatch, so MatMul can exercise serial frames before real UART/DMA is connected.
+- `sptorch-hal-ffi::serial_backend` registers a Tang9k serial dry-run backend into core dispatch, so MatMul can exercise serial frames and ACK/Error lifecycle before real UART/DMA is connected.
 - `Tang9kSerialTransport` isolates the send/receive boundary, letting loopback, UART, or DMA transports plug into the same dispatch path.
 - `sptorch-hal::serial::SerialStreamDecoder` standardizes byte-stream framing for UART/USB-CDC transports before strict frame decoding.
 - Tang9k serial v1 is now documented as a strict wire contract: [docs/tang9k-serial-protocol-v1.md](docs/tang9k-serial-protocol-v1.md).

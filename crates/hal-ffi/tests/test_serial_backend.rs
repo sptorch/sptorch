@@ -1,6 +1,6 @@
 use sptorch_core_ops::matmul;
 use sptorch_core_tensor::{Device, Tensor};
-use sptorch_hal::serial::{SerialFrame, SerialOpcode, SerialProtocolError};
+use sptorch_hal::serial::{SerialFrame, SerialOpcode, SerialProtocolError, SerialStatusCode, SerialStatusPayload};
 use sptorch_hal_ffi::serial_backend::{
     register_tang9k_serial_dry_run_backend_for, register_tang9k_serial_dry_run_backend_with_transport,
     Tang9kSerialTransport, MATMUL32X32_FLAG_CLEAR_OUTPUT, MATMUL32X32_FLAG_LAST_K_TILE,
@@ -15,7 +15,7 @@ struct CapturingTransport {
 impl Tang9kSerialTransport for CapturingTransport {
     fn exchange(&self, frame: &SerialFrame) -> Result<SerialFrame, SerialProtocolError> {
         self.seen.lock().unwrap().push(frame.clone());
-        Ok(frame.clone())
+        Ok(SerialFrame::ack(frame.sequence, SerialStatusPayload::ok()))
     }
 }
 
@@ -28,6 +28,21 @@ impl Tang9kSerialTransport for MismatchedTransport {
             SerialOpcode::Ack,
             frame.sequence.wrapping_add(1),
             Vec::new(),
+        ))
+    }
+}
+
+#[derive(Debug)]
+struct BusyTransport;
+
+impl Tang9kSerialTransport for BusyTransport {
+    fn exchange(&self, frame: &SerialFrame) -> Result<SerialFrame, SerialProtocolError> {
+        Ok(SerialFrame::ack(
+            frame.sequence,
+            SerialStatusPayload {
+                code: SerialStatusCode::Busy,
+                detail: 0xfeed_beef,
+            },
         ))
     }
 }
@@ -60,7 +75,13 @@ fn serial_dry_run_backend_registers_and_dispatches_matmul() {
     let trace = backend.last_trace().expect("serial trace should be recorded");
     assert_eq!(trace.plan.command_count(), 1);
     assert_eq!(trace.frames.len(), 1);
+    assert_eq!(trace.reports.len(), 1);
     assert_eq!(trace.frames[0].sequence, 0);
+    assert_eq!(trace.reports[0].status.code, SerialStatusCode::Ok);
+    assert_eq!(trace.reports[0].queue_depth_before, 0);
+    assert_eq!(trace.reports[0].queue_depth_after_enqueue, 1);
+    assert_eq!(trace.reports[0].queue_depth_after_submit, 0);
+    assert_eq!(trace.queue_high_watermark, 1);
     assert_eq!(
         trace.plan.commands[0].flags,
         MATMUL32X32_FLAG_CLEAR_OUTPUT | MATMUL32X32_FLAG_LAST_K_TILE
@@ -85,9 +106,12 @@ fn serial_dry_run_backend_tracks_multi_tile_frames() {
     let trace = backend.last_trace().expect("serial trace should be recorded");
     assert_eq!(trace.plan.command_count(), 8);
     assert_eq!(trace.frames.len(), 8);
+    assert_eq!(trace.reports.len(), 8);
     for (idx, frame) in trace.frames.iter().enumerate() {
         assert_eq!(frame.sequence, idx as u32);
+        assert_eq!(trace.reports[idx].status.code, SerialStatusCode::Ok);
     }
+    assert_eq!(trace.queue_high_watermark, 1);
 }
 
 #[test]
@@ -112,6 +136,17 @@ fn serial_dry_run_backend_accepts_custom_transport() {
 fn serial_dry_run_backend_rejects_mismatched_transport_echo() {
     let device = Device::Custom(904);
     let _backend = register_tang9k_serial_dry_run_backend_with_transport(device, Arc::new(MismatchedTransport));
+
+    let a = Tensor::new(vec![1.0f32; 32 * 32], vec![32, 32]).to_device(device);
+    let b = Tensor::new(vec![1.0f32; 32 * 32], vec![32, 32]).to_device(device);
+    let _ = matmul(&a, &b);
+}
+
+#[test]
+#[should_panic(expected = "Tang9k serial dry-run failed to submit MatMul frames")]
+fn serial_dry_run_backend_rejects_busy_ack() {
+    let device = Device::Custom(905);
+    let _backend = register_tang9k_serial_dry_run_backend_with_transport(device, Arc::new(BusyTransport));
 
     let a = Tensor::new(vec![1.0f32; 32 * 32], vec![32, 32]).to_device(device);
     let b = Tensor::new(vec![1.0f32; 32 * 32], vec![32, 32]).to_device(device);

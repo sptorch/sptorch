@@ -8,7 +8,7 @@
 use sptorch_core_tensor::{register_backend, BackendDispatch, Device};
 use sptorch_hal::serial::{
     plan_matmul32x32_commands, LoopbackSerialTransport, Matmul32x32Plan, MatmulMemoryLayout, SerialFrame,
-    SerialProtocolError,
+    SerialProtocolError, SerialStatusPayload, SerialSubmitQueue, SerialSubmitReport,
 };
 use std::sync::{Arc, Mutex};
 
@@ -28,14 +28,18 @@ pub const DEFAULT_TANG9K_SERIAL_DEVICE: Device = Device::Custom(9);
 pub struct Tang9kSerialTrace {
     pub plan: Matmul32x32Plan,
     pub frames: Vec<SerialFrame>,
+    pub reports: Vec<SerialSubmitReport>,
+    pub queue_high_watermark: u32,
     pub queue_depth_after_submit: u32,
 }
 
 /// Tang9k serial backend 的传输层边界。
 ///
 /// dry-run 默认用 loopback，但真实 UART/DMA 也应该实现这个 trait：调用方给出已经编码好的
-/// [`SerialFrame`]，传输层负责发送、等待响应并返回对端帧。把这个边界抽出来后，调度层可以继续
-/// 复用 tile planner、sequence 管理和 trace 记录，而不用知道底层是内存回环、串口还是 DMA。
+/// [`SerialFrame`]，传输层负责发送、等待响应并返回对端状态帧。v1 要求返回 `Ack/Ok`
+/// 才表示命令被目标接收；`Busy`、`Error` 或 sequence 不一致都会被调度层视为提交失败。
+/// 把这个边界抽出来后，调度层可以继续复用 tile planner、sequence 管理和 trace 记录，
+/// 而不用知道底层是内存回环、串口还是 DMA。
 pub trait Tang9kSerialTransport: Send + Sync + std::fmt::Debug {
     fn exchange(&self, frame: &SerialFrame) -> Result<SerialFrame, SerialProtocolError>;
 }
@@ -56,19 +60,26 @@ impl Tang9kSerialTransport for LoopbackTang9kTransport {
     fn exchange(&self, frame: &SerialFrame) -> Result<SerialFrame, SerialProtocolError> {
         let mut loopback = self.loopback.lock().unwrap();
         let echoed = loopback.exchange(&frame.encode()?)?;
-        SerialFrame::decode(&echoed)
+        let echoed = SerialFrame::decode(&echoed)?;
+        if echoed != *frame {
+            return Err(SerialProtocolError::InvalidMatmulLayout {
+                reason: "loopback transport returned a frame that differs from the submitted command".into(),
+            });
+        }
+        Ok(SerialFrame::ack(frame.sequence, SerialStatusPayload::ok()))
     }
 }
 
 /// Tang9k serial backend 的纯 Rust dry-run 实现。
 ///
 /// elementwise kernel 先保持 CPU 语义；MatMul 会额外生成并 loopback 校验 Tang9k 指令帧。
-/// `next_sequence` 用于模拟硬件提交队列的递增序号，`last_trace` 则是最近一次 MatMul 的调试快照。
+/// `submit_queue` 用于模拟硬件提交窗口、sequence 分配和 ACK 生命周期，`last_trace`
+/// 则是最近一次 MatMul 的调试快照。
 #[derive(Debug)]
 pub struct Tang9kSerialDryRunBackend {
     device: Device,
     transport: Arc<dyn Tang9kSerialTransport>,
-    next_sequence: Mutex<u32>,
+    submit_queue: Mutex<SerialSubmitQueue>,
     last_trace: Mutex<Option<Tang9kSerialTrace>>,
 }
 
@@ -87,7 +98,7 @@ impl Tang9kSerialDryRunBackend {
         Self {
             device,
             transport,
-            next_sequence: Mutex::new(0),
+            submit_queue: Mutex::new(SerialSubmitQueue::default()),
             last_trace: Mutex::new(None),
         }
     }
@@ -103,12 +114,7 @@ impl Tang9kSerialDryRunBackend {
 
     /// 返回模拟队列深度；dry-run 在 loopback 完成后会 drain 到 0。
     pub fn queue_depth(&self) -> u32 {
-        self.last_trace
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|trace| trace.queue_depth_after_submit)
-            .unwrap_or(0)
+        self.submit_queue.lock().unwrap().queue_depth()
     }
 
     /// 将 dry-run 后端注册到 core-tensor 的全局 dispatch 表。
@@ -119,30 +125,24 @@ impl Tang9kSerialDryRunBackend {
     fn record_serial_plan(&self, m: usize, k: usize, n: usize) -> Result<(), SerialProtocolError> {
         let layout = MatmulMemoryLayout::row_major(m, k, n, 0, (m * k * 4) as u64, ((m * k + k * n) * 4) as u64, 4);
         let plan = plan_matmul32x32_commands(m, k, n, layout)?;
-        let first_sequence = {
-            let mut next = self.next_sequence.lock().unwrap();
-            let current = *next;
-            *next = next.wrapping_add(plan.command_count() as u32);
-            current
-        };
+        let mut submit_queue = self.submit_queue.lock().unwrap();
+        let first_sequence = submit_queue.reserve_sequences(plan.command_count());
         let frames = plan.frames(first_sequence);
+        let mut reports = Vec::with_capacity(frames.len());
 
         for frame in &frames {
-            let echoed = self.transport.exchange(frame)?;
-            if echoed.sequence != frame.sequence || echoed.opcode != frame.opcode {
-                return Err(SerialProtocolError::InvalidMatmulLayout {
-                    reason: format!(
-                        "serial transport echoed mismatched frame: sent {:?}/{} got {:?}/{}",
-                        frame.opcode, frame.sequence, echoed.opcode, echoed.sequence
-                    ),
-                });
-            }
+            reports.push(submit_queue.submit(frame, |frame| self.transport.exchange(frame))?);
         }
+        let queue_high_watermark = submit_queue.high_watermark();
+        let queue_depth_after_submit = submit_queue.queue_depth();
+        drop(submit_queue);
 
         *self.last_trace.lock().unwrap() = Some(Tang9kSerialTrace {
             plan,
             frames,
-            queue_depth_after_submit: 0,
+            reports,
+            queue_high_watermark,
+            queue_depth_after_submit,
         });
         Ok(())
     }

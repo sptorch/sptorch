@@ -207,7 +207,7 @@ External ecosystem repositories (not part of framework workspace):
 **周验收里程碑（执行口径）**：
 1. **Week 1（协议与最小链路）**
    - 交付：串口帧协议 v1（帧头/长度/校验/错误码）与最小 Rust 收发 demo
-   - 进度：`sptorch-hal::serial` 已落地固定 16 字节帧头、payload 长度、FNV-1a checksum、8 字节对齐 padding、loopback 传输器、ACK/Error 状态载荷、stream framing decoder、golden vectors 和 32×32 MatMul tile 指令 payload；线协议标准见 `docs/tang9k-serial-protocol-v1.md`
+   - 进度：`sptorch-hal::serial` 已落地固定 16 字节帧头、payload 长度、FNV-1a checksum、8 字节对齐 padding、loopback 传输器、ACK/Error 状态载荷、host submit queue、stream framing decoder、golden vectors 和 32×32 MatMul tile 指令 payload；线协议标准见 `docs/tang9k-serial-protocol-v1.md`
    - 验收：主机↔Tang 9k 往返回环测试稳定通过，连续 10k 帧零崩溃
 2. **Week 2（算子指令映射）**
    - 交付：`matmul` 指令编码与 32×32 tile 切片/回收逻辑
@@ -215,7 +215,7 @@ External ecosystem repositories (not part of framework workspace):
    - 验收：CPU 参考结果对齐（容差阈值固定），错误可定位到 tile 级
 3. **Week 3（hal-ffi 接入）**
    - 交付：`serial_backend` 注册到 `BACKEND_REGISTRY`，`dispatch_matmul` 可路由到硬件
-   - 进度：`sptorch-hal-ffi::serial_backend` 已提供 Tang9k serial dry-run backend，可注册到 `core-tensor` dispatch 表，`core-ops::matmul` 能生成并 loopback 校验 serial tile frames；`Tang9kSerialTransport` 已抽象发送/接收边界，真实 UART/DMA 发送层待实现
+   - 进度：`sptorch-hal-ffi::serial_backend` 已提供 Tang9k serial dry-run backend，可注册到 `core-tensor` dispatch 表，`core-ops::matmul` 能生成 serial tile frames，并通过 `SerialSubmitQueue` 校验 ACK/OK、Busy 背压、sequence 和队列深度；`Tang9kSerialTransport` 已抽象发送/接收边界，真实 UART/DMA 发送层待实现
    - 验收：不改上层 API 即可切换 CPU/serial backend，核心回归测试通过
 4. **Week 4（端到端点亮）**
    - 交付：`sptorch -> serial_backend -> Tang 9k -> result` 全链路打通
@@ -826,7 +826,7 @@ External ecosystem repositories (not part of framework workspace):
 5. **SPTorch Studio**：Tauri 桌面应用，可视化训练/推理/Schema 管理
 
 ### 新增验收项（管理口径）
-1. **P8 硬件协议主线**：benchmark 基线已补齐，`hal::serial` 已具备串口帧协议、ACK/Error 标准载荷、stream framing、golden vectors、10k loopback、32×32 MatMul 指令编码与 tile 指令流规划；`hal-ffi::serial_backend` 已完成 dispatch dry-run 注册和 transport 边界抽象，下一步推进真实 UART/DMA 发送层和 32×32 端到端验证
+1. **P8 硬件协议主线**：benchmark 基线已补齐，`hal::serial` 已具备串口帧协议、ACK/Error 标准载荷、host submit queue、stream framing、golden vectors、10k loopback、32×32 MatMul 指令编码与 tile 指令流规划；`hal-ffi::serial_backend` 已完成 dispatch dry-run 注册、ACK/Busy 生命周期校验和 transport 边界抽象，下一步推进真实 UART/DMA 发送层和 32×32 端到端验证
 2. **真实数据集评估**：在 Spider/WikiSQL 上给出 Text2SQL 准确率与错误类型分布
 3. **TokenTrie 线上约束验证**：`generate_constrained` 接入线上生成路径，验证 SQL 幻觉下降幅度
 
@@ -913,6 +913,7 @@ bdf6661 GPU Attention模型: 单头attention+手动backward, loss 3.13→2.38
 - [x] Tang9k serial protocol scaffold: `sptorch-hal::serial` defines v1 aligned frames, checksum validation, 10k-frame loopback testing, and 32x32 MatMul command payloads.
 - [x] Tang9k serial protocol standard: `docs/tang9k-serial-protocol-v1.md` documents frame layout, opcode/status tables, ACK/Error payloads, MatMul command format, and compatibility rules.
 - [x] Tang9k stream framing: `SerialStreamDecoder` turns arbitrary UART/USB-CDC byte chunks into strict `SerialFrame` values with noise recovery and partial-frame buffering.
+- [x] Tang9k host submit lifecycle: `SerialSubmitQueue` owns sequence allocation, ACK/OK validation, Busy rejection, queue-depth drain, and high-watermark telemetry for dry-run and future UART/DMA transports.
 - [x] Tang9k golden vectors: `crates/hal/tests/tang9k_serial_golden.rs` locks byte-for-byte Ping, Ack, MatMul and stream framing conformance cases.
 - [x] Tang9k MatMul tile command planner: `plan_matmul32x32_commands` maps row-major board memory layouts into deterministic 32x32 tile command streams with clear/accumulate/last-k flags.
 - [x] Tang9k serial backend dry-run: `sptorch-hal-ffi::serial_backend` registers into core dispatch and lets `core-ops::matmul` exercise serial tile frames before real UART/DMA is connected.
