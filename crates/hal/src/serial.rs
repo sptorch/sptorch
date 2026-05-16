@@ -216,6 +216,12 @@ pub enum SerialProtocolError {
         status: SerialStatusCode,
         detail: u32,
     },
+    TransportIo {
+        reason: String,
+    },
+    ResponseTimeout {
+        timeout_ms: u64,
+    },
 }
 
 impl fmt::Display for SerialProtocolError {
@@ -281,6 +287,10 @@ impl fmt::Display for SerialProtocolError {
                 f,
                 "serial command {command_opcode:?} seq={sequence} rejected by {response_opcode:?}: status={status:?}, detail=0x{detail:08x}"
             ),
+            Self::TransportIo { reason } => write!(f, "serial transport I/O failed: {reason}"),
+            Self::ResponseTimeout { timeout_ms } => {
+                write!(f, "serial response timed out after {timeout_ms} ms")
+            }
         }
     }
 }

@@ -7,10 +7,11 @@
 
 use sptorch_core_tensor::{register_backend, BackendDispatch, Device};
 use sptorch_hal::serial::{
-    plan_matmul32x32_commands, LoopbackSerialTransport, Matmul32x32Plan, MatmulMemoryLayout, SerialFrame,
-    SerialProtocolError, SerialStatusPayload, SerialSubmitQueue, SerialSubmitReport,
+    plan_matmul32x32_commands, LoopbackSerialTransport, Matmul32x32Plan, MatmulMemoryLayout, SerialFrame, SerialOpcode,
+    SerialProtocolError, SerialStatusPayload, SerialStreamDecoder, SerialSubmitQueue, SerialSubmitReport,
 };
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 pub use sptorch_hal::serial::{
     MATMUL32X32_FLAG_ACCUMULATE, MATMUL32X32_FLAG_CLEAR_OUTPUT, MATMUL32X32_FLAG_LAST_K_TILE,
@@ -44,6 +45,88 @@ pub trait Tang9kSerialTransport: Send + Sync + std::fmt::Debug {
     fn exchange(&self, frame: &SerialFrame) -> Result<SerialFrame, SerialProtocolError>;
 }
 
+/// Windows/Linux/macOS 串口传输层。
+///
+/// 这个实现只负责字节流 I/O：写入一帧、持续读取，直到 `SerialStreamDecoder`
+/// 切出第一帧响应或超时。它不解释 `Ack/Busy/Error` 是否成功，成功语义仍交给
+/// `SerialSubmitQueue` / `validate_status_response`，这样 UART、DMA 和 loopback 的上层行为一致。
+#[derive(Debug, Clone)]
+pub struct UartTang9kTransport {
+    port_name: String,
+    baud_rate: u32,
+    timeout: Duration,
+}
+
+impl UartTang9kTransport {
+    pub fn new(port_name: impl Into<String>, baud_rate: u32, timeout: Duration) -> Self {
+        Self {
+            port_name: port_name.into(),
+            baud_rate,
+            timeout,
+        }
+    }
+
+    pub fn port_name(&self) -> &str {
+        &self.port_name
+    }
+
+    pub fn baud_rate(&self) -> u32 {
+        self.baud_rate
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+}
+
+impl Tang9kSerialTransport for UartTang9kTransport {
+    fn exchange(&self, frame: &SerialFrame) -> Result<SerialFrame, SerialProtocolError> {
+        let mut port = serialport::new(&self.port_name, self.baud_rate)
+            .timeout(Duration::from_millis(20))
+            .open()
+            .map_err(|err| SerialProtocolError::TransportIo {
+                reason: format!("open {} failed: {err}", self.port_name),
+            })?;
+
+        let encoded = frame.encode()?;
+        port.write_all(&encoded)
+            .map_err(|err| SerialProtocolError::TransportIo {
+                reason: format!("write {} failed: {err}", self.port_name),
+            })?;
+        port.flush().map_err(|err| SerialProtocolError::TransportIo {
+            reason: format!("flush {} failed: {err}", self.port_name),
+        })?;
+
+        let deadline = Instant::now() + self.timeout;
+        let mut decoder = SerialStreamDecoder::new();
+        let mut buf = [0u8; 256];
+
+        loop {
+            match port.read(&mut buf) {
+                Ok(0) => {}
+                Ok(n) => {
+                    let frames = decoder.push_bytes(&buf[..n])?;
+                    if let Some(response) = frames.into_iter().next() {
+                        return Ok(response);
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(err) => {
+                    return Err(SerialProtocolError::TransportIo {
+                        reason: format!("read {} failed: {err}", self.port_name),
+                    });
+                }
+            }
+
+            if Instant::now() >= deadline {
+                return Err(SerialProtocolError::ResponseTimeout {
+                    timeout_ms: self.timeout.as_millis() as u64,
+                });
+            }
+        }
+    }
+}
+
 /// 默认 loopback 传输层，用于 CI、dry-run 和没有板卡时的 bring-up 演练。
 #[derive(Debug, Default)]
 pub struct LoopbackTang9kTransport {
@@ -67,6 +150,62 @@ impl Tang9kSerialTransport for LoopbackTang9kTransport {
             });
         }
         Ok(SerialFrame::ack(frame.sequence, SerialStatusPayload::ok()))
+    }
+}
+
+/// 枚举当前主机可见串口。
+///
+/// probe 工具和用户代码都走这个入口，避免把 `serialport` crate 的类型泄漏为框架 API。
+pub fn list_tang9k_serial_ports() -> Result<Vec<String>, SerialProtocolError> {
+    serialport::available_ports()
+        .map(|ports| {
+            ports
+                .into_iter()
+                .map(|port| match port.port_type {
+                    serialport::SerialPortType::UsbPort(info) => {
+                        format!(
+                            "{} USB vid={:04x} pid={:04x} serial={}",
+                            port.port_name,
+                            info.vid,
+                            info.pid,
+                            info.serial_number.unwrap_or_else(|| "unknown".into())
+                        )
+                    }
+                    other => format!("{} {:?}", port.port_name, other),
+                })
+                .collect()
+        })
+        .map_err(|err| SerialProtocolError::TransportIo {
+            reason: format!("list serial ports failed: {err}"),
+        })
+}
+
+/// 对真实串口发送一帧 `Ping`，用于板卡上电后的最小链路验收。
+///
+/// 目标固件若还没实现 `Pong`，也可以返回 `Ack/Ok`，便于先验证 host->device->host
+/// 的控制通路。其它响应都会保留为协议错误，而不是吞掉。
+pub fn probe_tang9k_ping(
+    port_name: &str,
+    baud_rate: u32,
+    timeout: Duration,
+) -> Result<SerialFrame, SerialProtocolError> {
+    let transport = UartTang9kTransport::new(port_name, baud_rate, timeout);
+    let command = SerialFrame::new(SerialOpcode::Ping, 0, b"sptorch-ping".to_vec());
+    let response = transport.exchange(&command)?;
+    if response.sequence != command.sequence {
+        return Err(SerialProtocolError::SequenceMismatch {
+            expected: command.sequence,
+            actual: response.sequence,
+        });
+    }
+
+    match response.opcode {
+        SerialOpcode::Pong => Ok(response),
+        SerialOpcode::Ack => {
+            sptorch_hal::serial::validate_status_response(&command, &response)?;
+            Ok(response)
+        }
+        actual => Err(SerialProtocolError::UnexpectedResponseOpcode { actual }),
     }
 }
 

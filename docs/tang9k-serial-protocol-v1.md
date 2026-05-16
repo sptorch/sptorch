@@ -146,6 +146,25 @@ Rules:
 
 This split keeps recovery behavior consistent across loopback, UART, and future DMA-backed transports.
 
+## UART Bring-Up
+
+The first real-board host path is implemented by `sptorch-hal-ffi::serial_backend::UartTang9kTransport`.
+
+Safe bring-up sequence:
+
+```powershell
+cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --list
+cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --baud 115200 --timeout-ms 1000
+```
+
+Rules:
+
+- `--list` must be used first because it does not write to any device.
+- `--port` sends exactly one `Ping` frame with sequence `0` and payload `sptorch-ping`.
+- A target may answer with `Pong` or `Ack/Ok` during early bring-up.
+- `Busy`, `Error`, bad sequence, malformed frames, transport I/O errors, and timeouts are all reported explicitly.
+- If Windows only shows `COM1 Unknown`, treat it as suspicious unless the board documentation confirms Tang9k is mapped there; many built-in ACPI serial ports appear this way.
+
 ## Implementation Standards
 
 Host implementations:

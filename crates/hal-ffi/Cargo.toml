@@ -7,6 +7,11 @@ edition = "2021"
 sptorch-hal = { version = "0.1.0", path = "../hal" }
 sptorch-core-tensor = { version = "0.1.0", path = "../core-tensor" }
 libloading = "0.8"
+serialport = "4"
+
+[[bin]]
+name = "tang9k_probe"
+path = "src/bin/tang9k_probe.rs"
 
 [dev-dependencies]
 sptorch-core-ops = { version = "0.1.0", path = "../core-ops" }
