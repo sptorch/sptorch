@@ -149,10 +149,14 @@ This split keeps recovery behavior consistent across loopback, UART, and future 
 ## UART Bring-Up
 
 The first real-board host path is implemented by `sptorch-hal-ffi::serial_backend::UartTang9kTransport`.
+The first minimal target-side smoke-test bitstream lives in `hardware/tang9k/uart_responder`: it validates serial-v1 `Ping` frames and returns an empty `Pong` with the same sequence.
 
 Safe bring-up sequence:
 
 ```powershell
+& 'C:\Gowin\Gowin_V1.9.12.02_SP2_x64\IDE\bin\gw_sh.exe' hardware\tang9k\uart_responder\build.tcl
+$fs = (Resolve-Path hardware\tang9k\uart_responder\impl\pnr\tang9k_uart_responder.fs).Path
+& 'C:\Gowin\Gowin_V1.9.12.02_SP2_x64\Programmer\bin\programmer_cli.exe' --device GW1NR-9C --operation_index 2 --fsFile $fs --cable "USB Debugger A" --frequency 2.5MHz
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --list
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --baud 115200 --timeout-ms 1000
 ```
@@ -164,6 +168,14 @@ Rules:
 - A target may answer with `Pong` or `Ack/Ok` during early bring-up.
 - `Busy`, `Error`, bad sequence, malformed frames, transport I/O errors, and timeouts are all reported explicitly.
 - If Windows only shows `COM1 Unknown`, treat it as suspicious unless the board documentation confirms Tang9k is mapped there; many built-in ACPI serial ports appear this way.
+
+Real-board acceptance recorded on 2026-05-17:
+
+- JTAG cable: `USB Debugger A`.
+- Device scan: `GW1NR-9C`, ID `0x1100481B`.
+- SRAM Program status: `0x0003F020`.
+- UART port: `COM3`, `115200 8N1`.
+- Host result: `OK: response opcode=Pong, sequence=0, payload_len=0`.
 
 ## Implementation Standards
 

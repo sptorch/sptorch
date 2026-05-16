@@ -919,5 +919,6 @@ bdf6661 GPU Attention模型: 单头attention+手动backward, loss 3.13→2.38
 - [x] Tang9k serial backend dry-run: `sptorch-hal-ffi::serial_backend` registers into core dispatch and lets `core-ops::matmul` exercise serial tile frames before real UART/DMA is connected.
 - [x] Tang9k transport boundary: `Tang9kSerialTransport` isolates the send/receive layer so loopback, UART, or DMA transports can share the same MatMul dispatch path.
 - [x] Tang9k UART probe: `tang9k_probe --list` safely lists host serial ports and `--port COMx` sends one protocol Ping for real-board bring-up.
+- [x] Tang9k real-board UART smoke test: `hardware/tang9k/uart_responder` builds a minimal Gowin `GW1NR-9C` bitstream; SRAM Program via `USB Debugger A` succeeded with status `0x0003F020`, and `COM3 @ 115200` returned `OK: response opcode=Pong, sequence=0, payload_len=0`.
 - [x] Hardware-aware distributed dry-run: `sptorch-distributed::hardware_parallel` turns a topology into a validation plan combining MatMul sharding and Ring-AllReduce, so multi-board bring-up can be tested before real serial/PCIe DMA is connected.
 

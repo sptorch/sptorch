@@ -30,3 +30,8 @@ minigpt_checkpoint.sptc
 # Studio frontend build artifacts
 studio/node_modules
 studio/dist
+
+# Gowin FPGA generated artifacts. Keep source projects/scripts under hardware/,
+# but do not commit synthesized netlists, reports, bitstreams, or local UI state.
+hardware/**/impl/
+hardware/**/*.gprj.user
