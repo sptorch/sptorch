@@ -3,7 +3,7 @@ use sptorch_core_tensor::{Device, Tensor};
 use sptorch_hal::serial::{SerialFrame, SerialOpcode, SerialProtocolError, SerialStatusCode, SerialStatusPayload};
 use sptorch_hal_ffi::serial_backend::{
     register_tang9k_serial_dry_run_backend_for, register_tang9k_serial_dry_run_backend_with_transport,
-    Tang9kSerialTransport, MATMUL32X32_FLAG_CLEAR_OUTPUT, MATMUL32X32_FLAG_LAST_K_TILE,
+    tang9k_matmul_smoke_frame, Tang9kSerialTransport, MATMUL32X32_FLAG_CLEAR_OUTPUT, MATMUL32X32_FLAG_LAST_K_TILE,
 };
 use std::sync::{Arc, Mutex};
 
@@ -129,6 +129,29 @@ fn serial_dry_run_backend_accepts_custom_transport() {
     let seen = transport.seen.lock().unwrap();
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].opcode, SerialOpcode::Matmul32x32);
+}
+
+#[test]
+fn matmul_smoke_frame_matches_minimal_board_command_contract() {
+    let frame = tang9k_matmul_smoke_frame(9);
+
+    assert_eq!(frame.opcode, SerialOpcode::Matmul32x32);
+    assert_eq!(frame.sequence, 9);
+    assert_eq!(frame.payload.len(), 32);
+    assert_eq!(u32::from_le_bytes(frame.payload[0..4].try_into().unwrap()), 0);
+    assert_eq!(u64::from_le_bytes(frame.payload[4..12].try_into().unwrap()), 0);
+    assert_eq!(
+        u64::from_le_bytes(frame.payload[12..20].try_into().unwrap()),
+        32 * 32 * 4
+    );
+    assert_eq!(
+        u64::from_le_bytes(frame.payload[20..28].try_into().unwrap()),
+        (32 * 32 + 32 * 32) * 4
+    );
+    assert_eq!(
+        u32::from_le_bytes(frame.payload[28..32].try_into().unwrap()),
+        MATMUL32X32_FLAG_CLEAR_OUTPUT | MATMUL32X32_FLAG_LAST_K_TILE
+    );
 }
 
 #[test]

@@ -2,8 +2,9 @@
 //
 // This bitstream is intentionally tiny: it validates one SPTorch serial-v1
 // Ping frame from the host and replies with a Pong frame that echoes the same
-// sequence number.  It is the first real-board smoke test for the HAL serial
-// contract before any MatMul/DMA logic is introduced.
+// sequence number.  It also accepts a Matmul32x32 control frame and returns
+// Ack/Ok, so the host can test command submission before any PE array or DMA
+// datapath is introduced.
 
 module tang9k_uart_responder (
     input  wire       clk,
@@ -24,9 +25,18 @@ module tang9k_uart_responder (
     localparam [7:0] SERIAL_VERSION = 8'h01;
     localparam [7:0] OPCODE_PING   = 8'h01;
     localparam [7:0] OPCODE_PONG   = 8'h02;
+    localparam [7:0] OPCODE_MATMUL32X32 = 8'h10;
+    localparam [7:0] OPCODE_ACK    = 8'h7e;
+    localparam [7:0] OPCODE_ERROR  = 8'h7f;
     localparam [7:0] HEADER_LEN     = 8'd16;
     localparam [7:0] CHECKSUM_LEN   = 8'd4;
     localparam [15:0] MAX_PAYLOAD_LEN = 16'd64;
+    localparam [15:0] STATUS_PAYLOAD_LEN = 16'd8;
+    localparam [15:0] MATMUL32X32_PAYLOAD_LEN = 16'd32;
+
+    localparam [15:0] STATUS_OK                 = 16'h0000;
+    localparam [15:0] STATUS_UNSUPPORTED_OPCODE = 16'h0002;
+    localparam [15:0] STATUS_INVALID_PAYLOAD    = 16'h0003;
 
     localparam [3:0] RX_WAIT_S  = 4'd0;
     localparam [3:0] RX_WAIT_P  = 4'd1;
@@ -75,27 +85,39 @@ module tang9k_uart_responder (
     reg [31:0] checksum_calc = FNV_OFFSET;
     reg [2:0]  pad_remaining = 3'd0;
     reg [31:0] sequence = 32'd0;
+    reg [7:0]  command_opcode = 8'd0;
+    reg        unsupported_opcode = 1'b0;
+    reg        payload_invalid = 1'b0;
 
     reg        tx_frame_active = 1'b0;
+    reg        tx_prepare_active = 1'b0;
     reg [4:0]  tx_frame_index = 5'd0;
+    reg [4:0]  tx_hash_index = 5'd0;
     reg [1:0]  tx_phase = TX_SEND;
     reg [31:0] tx_sequence = 32'd0;
+    reg [31:0] tx_hash = FNV_OFFSET;
     reg [31:0] tx_checksum = 32'd0;
-    reg        pong_request_toggle = 1'b0;
-    reg        pong_request_seen = 1'b0;
-    reg [31:0] pong_request_sequence = 32'd0;
+    reg [7:0]  tx_response_opcode = OPCODE_PONG;
+    reg [15:0] tx_status_code = STATUS_OK;
+    reg [31:0] tx_status_detail = 32'd0;
+    reg        response_request_toggle = 1'b0;
+    reg        response_request_seen = 1'b0;
+    reg [31:0] response_request_sequence = 32'd0;
+    reg [7:0]  response_request_opcode = OPCODE_PONG;
+    reg [15:0] response_request_status_code = STATUS_OK;
+    reg [31:0] response_request_status_detail = 32'd0;
 
     reg [25:0] heartbeat = 26'd0;
     reg        led_heartbeat = 1'b0;
     reg        led_rx_byte = 1'b0;
     reg        led_tx_byte = 1'b0;
     reg        led_protocol_error = 1'b0;
-    reg        led_ping_accept = 1'b0;
+    reg        led_command_accept = 1'b0;
     reg        led_checksum_error = 1'b0;
 
     assign led = ~{
         led_checksum_error,
-        led_ping_accept,
+        led_command_accept,
         led_protocol_error,
         led_tx_byte,
         led_rx_byte,
@@ -121,50 +143,58 @@ module tang9k_uart_responder (
         end
     endfunction
 
-    function [31:0] pong_checksum;
-        input [31:0] seq;
-        reg [31:0] h;
+    function [4:0] response_last_index;
+        input [7:0] response_opcode;
         begin
-            h = FNV_OFFSET;
-            h = fnv_feed(h, SERIAL_MAGIC_S);
-            h = fnv_feed(h, SERIAL_MAGIC_P);
-            h = fnv_feed(h, SERIAL_VERSION);
-            h = fnv_feed(h, OPCODE_PONG);
-            h = fnv_feed(h, seq[7:0]);
-            h = fnv_feed(h, seq[15:8]);
-            h = fnv_feed(h, seq[23:16]);
-            h = fnv_feed(h, seq[31:24]);
-            h = fnv_feed(h, 8'h00);
-            h = fnv_feed(h, 8'h00);
-            h = fnv_feed(h, 8'h00);
-            h = fnv_feed(h, 8'h00);
-            h = fnv_feed(h, 8'h00);
-            h = fnv_feed(h, 8'h00);
-            h = fnv_feed(h, 8'h00);
-            h = fnv_feed(h, 8'h00);
-            pong_checksum = h;
+            response_last_index = response_opcode == OPCODE_PONG ? 5'd23 : 5'd31;
         end
     endfunction
 
-    function [7:0] pong_byte;
+    function [4:0] response_checksum_body_last_index;
+        input [7:0] response_opcode;
+        begin
+            response_checksum_body_last_index = response_opcode == OPCODE_PONG ? 5'd15 : 5'd23;
+        end
+    endfunction
+
+    function [7:0] response_byte;
         input [4:0] index;
+        input [7:0] response_opcode;
         input [31:0] seq;
+        input [15:0] status_code;
+        input [31:0] status_detail;
         input [31:0] csum;
         begin
             case (index)
-                5'd0:  pong_byte = SERIAL_MAGIC_S;
-                5'd1:  pong_byte = SERIAL_MAGIC_P;
-                5'd2:  pong_byte = SERIAL_VERSION;
-                5'd3:  pong_byte = OPCODE_PONG;
-                5'd4:  pong_byte = seq[7:0];
-                5'd5:  pong_byte = seq[15:8];
-                5'd6:  pong_byte = seq[23:16];
-                5'd7:  pong_byte = seq[31:24];
-                5'd16: pong_byte = csum[7:0];
-                5'd17: pong_byte = csum[15:8];
-                5'd18: pong_byte = csum[23:16];
-                5'd19: pong_byte = csum[31:24];
-                default: pong_byte = 8'h00;
+                5'd0:  response_byte = SERIAL_MAGIC_S;
+                5'd1:  response_byte = SERIAL_MAGIC_P;
+                5'd2:  response_byte = SERIAL_VERSION;
+                5'd3:  response_byte = response_opcode;
+                5'd4:  response_byte = seq[7:0];
+                5'd5:  response_byte = seq[15:8];
+                5'd6:  response_byte = seq[23:16];
+                5'd7:  response_byte = seq[31:24];
+                5'd8:  response_byte = response_opcode == OPCODE_PONG ? 8'h00 : STATUS_PAYLOAD_LEN[7:0];
+                5'd9:  response_byte = response_opcode == OPCODE_PONG ? 8'h00 : STATUS_PAYLOAD_LEN[15:8];
+                5'd10: response_byte = 8'h00;
+                5'd11: response_byte = 8'h00;
+                5'd12: response_byte = 8'h00;
+                5'd13: response_byte = 8'h00;
+                5'd14: response_byte = 8'h00;
+                5'd15: response_byte = 8'h00;
+                5'd16: response_byte = response_opcode == OPCODE_PONG ? csum[7:0] : status_code[7:0];
+                5'd17: response_byte = response_opcode == OPCODE_PONG ? csum[15:8] : status_code[15:8];
+                5'd18: response_byte = response_opcode == OPCODE_PONG ? csum[23:16] : 8'h00;
+                5'd19: response_byte = response_opcode == OPCODE_PONG ? csum[31:24] : 8'h00;
+                5'd20: response_byte = response_opcode == OPCODE_PONG ? 8'h00 : status_detail[7:0];
+                5'd21: response_byte = response_opcode == OPCODE_PONG ? 8'h00 : status_detail[15:8];
+                5'd22: response_byte = response_opcode == OPCODE_PONG ? 8'h00 : status_detail[23:16];
+                5'd23: response_byte = response_opcode == OPCODE_PONG ? 8'h00 : status_detail[31:24];
+                5'd24: response_byte = csum[7:0];
+                5'd25: response_byte = csum[15:8];
+                5'd26: response_byte = csum[23:16];
+                5'd27: response_byte = csum[31:24];
+                default: response_byte = 8'h00;
             endcase
         end
     endfunction
@@ -179,14 +209,34 @@ module tang9k_uart_responder (
             checksum_seen <= 32'd0;
             checksum_calc <= FNV_OFFSET;
             pad_remaining <= 3'd0;
+            command_opcode <= 8'd0;
+            unsupported_opcode <= 1'b0;
+            payload_invalid <= 1'b0;
         end
     endtask
 
-    task accept_ping;
+    task complete_frame;
         begin
-            pong_request_sequence <= sequence;
-            pong_request_toggle <= ~pong_request_toggle;
-            led_ping_accept <= ~led_ping_accept;
+            response_request_sequence <= sequence;
+            if (unsupported_opcode) begin
+                response_request_opcode <= OPCODE_ERROR;
+                response_request_status_code <= STATUS_UNSUPPORTED_OPCODE;
+                response_request_status_detail <= {24'd0, command_opcode};
+            end else if (payload_invalid) begin
+                response_request_opcode <= OPCODE_ERROR;
+                response_request_status_code <= STATUS_INVALID_PAYLOAD;
+                response_request_status_detail <= {16'd0, payload_len};
+            end else if (command_opcode == OPCODE_MATMUL32X32) begin
+                response_request_opcode <= OPCODE_ACK;
+                response_request_status_code <= STATUS_OK;
+                response_request_status_detail <= 32'd0;
+            end else begin
+                response_request_opcode <= OPCODE_PONG;
+                response_request_status_code <= STATUS_OK;
+                response_request_status_detail <= 32'd0;
+            end
+            response_request_toggle <= ~response_request_toggle;
+            led_command_accept <= ~led_command_accept;
             reset_parser();
         end
     endtask
@@ -201,18 +251,47 @@ module tang9k_uart_responder (
     always @(posedge clk) begin
         tx_start <= 1'b0;
 
-        if (!tx_frame_active && (pong_request_seen != pong_request_toggle)) begin
-            pong_request_seen <= pong_request_toggle;
-            tx_sequence <= pong_request_sequence;
-            tx_checksum <= pong_checksum(pong_request_sequence);
-            tx_frame_index <= 5'd0;
-            tx_phase <= TX_SEND;
-            tx_frame_active <= 1'b1;
+        if (!tx_frame_active && !tx_prepare_active && (response_request_seen != response_request_toggle)) begin
+            response_request_seen <= response_request_toggle;
+            tx_sequence <= response_request_sequence;
+            tx_response_opcode <= response_request_opcode;
+            tx_status_code <= response_request_status_code;
+            tx_status_detail <= response_request_status_detail;
+            tx_hash <= FNV_OFFSET;
+            tx_hash_index <= 5'd0;
+            tx_prepare_active <= 1'b1;
+        end else if (tx_prepare_active) begin
+            // 一拍只喂一个响应字节。之前把 24 次 FNV 乘法串在同一个组合函数里，
+            // Pong 勉强能过，但 Ack 帧在真实 GW1NR-9C 上会产生错误 checksum。
+            // 这里牺牲不到 1 微秒准备时间，换取控制面协议的确定性。
+            tx_hash <= fnv_feed(
+                tx_hash,
+                response_byte(tx_hash_index, tx_response_opcode, tx_sequence, tx_status_code, tx_status_detail, 32'd0)
+            );
+            if (tx_hash_index == response_checksum_body_last_index(tx_response_opcode)) begin
+                tx_checksum <= fnv_feed(
+                    tx_hash,
+                    response_byte(tx_hash_index, tx_response_opcode, tx_sequence, tx_status_code, tx_status_detail, 32'd0)
+                );
+                tx_prepare_active <= 1'b0;
+                tx_frame_index <= 5'd0;
+                tx_phase <= TX_SEND;
+                tx_frame_active <= 1'b1;
+            end else begin
+                tx_hash_index <= tx_hash_index + 5'd1;
+            end
         end else if (tx_frame_active) begin
             case (tx_phase)
                 TX_SEND: begin
                     if (!tx_busy) begin
-                        tx_data <= pong_byte(tx_frame_index, tx_sequence, tx_checksum);
+                        tx_data <= response_byte(
+                            tx_frame_index,
+                            tx_response_opcode,
+                            tx_sequence,
+                            tx_status_code,
+                            tx_status_detail,
+                            tx_checksum
+                        );
                         tx_start <= 1'b1;
                         led_tx_byte <= ~led_tx_byte;
                         tx_phase <= TX_WAIT_BUSY;
@@ -227,7 +306,7 @@ module tang9k_uart_responder (
 
                 TX_WAIT_IDLE: begin
                     if (!tx_busy) begin
-                        if (tx_frame_index == 5'd23) begin
+                        if (tx_frame_index == response_last_index(tx_response_opcode)) begin
                             tx_frame_active <= 1'b0;
                             tx_frame_index <= 5'd0;
                             tx_phase <= TX_SEND;
@@ -278,12 +357,9 @@ module tang9k_uart_responder (
                             end
                         end
                         5'd3: begin
-                            if (rx_byte != OPCODE_PING) begin
-                                led_protocol_error <= ~led_protocol_error;
-                                reset_parser();
-                            end else begin
-                                header_index <= header_index + 5'd1;
-                            end
+                            command_opcode <= rx_byte;
+                            unsupported_opcode <= rx_byte != OPCODE_PING && rx_byte != OPCODE_MATMUL32X32;
+                            header_index <= header_index + 5'd1;
                         end
                         5'd4: begin
                             sequence[7:0] <= rx_byte;
@@ -341,6 +417,8 @@ module tang9k_uart_responder (
                                 led_protocol_error <= ~led_protocol_error;
                                 reset_parser();
                             end else begin
+                                payload_invalid <= command_opcode == OPCODE_MATMUL32X32
+                                    && payload_len != MATMUL32X32_PAYLOAD_LEN;
                                 checksum_index <= 2'd0;
                                 if (payload_len == 16'd0) begin
                                     rx_state <= RX_CSUM;
@@ -381,7 +459,7 @@ module tang9k_uart_responder (
                             if (checksum_calc == {rx_byte, checksum_seen[23:0]}) begin
                                 pad_remaining <= frame_padding_len(payload_len);
                                 if (frame_padding_len(payload_len) == 3'd0) begin
-                                    accept_ping();
+                                    complete_frame();
                                 end else begin
                                     rx_state <= RX_PAD;
                                 end
@@ -398,7 +476,7 @@ module tang9k_uart_responder (
                         led_protocol_error <= ~led_protocol_error;
                         reset_parser();
                     end else if (pad_remaining <= 3'd1) begin
-                        accept_ping();
+                        complete_frame();
                     end else begin
                         pad_remaining <= pad_remaining - 3'd1;
                     end

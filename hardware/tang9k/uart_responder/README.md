@@ -1,6 +1,6 @@
 ﻿# Tang9k UART Responder Bring-Up
 
-这个工程是 SPTorch HAL 串行协议的第一块真实板卡烟测固件。它不实现 MatMul，也不进入训练路径，只做一件事：通过 Tang Nano 9K / Tang9k 的 USB-UART 收到 SPTorch serial v1 `Ping` 后，回传 checksum 正确、sequence 相同的 `Pong`。
+这个工程是 SPTorch HAL 串行协议的第一块真实板卡烟测固件。它不进入训练路径，先把控制面练稳：通过 Tang Nano 9K / Tang9k 的 USB-UART 收到 SPTorch serial v1 `Ping` 后回传 checksum 正确、sequence 相同的 `Pong`；收到最小 `Matmul32x32` 控制帧后回传 `Ack/Ok`。真正的 PE 阵列、DMA 和结果回读会在下一层接入。
 
 ## 目标板与链路
 
@@ -42,15 +42,33 @@ $fs = (Resolve-Path hardware\tang9k\uart_responder\impl\pnr\tang9k_uart_responde
 
 ```powershell
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --baud 115200 --timeout-ms 1000
+cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --matmul-smoke --baud 115200 --timeout-ms 1000
+cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --matmul-smoke --baud 115200 --timeout-ms 1000 --dump-raw
 ```
 
-期望输出类似：
+`Ping` 期望输出类似：
 
 ```text
 OK: response opcode=Pong, sequence=0, payload_len=0
 ```
 
+`MatmulSmoke` 期望输出类似：
+
+```text
+OK: response opcode=Ack, sequence=1, payload_len=8
+```
+
+当前实测的 `MatmulSmoke` ACK raw response：
+
+```text
+53 50 01 7e 01 00 00 00 08 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 b8 59 20 24 00 00 00 00
+```
+
 如果仍然超时，优先检查 `uart_tx` / `uart_rx` 约束是否需要对调。当前约束使用常见 Tang Nano 9K USB-UART 引脚：FPGA `uart_tx=17`、`uart_rx=18`。
+
+## RTL 约束
+
+响应帧 checksum 必须逐字节、逐拍计算。早期版本把 ACK 的 24 次 FNV-1a feed 串成单周期组合链，Pong 偶然通过，但 `Matmul32x32 -> Ack/Ok` 在真实 `GW1NR-9C` 上会出现 checksum drift。当前实现先用 `tx_prepare_active` 在 16/24 个时钟周期内生成 checksum，再进入 UART TX；这点准备延迟远小于串口发送时间，但能保证控制面稳定。
 
 ## LED 观测
 
@@ -60,5 +78,5 @@ OK: response opcode=Pong, sequence=0, payload_len=0
 - `led[1]`：收到 UART 字节后翻转。
 - `led[2]`：发送 UART 字节后翻转。
 - `led[3]`：结构性协议错误。
-- `led[4]`：合法 Ping 被接受。
+- `led[4]`：合法命令帧被接受并排队响应。
 - `led[5]`：checksum 错误。

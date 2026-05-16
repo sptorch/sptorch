@@ -55,8 +55,8 @@ External ecosystem repositories:
 - `sptorch-hal::serial::plan_matmul32x32_commands` turns row-major board memory layouts into deterministic Tang9k tile command streams.
 - `sptorch-hal-ffi::serial_backend` registers a Tang9k serial dry-run backend into core dispatch, so MatMul can exercise serial frames and ACK/Error lifecycle before real UART/DMA is connected.
 - `Tang9kSerialTransport` isolates the send/receive boundary, letting loopback, UART, or DMA transports plug into the same dispatch path.
-- `UartTang9kTransport` and `tang9k_probe` provide the first real serial bring-up path: list visible COM ports first, then send a protocol `Ping` only after confirming the Tang9k port.
-- `hardware/tang9k/uart_responder` contains the first minimal Gowin bitstream project for real Tang9k smoke testing: it receives serial-v1 `Ping` over USB-UART and returns a checksum-valid `Pong`.
+- `UartTang9kTransport` and `tang9k_probe` provide the first real serial bring-up path: list visible COM ports first, then send protocol `Ping` or `Matmul32x32` command-lifecycle probes after confirming the Tang9k port.
+- `hardware/tang9k/uart_responder` contains the first minimal Gowin bitstream project for real Tang9k smoke testing: it receives serial-v1 `Ping` over USB-UART and returns a checksum-valid `Pong`; it also accepts `Matmul32x32` and returns checksum-valid `Ack/Ok`.
 - `sptorch-hal::serial::SerialStreamDecoder` standardizes byte-stream framing for UART/USB-CDC transports before strict frame decoding.
 - Tang9k serial v1 is now documented as a strict wire contract: [docs/tang9k-serial-protocol-v1.md](docs/tang9k-serial-protocol-v1.md).
 - Tang9k protocol conformance is guarded by byte-level golden vectors in `crates/hal/tests/tang9k_serial_golden.rs`.
@@ -68,6 +68,12 @@ cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --list
 
 # Sends one Tang9k protocol Ping after you have confirmed the COM port.
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --baud 115200 --timeout-ms 1000
+
+# Sends one command-lifecycle Matmul32x32 smoke frame; requires the newer responder bitstream.
+cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --matmul-smoke --baud 115200 --timeout-ms 1000
+
+# Add --dump-raw when debugging board bytes, checksum drift, or stale serial data.
+cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --matmul-smoke --baud 115200 --timeout-ms 1000 --dump-raw
 ```
 
 Current real-board smoke test:
@@ -75,6 +81,8 @@ Current real-board smoke test:
 ```text
 Gowin SRAM Program: USB Debugger A -> GW1NR-9C, Status Code 0x0003F020
 Host probe: COM3 @ 115200 -> OK: response opcode=Pong, sequence=0, payload_len=0
+Host command lifecycle: COM3 @ 115200 -> OK: response opcode=Ack, sequence=1, payload_len=8
+Ack raw response: 53 50 01 7e 01 00 00 00 08 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 b8 59 20 24 00 00 00 00
 ```
 
 ## Quick Start

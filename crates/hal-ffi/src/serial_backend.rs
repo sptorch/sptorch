@@ -7,9 +7,11 @@
 
 use sptorch_core_tensor::{register_backend, BackendDispatch, Device};
 use sptorch_hal::serial::{
-    plan_matmul32x32_commands, LoopbackSerialTransport, Matmul32x32Plan, MatmulMemoryLayout, SerialFrame, SerialOpcode,
-    SerialProtocolError, SerialStatusPayload, SerialStreamDecoder, SerialSubmitQueue, SerialSubmitReport,
+    plan_matmul32x32_commands, validate_status_response, LoopbackSerialTransport, Matmul32x32Command, Matmul32x32Plan,
+    MatmulMemoryLayout, SerialFrame, SerialOpcode, SerialProtocolError, SerialStatusPayload, SerialStreamDecoder,
+    SerialSubmitQueue, SerialSubmitReport,
 };
+use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -45,6 +47,47 @@ pub trait Tang9kSerialTransport: Send + Sync + std::fmt::Debug {
     fn exchange(&self, frame: &SerialFrame) -> Result<SerialFrame, SerialProtocolError>;
 }
 
+/// 一次真实 UART 交换留下的字节级证据。
+///
+/// 真实板卡 bring-up 里，`SerialFrame` 只能说明“最终解码出了什么”；而 checksum mismatch、
+/// padding 污染、旧响应残留这类问题必须回到原始字节才能定位。因此 trace 同时保留 host 写出的
+/// request bytes 和设备侧读回的 raw bytes，CLI 可以直接打印，测试和后续 Studio 也能复用。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UartTang9kExchangeTrace {
+    pub request_bytes: Vec<u8>,
+    pub raw_response_bytes: Vec<u8>,
+    pub response: SerialFrame,
+}
+
+/// 带原始字节上下文的 UART 交换错误。
+///
+/// 内层仍然使用协议层统一的 [`SerialProtocolError`]，这里额外携带字节上下文，避免硬件调试时
+/// 只看到“checksum mismatch”却看不到 FPGA 实际发回了什么。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UartTang9kExchangeError {
+    pub error: SerialProtocolError,
+    pub request_bytes: Vec<u8>,
+    pub raw_response_bytes: Vec<u8>,
+}
+
+impl UartTang9kExchangeError {
+    fn new(error: SerialProtocolError, request_bytes: Vec<u8>, raw_response_bytes: Vec<u8>) -> Self {
+        Self {
+            error,
+            request_bytes,
+            raw_response_bytes,
+        }
+    }
+}
+
+impl fmt::Display for UartTang9kExchangeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for UartTang9kExchangeError {}
+
 /// Windows/Linux/macOS 串口传输层。
 ///
 /// 这个实现只负责字节流 I/O：写入一帧、持续读取，直到 `SerialStreamDecoder`
@@ -77,53 +120,81 @@ impl UartTang9kTransport {
     pub fn timeout(&self) -> Duration {
         self.timeout
     }
-}
 
-impl Tang9kSerialTransport for UartTang9kTransport {
-    fn exchange(&self, frame: &SerialFrame) -> Result<SerialFrame, SerialProtocolError> {
+    /// 发送一帧并返回字节级 trace。
+    ///
+    /// 打开串口后会短暂等待并清理输入缓冲，这是为了避免上一轮 probe 的残留响应污染当前命令。
+    /// Tang9k 当前 responder 是简单同步状态机，20ms 已远大于 115200 baud 下一帧 32 字节响应所需时间。
+    pub fn exchange_with_trace(&self, frame: &SerialFrame) -> Result<UartTang9kExchangeTrace, UartTang9kExchangeError> {
+        let encoded = frame
+            .encode()
+            .map_err(|error| UartTang9kExchangeError::new(error, Vec::new(), Vec::new()))?;
         let mut port = serialport::new(&self.port_name, self.baud_rate)
             .timeout(Duration::from_millis(20))
             .open()
             .map_err(|err| SerialProtocolError::TransportIo {
                 reason: format!("open {} failed: {err}", self.port_name),
-            })?;
+            })
+            .map_err(|error| UartTang9kExchangeError::new(error, encoded.clone(), Vec::new()))?;
 
-        let encoded = frame.encode()?;
+        std::thread::sleep(Duration::from_millis(20));
+        let _ = port.clear(serialport::ClearBuffer::Input);
         port.write_all(&encoded)
             .map_err(|err| SerialProtocolError::TransportIo {
                 reason: format!("write {} failed: {err}", self.port_name),
-            })?;
-        port.flush().map_err(|err| SerialProtocolError::TransportIo {
-            reason: format!("flush {} failed: {err}", self.port_name),
-        })?;
+            })
+            .map_err(|error| UartTang9kExchangeError::new(error, encoded.clone(), Vec::new()))?;
+        port.flush()
+            .map_err(|err| SerialProtocolError::TransportIo {
+                reason: format!("flush {} failed: {err}", self.port_name),
+            })
+            .map_err(|error| UartTang9kExchangeError::new(error, encoded.clone(), Vec::new()))?;
 
         let deadline = Instant::now() + self.timeout;
         let mut decoder = SerialStreamDecoder::new();
         let mut buf = [0u8; 256];
+        let mut raw_response_bytes = Vec::new();
 
         loop {
             match port.read(&mut buf) {
                 Ok(0) => {}
                 Ok(n) => {
-                    let frames = decoder.push_bytes(&buf[..n])?;
+                    raw_response_bytes.extend_from_slice(&buf[..n]);
+                    let frames = decoder.push_bytes(&buf[..n]).map_err(|error| {
+                        UartTang9kExchangeError::new(error, encoded.clone(), raw_response_bytes.clone())
+                    })?;
                     if let Some(response) = frames.into_iter().next() {
-                        return Ok(response);
+                        return Ok(UartTang9kExchangeTrace {
+                            request_bytes: encoded,
+                            raw_response_bytes,
+                            response,
+                        });
                     }
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {}
                 Err(err) => {
-                    return Err(SerialProtocolError::TransportIo {
+                    let error = SerialProtocolError::TransportIo {
                         reason: format!("read {} failed: {err}", self.port_name),
-                    });
+                    };
+                    return Err(UartTang9kExchangeError::new(error, encoded, raw_response_bytes));
                 }
             }
 
             if Instant::now() >= deadline {
-                return Err(SerialProtocolError::ResponseTimeout {
+                let error = SerialProtocolError::ResponseTimeout {
                     timeout_ms: self.timeout.as_millis() as u64,
-                });
+                };
+                return Err(UartTang9kExchangeError::new(error, encoded, raw_response_bytes));
             }
         }
+    }
+}
+
+impl Tang9kSerialTransport for UartTang9kTransport {
+    fn exchange(&self, frame: &SerialFrame) -> Result<SerialFrame, SerialProtocolError> {
+        self.exchange_with_trace(frame)
+            .map(|trace| trace.response)
+            .map_err(|err| err.error)
     }
 }
 
@@ -189,24 +260,99 @@ pub fn probe_tang9k_ping(
     baud_rate: u32,
     timeout: Duration,
 ) -> Result<SerialFrame, SerialProtocolError> {
+    probe_tang9k_ping_with_trace(port_name, baud_rate, timeout)
+        .map(|trace| trace.response)
+        .map_err(|err| err.error)
+}
+
+pub fn probe_tang9k_ping_with_trace(
+    port_name: &str,
+    baud_rate: u32,
+    timeout: Duration,
+) -> Result<UartTang9kExchangeTrace, UartTang9kExchangeError> {
     let transport = UartTang9kTransport::new(port_name, baud_rate, timeout);
     let command = SerialFrame::new(SerialOpcode::Ping, 0, b"sptorch-ping".to_vec());
-    let response = transport.exchange(&command)?;
-    if response.sequence != command.sequence {
-        return Err(SerialProtocolError::SequenceMismatch {
+    let trace = transport.exchange_with_trace(&command)?;
+    if trace.response.sequence != command.sequence {
+        let error = SerialProtocolError::SequenceMismatch {
             expected: command.sequence,
-            actual: response.sequence,
-        });
+            actual: trace.response.sequence,
+        };
+        return Err(UartTang9kExchangeError::new(
+            error,
+            trace.request_bytes,
+            trace.raw_response_bytes,
+        ));
     }
 
-    match response.opcode {
-        SerialOpcode::Pong => Ok(response),
+    match trace.response.opcode {
+        SerialOpcode::Pong => Ok(trace),
         SerialOpcode::Ack => {
-            sptorch_hal::serial::validate_status_response(&command, &response)?;
-            Ok(response)
+            if let Err(error) = sptorch_hal::serial::validate_status_response(&command, &trace.response) {
+                return Err(UartTang9kExchangeError::new(
+                    error,
+                    trace.request_bytes,
+                    trace.raw_response_bytes,
+                ));
+            }
+            Ok(trace)
         }
-        actual => Err(SerialProtocolError::UnexpectedResponseOpcode { actual }),
+        actual => Err(UartTang9kExchangeError::new(
+            SerialProtocolError::UnexpectedResponseOpcode { actual },
+            trace.request_bytes,
+            trace.raw_response_bytes,
+        )),
     }
+}
+
+/// 构造真实板卡 smoke test 使用的最小 MatMul 控制帧。
+///
+/// 地址只是协议层面的设备侧偏移，当前 responder 不会真正访问这些位置。把构造逻辑单独拆出来，
+/// 是为了让 CLI、测试和未来批量 bring-up 工具使用同一条命令样本，避免“host 发的不是我们以为的
+/// MatMul 帧”这种很难看的硬件调试分叉。
+pub fn tang9k_matmul_smoke_frame(sequence: u32) -> SerialFrame {
+    Matmul32x32Command {
+        tile_id: 0,
+        a_offset: 0,
+        b_offset: (Matmul32x32Command::M * Matmul32x32Command::K * std::mem::size_of::<f32>()) as u64,
+        out_offset: ((Matmul32x32Command::M * Matmul32x32Command::K + Matmul32x32Command::K * Matmul32x32Command::N)
+            * std::mem::size_of::<f32>()) as u64,
+        flags: MATMUL32X32_FLAG_CLEAR_OUTPUT | MATMUL32X32_FLAG_LAST_K_TILE,
+    }
+    .into_frame(sequence)
+}
+
+/// 向真实 Tang9k 串口发送一条最小 `Matmul32x32` 控制帧，并要求板端返回 `Ack/Ok`。
+///
+/// 这个探针不验证矩阵计算结果；它只验证板端已经能接收标准命令帧、校验 payload/checksum/padding，
+/// 并按 v1 规则回显 sequence 与状态载荷。换句话说，这是进入真实 PE 阵列之前的“命令提交生命周期”
+/// 烟测，能把 UART 物理链路问题和后续计算数据通路问题拆开定位。
+pub fn probe_tang9k_matmul_smoke(
+    port_name: &str,
+    baud_rate: u32,
+    timeout: Duration,
+) -> Result<SerialFrame, SerialProtocolError> {
+    probe_tang9k_matmul_smoke_with_trace(port_name, baud_rate, timeout)
+        .map(|trace| trace.response)
+        .map_err(|err| err.error)
+}
+
+pub fn probe_tang9k_matmul_smoke_with_trace(
+    port_name: &str,
+    baud_rate: u32,
+    timeout: Duration,
+) -> Result<UartTang9kExchangeTrace, UartTang9kExchangeError> {
+    let transport = UartTang9kTransport::new(port_name, baud_rate, timeout);
+    let command = tang9k_matmul_smoke_frame(1);
+    let trace = transport.exchange_with_trace(&command)?;
+    if let Err(error) = validate_status_response(&command, &trace.response) {
+        return Err(UartTang9kExchangeError::new(
+            error,
+            trace.request_bytes,
+            trace.raw_response_bytes,
+        ));
+    }
+    Ok(trace)
 }
 
 /// Tang9k serial backend 的纯 Rust dry-run 实现。

@@ -149,7 +149,7 @@ This split keeps recovery behavior consistent across loopback, UART, and future 
 ## UART Bring-Up
 
 The first real-board host path is implemented by `sptorch-hal-ffi::serial_backend::UartTang9kTransport`.
-The first minimal target-side smoke-test bitstream lives in `hardware/tang9k/uart_responder`: it validates serial-v1 `Ping` frames and returns an empty `Pong` with the same sequence.
+The first minimal target-side smoke-test bitstream lives in `hardware/tang9k/uart_responder`: it validates serial-v1 `Ping` frames and returns an empty `Pong` with the same sequence. The command-lifecycle version also accepts a `Matmul32x32` frame and returns `Ack/Ok` after validating payload length, checksum, and padding; it does not compute matrix data yet.
 
 Safe bring-up sequence:
 
@@ -159,12 +159,16 @@ $fs = (Resolve-Path hardware\tang9k\uart_responder\impl\pnr\tang9k_uart_responde
 & 'C:\Gowin\Gowin_V1.9.12.02_SP2_x64\Programmer\bin\programmer_cli.exe' --device GW1NR-9C --operation_index 2 --fsFile $fs --cable "USB Debugger A" --frequency 2.5MHz
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --list
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --baud 115200 --timeout-ms 1000
+cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --matmul-smoke --baud 115200 --timeout-ms 1000
+cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --matmul-smoke --baud 115200 --timeout-ms 1000 --dump-raw
 ```
 
 Rules:
 
 - `--list` must be used first because it does not write to any device.
 - `--port` sends exactly one `Ping` frame with sequence `0` and payload `sptorch-ping`.
+- `--matmul-smoke` sends exactly one `Matmul32x32` command frame with sequence `1`.
+- `--dump-raw` prints host request bytes and target response bytes; keep it enabled when debugging checksum drift, stale serial data, or RTL framing changes.
 - A target may answer with `Pong` or `Ack/Ok` during early bring-up.
 - `Busy`, `Error`, bad sequence, malformed frames, transport I/O errors, and timeouts are all reported explicitly.
 - If Windows only shows `COM1 Unknown`, treat it as suspicious unless the board documentation confirms Tang9k is mapped there; many built-in ACPI serial ports appear this way.
@@ -175,7 +179,13 @@ Real-board acceptance recorded on 2026-05-17:
 - Device scan: `GW1NR-9C`, ID `0x1100481B`.
 - SRAM Program status: `0x0003F020`.
 - UART port: `COM3`, `115200 8N1`.
-- Host result: `OK: response opcode=Pong, sequence=0, payload_len=0`.
+- Ping host result: `OK: response opcode=Pong, sequence=0, payload_len=0`.
+- Matmul smoke host result: `OK: response opcode=Ack, sequence=1, payload_len=8`.
+- Matmul smoke ACK response bytes:
+
+```text
+53 50 01 7e 01 00 00 00 08 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 b8 59 20 24 00 00 00 00
+```
 
 ## Implementation Standards
 
@@ -194,6 +204,7 @@ Target implementations:
 - Must reply with `Ack` or `Error` using `SerialStatusPayload`.
 - Must return `Busy` when the command FIFO cannot accept work; it must not accept and silently drop the frame.
 - Must not reinterpret reserved bytes until a new protocol version is defined.
+- Should compute response checksums in a timing-safe way. On GW1NR-9C, chaining 24 FNV-1a feeds in one combinational function produced ACK checksum drift; the responder computes one checksum byte feed per clock before transmitting.
 
 Compatibility:
 
