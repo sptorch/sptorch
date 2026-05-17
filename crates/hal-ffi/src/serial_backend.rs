@@ -7,9 +7,9 @@
 
 use sptorch_core_tensor::{register_backend, BackendDispatch, Device};
 use sptorch_hal::serial::{
-    plan_matmul32x32_commands, validate_status_response, LoopbackSerialTransport, Matmul32x32Command, Matmul32x32Plan,
-    MatmulMemoryLayout, SerialFrame, SerialOpcode, SerialProtocolError, SerialStatusPayload, SerialStreamDecoder,
-    SerialSubmitQueue, SerialSubmitReport,
+    plan_matmul32x32_commands, validate_scratch_value_response, validate_status_response, LoopbackSerialTransport,
+    Matmul32x32Command, Matmul32x32Plan, MatmulMemoryLayout, ScratchRead32Command, ScratchWrite32Command, SerialFrame,
+    SerialOpcode, SerialProtocolError, SerialStatusPayload, SerialStreamDecoder, SerialSubmitQueue, SerialSubmitReport,
 };
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -353,6 +353,55 @@ pub fn probe_tang9k_matmul_smoke_with_trace(
         ));
     }
     Ok(trace)
+}
+
+/// 向 Tang9k 发送一个最小 scratch 写入帧，然后再读回同一位置。
+///
+/// 这条路径不代表最终 DMA/共享内存协议，只是先验证“非 ACK 载荷”的数据面回环能力：host 能写，
+/// target 能记住，host 能再把 value 原样读回来。后续 MatMul 结果回读会复用同样的控制面接口。
+pub fn probe_tang9k_scratch_smoke_with_trace(
+    port_name: &str,
+    baud_rate: u32,
+    timeout: Duration,
+) -> Result<(UartTang9kExchangeTrace, UartTang9kExchangeTrace), UartTang9kExchangeError> {
+    let transport = UartTang9kTransport::new(port_name, baud_rate, timeout);
+    let write_command = ScratchWrite32Command::new(0x44, 0x1122_3344).into_frame(2);
+    let write_trace = transport.exchange_with_trace(&write_command)?;
+    if let Err(error) = validate_status_response(&write_command, &write_trace.response) {
+        return Err(UartTang9kExchangeError::new(
+            error,
+            write_trace.request_bytes,
+            write_trace.raw_response_bytes,
+        ));
+    }
+
+    let read_command = ScratchRead32Command::new(0x44).into_frame(3);
+    let read_trace = transport.exchange_with_trace(&read_command)?;
+    let read_value = match validate_scratch_value_response(&read_command, &read_trace.response) {
+        Ok(value) => value,
+        Err(error) => {
+            return Err(UartTang9kExchangeError::new(
+                error,
+                read_trace.request_bytes.clone(),
+                read_trace.raw_response_bytes.clone(),
+            ));
+        }
+    };
+
+    if read_value.offset != 0x44 || read_value.value != 0x1122_3344 {
+        return Err(UartTang9kExchangeError::new(
+            SerialProtocolError::ScratchValueMismatch {
+                expected_offset: 0x44,
+                expected_value: 0x1122_3344,
+                actual_offset: read_value.offset,
+                actual_value: read_value.value,
+            },
+            read_trace.request_bytes,
+            read_trace.raw_response_bytes,
+        ));
+    }
+
+    Ok((write_trace, read_trace))
 }
 
 /// Tang9k serial backend 的纯 Rust dry-run 实现。

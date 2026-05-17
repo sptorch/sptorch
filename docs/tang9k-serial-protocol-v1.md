@@ -43,6 +43,9 @@ Normative rules:
 | `Ping` | `0x01` | host -> device | implementation-defined or empty |
 | `Pong` | `0x02` | device -> host | implementation-defined or empty |
 | `Matmul32x32` | `0x10` | host -> device | `Matmul32x32Command` |
+| `ScratchWrite32` | `0x20` | host -> device | `ScratchWrite32Command` |
+| `ScratchRead32` | `0x21` | host -> device | `ScratchRead32Command` |
+| `ScratchValue32` | `0x22` | device -> host | `ScratchValue32Payload` |
 | `Ack` | `0x7e` | device -> host | `SerialStatusPayload` |
 | `Error` | `0x7f` | device -> host | `SerialStatusPayload` |
 
@@ -70,6 +73,35 @@ Status codes:
 | `HardwareFault` | `0x0005` | Target reported PE/DMA/FIFO fault |
 
 `detail` is opcode-specific. For MatMul it should prefer `tile_id`; for hardware faults it may contain a device status register snapshot.
+
+## Scratch Data-Plane Smoke Frames
+
+`ScratchWrite32` and `ScratchRead32` are the first strict data-plane extension on top of the command lifecycle.
+They are intentionally tiny: the goal is to verify that the board can store and return one 32-bit word before
+real DMA, queue depth exposure, or matrix-result readback exists.
+
+Payloads:
+
+```text
+ScratchWrite32Command
+0..4    offset  u32
+4..8    value   u32
+
+ScratchRead32Command
+0..4    offset  u32
+
+ScratchValue32Payload
+0..4    offset  u32
+4..8    value   u32
+```
+
+Rules:
+
+- `ScratchWrite32` must reply with `Ack/Ok` after accepting the write.
+- `ScratchRead32` must reply with `ScratchValue32`, not `Ack`, when the stored offset matches the read offset.
+- `ScratchValue32` is the host-visible readback payload; it is not a status frame.
+- A read before any write may return `Error/HardwareFault`.
+- The board-side responder currently stores one 32-bit slot and uses it as the scratch smoke baseline.
 
 ## Matmul32x32 Command
 
@@ -149,7 +181,7 @@ This split keeps recovery behavior consistent across loopback, UART, and future 
 ## UART Bring-Up
 
 The first real-board host path is implemented by `sptorch-hal-ffi::serial_backend::UartTang9kTransport`.
-The first minimal target-side smoke-test bitstream lives in `hardware/tang9k/uart_responder`: it validates serial-v1 `Ping` frames and returns an empty `Pong` with the same sequence. The command-lifecycle version also accepts a `Matmul32x32` frame and returns `Ack/Ok` after validating payload length, checksum, and padding; it does not compute matrix data yet.
+The first minimal target-side smoke-test bitstream lives in `hardware/tang9k/uart_responder`: it validates serial-v1 `Ping` frames and returns an empty `Pong` with the same sequence. The command-lifecycle version also accepts a `Matmul32x32` frame and returns `Ack/Ok` after validating payload length, checksum, and padding; the newer scratch smoke version stores one 32-bit word on `ScratchWrite32` and returns it via `ScratchValue32` on `ScratchRead32`.
 
 Safe bring-up sequence:
 
@@ -161,6 +193,8 @@ cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --list
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --baud 115200 --timeout-ms 1000
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --matmul-smoke --baud 115200 --timeout-ms 1000
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --matmul-smoke --baud 115200 --timeout-ms 1000 --dump-raw
+cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --scratch-smoke --baud 115200 --timeout-ms 1000
+cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --scratch-smoke --baud 115200 --timeout-ms 1000 --dump-raw
 ```
 
 Rules:
@@ -168,8 +202,9 @@ Rules:
 - `--list` must be used first because it does not write to any device.
 - `--port` sends exactly one `Ping` frame with sequence `0` and payload `sptorch-ping`.
 - `--matmul-smoke` sends exactly one `Matmul32x32` command frame with sequence `1`.
+- `--scratch-smoke` sends one `ScratchWrite32` followed by one `ScratchRead32`, then checks the returned `ScratchValue32`.
 - `--dump-raw` prints host request bytes and target response bytes; keep it enabled when debugging checksum drift, stale serial data, or RTL framing changes.
-- A target may answer with `Pong` or `Ack/Ok` during early bring-up.
+- A target may answer with `Pong`, `Ack/Ok`, or `ScratchValue32` during early bring-up.
 - `Busy`, `Error`, bad sequence, malformed frames, transport I/O errors, and timeouts are all reported explicitly.
 - If Windows only shows `COM1 Unknown`, treat it as suspicious unless the board documentation confirms Tang9k is mapped there; many built-in ACPI serial ports appear this way.
 
@@ -187,6 +222,20 @@ Real-board acceptance recorded on 2026-05-17:
 53 50 01 7e 01 00 00 00 08 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 b8 59 20 24 00 00 00 00
 ```
 
+- Scratch smoke host result: `OK: scratch write opcode=Ack, sequence=2, payload_len=8`.
+- Scratch smoke host result: `OK: scratch read opcode=ScratchValue32, sequence=3, offset=0x00000044, value=0x11223344`.
+- Scratch smoke write raw response bytes:
+
+```text
+53 50 01 7e 02 00 00 00 08 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 c1 fc 65 21 00 00 00 00
+```
+
+- Scratch smoke read raw response bytes:
+
+```text
+53 50 01 22 03 00 00 00 08 00 00 00 00 00 00 00 44 00 00 00 44 33 22 11 86 82 c3 d0 00 00 00 00
+```
+
 ## Implementation Standards
 
 Host implementations:
@@ -201,7 +250,7 @@ Host implementations:
 Target implementations:
 
 - Must validate `magic`, `version`, `opcode`, `payload_len`, reserved fields, checksum, and padding before execution.
-- Must reply with `Ack` or `Error` using `SerialStatusPayload`.
+- Must reply with `Ack`, `Error`, or the dedicated data-plane response opcode when a new readback path is defined.
 - Must return `Busy` when the command FIFO cannot accept work; it must not accept and silently drop the frame.
 - Must not reinterpret reserved bytes until a new protocol version is defined.
 - Should compute response checksums in a timing-safe way. On GW1NR-9C, chaining 24 FNV-1a feeds in one combinational function produced ACK checksum drift; the responder computes one checksum byte feed per clock before transmitting.
@@ -221,6 +270,7 @@ Golden coverage:
 - `Ping` frame with flags, payload, checksum, and padding.
 - `Ack` frame using `SerialStatusPayload { Busy, detail = 0x11223344 }`.
 - `Matmul32x32Command` payload and full frame.
+- `ScratchWrite32`, `ScratchRead32`, and `ScratchValue32` payloads and full frames.
 - Stream decoder behavior with leading noise and multiple golden frames in one byte stream.
 
 Any non-Rust implementation should reproduce these exact bytes before being treated as protocol-compatible.

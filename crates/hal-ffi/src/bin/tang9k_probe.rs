@@ -1,5 +1,7 @@
+use sptorch_hal::serial::{ScratchValue32Payload, SerialOpcode};
 use sptorch_hal_ffi::serial_backend::{
     list_tang9k_serial_ports, probe_tang9k_matmul_smoke_with_trace, probe_tang9k_ping_with_trace,
+    probe_tang9k_scratch_smoke_with_trace,
 };
 use std::time::Duration;
 
@@ -16,6 +18,7 @@ struct Args {
 enum ProbeCommand {
     Ping,
     MatmulSmoke,
+    ScratchSmoke,
 }
 
 impl Default for Args {
@@ -42,33 +45,60 @@ fn main() {
             "Probing Tang9k on {port} at {} baud, timeout={}ms, command={:?}",
             args.baud, args.timeout_ms, args.command
         );
-        let result = match args.command {
+        match args.command {
             ProbeCommand::Ping => {
-                probe_tang9k_ping_with_trace(&port, args.baud, Duration::from_millis(args.timeout_ms))
+                let result = probe_tang9k_ping_with_trace(&port, args.baud, Duration::from_millis(args.timeout_ms));
+                match result {
+                    Ok(trace) => {
+                        print_trace_summary("response", &trace);
+                        if args.dump_raw {
+                            print_raw_exchange("response", &trace.request_bytes, &trace.raw_response_bytes);
+                        }
+                    }
+                    Err(err) => {
+                        print_probe_error(args.dump_raw, err);
+                    }
+                }
             }
             ProbeCommand::MatmulSmoke => {
-                probe_tang9k_matmul_smoke_with_trace(&port, args.baud, Duration::from_millis(args.timeout_ms))
-            }
-        };
-
-        match result {
-            Ok(trace) => {
-                println!(
-                    "OK: response opcode={:?}, sequence={}, payload_len={}",
-                    trace.response.opcode,
-                    trace.response.sequence,
-                    trace.response.payload.len()
-                );
-                if args.dump_raw {
-                    print_raw_exchange(&trace.request_bytes, &trace.raw_response_bytes);
+                let result =
+                    probe_tang9k_matmul_smoke_with_trace(&port, args.baud, Duration::from_millis(args.timeout_ms));
+                match result {
+                    Ok(trace) => {
+                        print_trace_summary("matmul", &trace);
+                        if args.dump_raw {
+                            print_raw_exchange("matmul", &trace.request_bytes, &trace.raw_response_bytes);
+                        }
+                    }
+                    Err(err) => {
+                        print_probe_error(args.dump_raw, err);
+                    }
                 }
             }
-            Err(err) => {
-                eprintln!("Probe failed: {err}");
-                if args.dump_raw {
-                    print_raw_exchange(&err.request_bytes, &err.raw_response_bytes);
+            ProbeCommand::ScratchSmoke => {
+                let result =
+                    probe_tang9k_scratch_smoke_with_trace(&port, args.baud, Duration::from_millis(args.timeout_ms));
+                match result {
+                    Ok((write_trace, read_trace)) => {
+                        print_trace_summary("scratch write", &write_trace);
+                        print_trace_summary("scratch read", &read_trace);
+                        if args.dump_raw {
+                            print_raw_exchange(
+                                "scratch write",
+                                &write_trace.request_bytes,
+                                &write_trace.raw_response_bytes,
+                            );
+                            print_raw_exchange(
+                                "scratch read",
+                                &read_trace.request_bytes,
+                                &read_trace.raw_response_bytes,
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        print_probe_error(args.dump_raw, err);
+                    }
                 }
-                std::process::exit(1);
             }
         }
     } else {
@@ -128,6 +158,10 @@ fn parse_args(raw: Vec<String>) -> Result<Args, String> {
                 args.command = ProbeCommand::MatmulSmoke;
                 idx += 1;
             }
+            "--scratch-smoke" => {
+                args.command = ProbeCommand::ScratchSmoke;
+                idx += 1;
+            }
             "--dump-raw" => {
                 args.dump_raw = true;
                 idx += 1;
@@ -139,11 +173,48 @@ fn parse_args(raw: Vec<String>) -> Result<Args, String> {
     Ok(args)
 }
 
-fn print_raw_exchange(request_bytes: &[u8], response_bytes: &[u8]) {
-    println!("request_raw_len={}", request_bytes.len());
-    println!("request_raw={}", format_hex(request_bytes));
-    println!("response_raw_len={}", response_bytes.len());
-    println!("response_raw={}", format_hex(response_bytes));
+fn print_trace_summary(label: &str, trace: &sptorch_hal_ffi::serial_backend::UartTang9kExchangeTrace) {
+    match trace.response.opcode {
+        SerialOpcode::ScratchValue32 => match ScratchValue32Payload::decode_payload(&trace.response.payload) {
+            Ok(payload) => {
+                println!(
+                    "OK: {label} opcode={:?}, sequence={}, offset=0x{:08x}, value=0x{:08x}",
+                    trace.response.opcode, trace.response.sequence, payload.offset, payload.value
+                );
+            }
+            Err(_) => {
+                println!(
+                    "OK: {label} opcode={:?}, sequence={}, payload_len={}",
+                    trace.response.opcode,
+                    trace.response.sequence,
+                    trace.response.payload.len()
+                );
+            }
+        },
+        _ => {
+            println!(
+                "OK: {label} opcode={:?}, sequence={}, payload_len={}",
+                trace.response.opcode,
+                trace.response.sequence,
+                trace.response.payload.len()
+            );
+        }
+    }
+}
+
+fn print_probe_error(dump_raw: bool, err: sptorch_hal_ffi::serial_backend::UartTang9kExchangeError) -> ! {
+    eprintln!("Probe failed: {err}");
+    if dump_raw {
+        print_raw_exchange("error", &err.request_bytes, &err.raw_response_bytes);
+    }
+    std::process::exit(1);
+}
+
+fn print_raw_exchange(label: &str, request_bytes: &[u8], response_bytes: &[u8]) {
+    println!("{label}_request_raw_len={}", request_bytes.len());
+    println!("{label}_request_raw={}", format_hex(request_bytes));
+    println!("{label}_response_raw_len={}", response_bytes.len());
+    println!("{label}_response_raw={}", format_hex(response_bytes));
 }
 
 fn format_hex(bytes: &[u8]) -> String {
@@ -164,6 +235,9 @@ fn print_usage() {
     println!("  cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --baud 115200 --timeout-ms 1000");
     println!(
         "  cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --matmul-smoke --baud 115200 --timeout-ms 1000"
+    );
+    println!(
+        "  cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --scratch-smoke --baud 115200 --timeout-ms 1000"
     );
     println!("  add --dump-raw to print request/response bytes for board bring-up diagnostics");
 }
@@ -217,6 +291,14 @@ mod tests {
         assert_eq!(args.timeout_ms, 250);
         assert_eq!(args.command, ProbeCommand::MatmulSmoke);
         assert!(args.dump_raw);
+    }
+
+    #[test]
+    fn parse_scratch_smoke_arguments() {
+        let args = parse_args(vec!["--port".into(), "COM3".into(), "--scratch-smoke".into()]).unwrap();
+
+        assert_eq!(args.port.as_deref(), Some("COM3"));
+        assert_eq!(args.command, ProbeCommand::ScratchSmoke);
     }
 
     #[test]

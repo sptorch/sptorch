@@ -40,6 +40,9 @@ pub enum SerialOpcode {
     Ping = 0x01,
     Pong = 0x02,
     Matmul32x32 = 0x10,
+    ScratchWrite32 = 0x20,
+    ScratchRead32 = 0x21,
+    ScratchValue32 = 0x22,
     Ack = 0x7e,
     Error = 0x7f,
 }
@@ -51,6 +54,9 @@ impl SerialOpcode {
             0x01 => Ok(Self::Ping),
             0x02 => Ok(Self::Pong),
             0x10 => Ok(Self::Matmul32x32),
+            0x20 => Ok(Self::ScratchWrite32),
+            0x21 => Ok(Self::ScratchRead32),
+            0x22 => Ok(Self::ScratchValue32),
             0x7e => Ok(Self::Ack),
             0x7f => Ok(Self::Error),
             other => Err(SerialProtocolError::UnknownOpcode(other)),
@@ -180,6 +186,11 @@ pub enum SerialProtocolError {
     InvalidMatmulPayloadLen {
         actual: usize,
     },
+    InvalidScratchPayloadLen {
+        opcode: SerialOpcode,
+        actual: usize,
+        expected: usize,
+    },
     InvalidStatusPayloadLen {
         actual: usize,
     },
@@ -215,6 +226,12 @@ pub enum SerialProtocolError {
         sequence: u32,
         status: SerialStatusCode,
         detail: u32,
+    },
+    ScratchValueMismatch {
+        expected_offset: u32,
+        expected_value: u32,
+        actual_offset: u32,
+        actual_value: u32,
     },
     TransportIo {
         reason: String,
@@ -254,6 +271,13 @@ impl fmt::Display for SerialProtocolError {
             Self::InvalidMatmulPayloadLen { actual } => {
                 write!(f, "MatMul32x32 payload must be 32 bytes, got {actual}")
             }
+            Self::InvalidScratchPayloadLen {
+                opcode,
+                actual,
+                expected,
+            } => {
+                write!(f, "{opcode:?} payload must be {expected} bytes, got {actual}")
+            }
             Self::InvalidStatusPayloadLen { actual } => {
                 write!(f, "serial status payload must be 8 bytes, got {actual}")
             }
@@ -286,6 +310,15 @@ impl fmt::Display for SerialProtocolError {
             } => write!(
                 f,
                 "serial command {command_opcode:?} seq={sequence} rejected by {response_opcode:?}: status={status:?}, detail=0x{detail:08x}"
+            ),
+            Self::ScratchValueMismatch {
+                expected_offset,
+                expected_value,
+                actual_offset,
+                actual_value,
+            } => write!(
+                f,
+                "serial scratch readback mismatch: expected offset=0x{expected_offset:08x} value=0x{expected_value:08x}, got offset=0x{actual_offset:08x} value=0x{actual_value:08x}"
             ),
             Self::TransportIo { reason } => write!(f, "serial transport I/O failed: {reason}"),
             Self::ResponseTimeout { timeout_ms } => {
@@ -688,6 +721,28 @@ impl SerialStreamDecoder {
     }
 }
 
+/// 验证 `ScratchRead32` 的回包是否至少是一个结构正确的 `ScratchValue32`。
+///
+/// 这个 helper 只负责协议层形态校验，不替调用者猜测“这次读回该得到什么值”。
+/// 调用方通常会在这里拿到 `offset/value`，再和自己写入过的期望值做比对，这样
+/// 协议层和业务层的职责就不会搅在一起。
+pub fn validate_scratch_value_response(
+    command: &SerialFrame,
+    response: &SerialFrame,
+) -> Result<ScratchValue32Payload, SerialProtocolError> {
+    if response.sequence != command.sequence {
+        return Err(SerialProtocolError::SequenceMismatch {
+            expected: command.sequence,
+            actual: response.sequence,
+        });
+    }
+
+    match response.opcode {
+        SerialOpcode::ScratchValue32 => ScratchValue32Payload::decode_payload(&response.payload),
+        actual => Err(SerialProtocolError::UnexpectedResponseOpcode { actual }),
+    }
+}
+
 /// Tang9k 第一轮硬件验证使用的 32x32 MatMul tile 指令。
 ///
 /// 指令只携带三段设备侧偏移与 tile 编号，不携带矩阵内容本身。这样它更接近真实硬件路径：
@@ -759,6 +814,127 @@ impl Matmul32x32Command {
     /// 包装成完整串行帧，便于调用侧直接进入发送队列。
     pub fn into_frame(self, sequence: u32) -> SerialFrame {
         SerialFrame::new(SerialOpcode::Matmul32x32, sequence, self.encode_payload())
+    }
+}
+
+/// 最小数据面烟测使用的 32-bit scratch 写指令。
+///
+/// 这条指令不代表最终 DMA 方案，只是把“host 写入设备侧状态，再从设备侧读回”的路径先练稳。
+/// 地址字段保留下来，是为了让同一套 payload 将来能自然扩展到小块寄存器窗口或 BRAM scratch 区。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScratchWrite32Command {
+    pub offset: u32,
+    pub value: u32,
+}
+
+impl ScratchWrite32Command {
+    pub const PAYLOAD_LEN: usize = 8;
+
+    pub fn new(offset: u32, value: u32) -> Self {
+        Self { offset, value }
+    }
+
+    pub fn encode_payload(&self) -> [u8; Self::PAYLOAD_LEN] {
+        let mut payload = [0u8; Self::PAYLOAD_LEN];
+        payload[0..4].copy_from_slice(&self.offset.to_le_bytes());
+        payload[4..8].copy_from_slice(&self.value.to_le_bytes());
+        payload
+    }
+
+    pub fn decode_payload(payload: &[u8]) -> Result<Self, SerialProtocolError> {
+        if payload.len() != Self::PAYLOAD_LEN {
+            return Err(SerialProtocolError::InvalidScratchPayloadLen {
+                opcode: SerialOpcode::ScratchWrite32,
+                actual: payload.len(),
+                expected: Self::PAYLOAD_LEN,
+            });
+        }
+        Ok(Self {
+            offset: u32::from_le_bytes(payload[0..4].try_into().expect("payload length checked")),
+            value: u32::from_le_bytes(payload[4..8].try_into().expect("payload length checked")),
+        })
+    }
+
+    pub fn into_frame(self, sequence: u32) -> SerialFrame {
+        SerialFrame::new(SerialOpcode::ScratchWrite32, sequence, self.encode_payload())
+    }
+}
+
+/// 最小数据面烟测使用的 32-bit scratch 读指令。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScratchRead32Command {
+    pub offset: u32,
+}
+
+impl ScratchRead32Command {
+    pub const PAYLOAD_LEN: usize = 4;
+
+    pub fn new(offset: u32) -> Self {
+        Self { offset }
+    }
+
+    pub fn encode_payload(&self) -> [u8; Self::PAYLOAD_LEN] {
+        self.offset.to_le_bytes()
+    }
+
+    pub fn decode_payload(payload: &[u8]) -> Result<Self, SerialProtocolError> {
+        if payload.len() != Self::PAYLOAD_LEN {
+            return Err(SerialProtocolError::InvalidScratchPayloadLen {
+                opcode: SerialOpcode::ScratchRead32,
+                actual: payload.len(),
+                expected: Self::PAYLOAD_LEN,
+            });
+        }
+        Ok(Self {
+            offset: u32::from_le_bytes(payload[0..4].try_into().expect("payload length checked")),
+        })
+    }
+
+    pub fn into_frame(self, sequence: u32) -> SerialFrame {
+        SerialFrame::new(SerialOpcode::ScratchRead32, sequence, self.encode_payload())
+    }
+}
+
+/// `ScratchRead32` 的标准响应 payload。
+///
+/// 响应独立使用 `ScratchValue32` opcode，而不是把 value 塞进 `Ack.detail`，是为了保持 ACK 只表达
+/// “命令是否被接收”，真实数据返回走显式数据帧。这条边界后面会复用到 MatMul 结果回读。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScratchValue32Payload {
+    pub offset: u32,
+    pub value: u32,
+}
+
+impl ScratchValue32Payload {
+    pub const PAYLOAD_LEN: usize = 8;
+
+    pub fn new(offset: u32, value: u32) -> Self {
+        Self { offset, value }
+    }
+
+    pub fn encode_payload(&self) -> [u8; Self::PAYLOAD_LEN] {
+        let mut payload = [0u8; Self::PAYLOAD_LEN];
+        payload[0..4].copy_from_slice(&self.offset.to_le_bytes());
+        payload[4..8].copy_from_slice(&self.value.to_le_bytes());
+        payload
+    }
+
+    pub fn decode_payload(payload: &[u8]) -> Result<Self, SerialProtocolError> {
+        if payload.len() != Self::PAYLOAD_LEN {
+            return Err(SerialProtocolError::InvalidScratchPayloadLen {
+                opcode: SerialOpcode::ScratchValue32,
+                actual: payload.len(),
+                expected: Self::PAYLOAD_LEN,
+            });
+        }
+        Ok(Self {
+            offset: u32::from_le_bytes(payload[0..4].try_into().expect("payload length checked")),
+            value: u32::from_le_bytes(payload[4..8].try_into().expect("payload length checked")),
+        })
+    }
+
+    pub fn into_frame(self, sequence: u32) -> SerialFrame {
+        SerialFrame::new(SerialOpcode::ScratchValue32, sequence, self.encode_payload())
     }
 }
 
@@ -1292,6 +1468,39 @@ mod tests {
         assert_eq!(decoded_frame.opcode, SerialOpcode::Matmul32x32);
         assert_eq!(decoded_frame.sequence, 99);
         assert_eq!(decoded_command, command);
+    }
+
+    #[test]
+    fn scratch_write32_command_roundtrips() {
+        let command = ScratchWrite32Command::new(0x44, 0x1122_3344);
+        let frame = command.into_frame(77);
+        let decoded_frame = SerialFrame::decode(&frame.encode().unwrap()).unwrap();
+        let decoded_command = ScratchWrite32Command::decode_payload(&decoded_frame.payload).unwrap();
+        assert_eq!(decoded_frame.opcode, SerialOpcode::ScratchWrite32);
+        assert_eq!(decoded_frame.sequence, 77);
+        assert_eq!(decoded_command, command);
+    }
+
+    #[test]
+    fn scratch_read32_command_roundtrips() {
+        let command = ScratchRead32Command::new(0x44);
+        let frame = command.into_frame(78);
+        let decoded_frame = SerialFrame::decode(&frame.encode().unwrap()).unwrap();
+        let decoded_command = ScratchRead32Command::decode_payload(&decoded_frame.payload).unwrap();
+        assert_eq!(decoded_frame.opcode, SerialOpcode::ScratchRead32);
+        assert_eq!(decoded_frame.sequence, 78);
+        assert_eq!(decoded_command, command);
+    }
+
+    #[test]
+    fn scratch_value32_payload_roundtrips() {
+        let payload = ScratchValue32Payload::new(0x44, 0x1122_3344);
+        let frame = payload.into_frame(79);
+        let decoded_frame = SerialFrame::decode(&frame.encode().unwrap()).unwrap();
+        let decoded_payload = ScratchValue32Payload::decode_payload(&decoded_frame.payload).unwrap();
+        assert_eq!(decoded_frame.opcode, SerialOpcode::ScratchValue32);
+        assert_eq!(decoded_frame.sequence, 79);
+        assert_eq!(decoded_payload, payload);
     }
 
     #[test]
