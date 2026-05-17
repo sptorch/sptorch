@@ -10,7 +10,8 @@ use sptorch_hal::serial::{
     plan_matmul32x32_commands, validate_result_value_response, validate_scratch_value_response,
     validate_status_response, LoopbackSerialTransport, Matmul32x32Command, Matmul32x32Plan, MatmulMemoryLayout,
     ResultRead32Command, ScratchRead32Command, ScratchWrite32Command, SerialFrame, SerialOpcode, SerialProtocolError,
-    SerialStatusPayload, SerialStreamDecoder, SerialSubmitQueue, SerialSubmitReport,
+    SerialStatusCode, SerialStatusPayload, SerialStreamDecoder, SerialSubmitQueue, SerialSubmitReport,
+    TANG9K_RESULT_WINDOW_WORD_STRIDE_BYTES,
 };
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -533,6 +534,101 @@ pub fn probe_tang9k_result_window_smoke_with_trace(
     }
 
     Ok(traces)
+}
+
+/// 验证 result-window 的越界读会被板端明确拒绝。
+///
+/// 这条负向探针非常适合在接入真实 BRAM/FIFO 前保底：如果越界 offset 也返回 `ResultValue32`，
+/// host 后续就无法区分“真正结果 word”和“RTL 默认值/旧值泄漏”。因此这里要求板端返回
+/// `Error + HardwareFault`，并把 detail 写成被拒绝的 offset。
+pub fn probe_tang9k_result_oob_smoke_with_trace(
+    port_name: &str,
+    baud_rate: u32,
+    timeout: Duration,
+) -> Result<(Vec<UartTang9kExchangeTrace>, UartTang9kExchangeTrace), UartTang9kExchangeError> {
+    let transport = UartTang9kTransport::new(port_name, baud_rate, timeout);
+    let matmul_command = tang9k_matmul_smoke_frame(4);
+    let matmul_trace = transport.exchange_with_trace(&matmul_command)?;
+    if let Err(error) = validate_status_response(&matmul_command, &matmul_trace.response) {
+        return Err(UartTang9kExchangeError::new(
+            error,
+            matmul_trace.request_bytes,
+            matmul_trace.raw_response_bytes,
+        ));
+    }
+
+    let decoded_matmul = match Matmul32x32Command::decode_payload(&matmul_command.payload) {
+        Ok(command) => command,
+        Err(error) => {
+            return Err(UartTang9kExchangeError::new(
+                error,
+                matmul_trace.request_bytes.clone(),
+                matmul_trace.raw_response_bytes.clone(),
+            ));
+        }
+    };
+    let expected_window = decoded_matmul.smoke_result_window();
+    let mut setup_traces = Vec::with_capacity(1 + expected_window.len());
+    setup_traces.push(matmul_trace);
+
+    for (idx, expected_result) in expected_window.iter().enumerate() {
+        let read_sequence = 5 + idx as u32;
+        let read_command = ResultRead32Command::new(expected_result.offset).into_frame(read_sequence);
+        let read_trace = transport.exchange_with_trace(&read_command)?;
+        let read_value = match validate_result_value_response(&read_command, &read_trace.response) {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(UartTang9kExchangeError::new(
+                    error,
+                    read_trace.request_bytes.clone(),
+                    read_trace.raw_response_bytes.clone(),
+                ));
+            }
+        };
+
+        if read_value != *expected_result {
+            return Err(UartTang9kExchangeError::new(
+                SerialProtocolError::ResultValueMismatch {
+                    expected_offset: expected_result.offset,
+                    expected_value: expected_result.value,
+                    actual_offset: read_value.offset,
+                    actual_value: read_value.value,
+                },
+                read_trace.request_bytes,
+                read_trace.raw_response_bytes,
+            ));
+        }
+
+        setup_traces.push(read_trace);
+    }
+
+    let last_word = expected_window
+        .last()
+        .expect("fixed Tang9k result smoke window is non-empty");
+    let oob_offset = last_word.offset.wrapping_add(TANG9K_RESULT_WINDOW_WORD_STRIDE_BYTES);
+    let oob_command = ResultRead32Command::new(oob_offset).into_frame(9);
+    let oob_trace = transport.exchange_with_trace(&oob_command)?;
+    match validate_status_response(&oob_command, &oob_trace.response) {
+        Err(SerialProtocolError::CommandRejected {
+            command_opcode: SerialOpcode::ResultRead32,
+            response_opcode: SerialOpcode::Error,
+            sequence: 9,
+            status: SerialStatusCode::HardwareFault,
+            detail,
+        }) if detail == oob_offset => Ok((setup_traces, oob_trace)),
+        Ok(_) => Err(UartTang9kExchangeError::new(
+            SerialProtocolError::UnexpectedResponseOpcode {
+                actual: oob_trace.response.opcode,
+            },
+            oob_trace.request_bytes,
+            oob_trace.raw_response_bytes,
+        )),
+        Err(error) => Err(UartTang9kExchangeError::new(
+            error,
+            oob_trace.request_bytes,
+            oob_trace.raw_response_bytes,
+        )),
+    }
 }
 
 /// Tang9k serial backend 的纯 Rust dry-run 实现。

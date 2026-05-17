@@ -78,6 +78,9 @@ cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-smoke --
 # Sends Matmul32x32, then reads back all 4 smoke words from the result window.
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-window-smoke --baud 115200 --timeout-ms 1000
 
+# Verifies that the first out-of-window result offset is rejected with HardwareFault.
+cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-oob-smoke --baud 115200 --timeout-ms 1000
+
 # Writes and reads back one 32-bit scratch value on the board.
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --scratch-smoke --baud 115200 --timeout-ms 1000
 
@@ -94,6 +97,7 @@ Host command lifecycle: COM3 @ 115200 -> OK: response opcode=Ack, sequence=1, pa
 Host scratch data-plane: COM3 @ 115200 -> OK: ScratchValue32 offset=0x00000044, value=0x11223344
 Host result window: COM3 @ 115200 -> OK: ResultValue32 offset=0x00002000, value=0x00003005
 Host result window 4-word smoke: COM3 @ 115200 -> [0x00003005, 0x9e3749bc, 0x3c6ec377, 0xdaa65d2e]
+Host result window OOB: COM3 @ 115200 -> Error HardwareFault detail=0x00002010
 Ack raw response: 53 50 01 7e 01 00 00 00 08 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 b8 59 20 24 00 00 00 00
 ```
 

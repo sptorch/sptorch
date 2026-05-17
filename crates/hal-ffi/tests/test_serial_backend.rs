@@ -2,7 +2,7 @@ use sptorch_core_ops::matmul;
 use sptorch_core_tensor::{Device, Tensor};
 use sptorch_hal::serial::{
     validate_result_value_response, Matmul32x32Command, ResultRead32Command, ResultValue32Payload, SerialFrame,
-    SerialOpcode, SerialProtocolError, SerialStatusCode, SerialStatusPayload,
+    SerialOpcode, SerialProtocolError, SerialStatusCode, SerialStatusPayload, TANG9K_RESULT_WINDOW_WORD_STRIDE_BYTES,
 };
 use sptorch_hal_ffi::serial_backend::{
     register_tang9k_serial_dry_run_backend_for, register_tang9k_serial_dry_run_backend_with_transport,
@@ -198,6 +198,37 @@ fn result_window_smoke_contract_covers_four_stable_words() {
             *expected
         );
     }
+}
+
+#[test]
+fn result_window_oob_contract_is_rejected_as_hardware_fault() {
+    let matmul_frame = tang9k_matmul_smoke_frame(4);
+    let matmul_command = Matmul32x32Command::decode_payload(&matmul_frame.payload).unwrap();
+    let expected_window = matmul_command.smoke_result_window();
+    let oob_offset = expected_window
+        .last()
+        .unwrap()
+        .offset
+        .wrapping_add(TANG9K_RESULT_WINDOW_WORD_STRIDE_BYTES);
+    let oob_read = ResultRead32Command::new(oob_offset).into_frame(9);
+    let response = SerialFrame::error(
+        9,
+        SerialStatusPayload {
+            code: SerialStatusCode::HardwareFault,
+            detail: oob_offset,
+        },
+    );
+
+    assert_eq!(
+        sptorch_hal::serial::validate_status_response(&oob_read, &response).unwrap_err(),
+        SerialProtocolError::CommandRejected {
+            command_opcode: SerialOpcode::ResultRead32,
+            response_opcode: SerialOpcode::Error,
+            sequence: 9,
+            status: SerialStatusCode::HardwareFault,
+            detail: oob_offset,
+        }
+    );
 }
 
 #[test]

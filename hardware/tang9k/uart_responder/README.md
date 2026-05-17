@@ -46,6 +46,7 @@ cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --matmul-smoke --
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --matmul-smoke --baud 115200 --timeout-ms 1000 --dump-raw
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-smoke --baud 115200 --timeout-ms 1000 --dump-raw
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-window-smoke --baud 115200 --timeout-ms 1000 --dump-raw
+cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-oob-smoke --baud 115200 --timeout-ms 1000 --dump-raw
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --scratch-smoke --baud 115200 --timeout-ms 1000 --dump-raw
 ```
 
@@ -85,6 +86,12 @@ OK: result window read 2 opcode=ResultValue32, sequence=7, offset=0x00002008, va
 OK: result window read 3 opcode=ResultValue32, sequence=8, offset=0x0000200c, value=0xdaa65d2e
 ```
 
+`ResultOobSmoke` 期望输出类似：
+
+```text
+OK: result oob rejected read opcode=Error, sequence=9, status=HardwareFault, detail=0x00002010
+```
+
 当前实测的 `MatmulSmoke` ACK raw response：
 
 ```text
@@ -99,7 +106,7 @@ OK: result window read 3 opcode=ResultValue32, sequence=8, offset=0x0000200c, va
 
 `ScratchSmoke` 是第一条非 ACK 数据面回环：它不证明 DDR/DMA 已经可用，只证明 target 能按协议保存一个 32-bit 值并作为数据帧读回。`ResultSmoke` 在这条边界上再推进一步：MatMul 控制帧会更新板端结果窗口，host 随后用 `ResultRead32` 读回摘要值。这个摘要还不是矩阵结果，只是证明“命令触发结果窗口更新”这条闭环已经存在。
 
-`ResultWindowSmoke` 把单槽摘要扩展到 4 个连续 word。它依旧不是矩阵结果，但已经开始验证 result buffer 的核心行为：同一条 MatMul 命令写入多个可区分 word，host 按 offset 连续读回，RTL 必须做正确地址选择。
+`ResultWindowSmoke` 把单槽摘要扩展到 4 个连续 word。它依旧不是矩阵结果，但已经开始验证 result buffer 的核心行为：同一条 MatMul 命令写入多个可区分 word，host 按 offset 连续读回，RTL 必须做正确地址选择。`ResultOobSmoke` 则验证窗口边界：第一个越界 offset 必须返回 `Error/HardwareFault`，不能把默认值或旧值伪装成合法结果。
 
 如果仍然超时，优先检查 `uart_tx` / `uart_rx` 约束是否需要对调。当前约束使用常见 Tang Nano 9K USB-UART 引脚：FPGA `uart_tx=17`、`uart_rx=18`。
 

@@ -131,6 +131,7 @@ Rules:
 - The current responder writes `value[word_index] = base_value ^ [0x00000000, 0x9e3779b9, 0x3c6ef372, 0xdaa66d2b][word_index]`.
 - The Rust host computes the same smoke value through `Matmul32x32Command::smoke_result_summary`.
 - The Rust host computes the full smoke window through `Matmul32x32Command::smoke_result_window`.
+- The first offset outside the current smoke window must return `Error + HardwareFault` with `detail = requested_offset`.
 - This path only proves command-triggered result-window visibility. Real PE output and larger buffer readback remain future work.
 
 ## Matmul32x32 Command
@@ -227,6 +228,8 @@ cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-smoke --
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-smoke --baud 115200 --timeout-ms 1000 --dump-raw
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-window-smoke --baud 115200 --timeout-ms 1000
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-window-smoke --baud 115200 --timeout-ms 1000 --dump-raw
+cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-oob-smoke --baud 115200 --timeout-ms 1000
+cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-oob-smoke --baud 115200 --timeout-ms 1000 --dump-raw
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --scratch-smoke --baud 115200 --timeout-ms 1000
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --scratch-smoke --baud 115200 --timeout-ms 1000 --dump-raw
 ```
@@ -238,6 +241,7 @@ Rules:
 - `--matmul-smoke` sends exactly one `Matmul32x32` command frame with sequence `1`.
 - `--result-smoke` sends one `Matmul32x32` command frame with sequence `4`, then one `ResultRead32` frame with sequence `5`, and checks the returned `ResultValue32`.
 - `--result-window-smoke` sends one `Matmul32x32` command frame with sequence `4`, then four `ResultRead32` frames with sequences `5..8`, and checks all four returned `ResultValue32` words.
+- `--result-oob-smoke` performs the four-word result-window smoke first, then reads `out_offset + 16` with sequence `9` and requires `Error/HardwareFault`.
 - `--scratch-smoke` sends one `ScratchWrite32` followed by one `ScratchRead32`, then checks the returned `ScratchValue32`.
 - `--dump-raw` prints host request bytes and target response bytes; keep it enabled when debugging checksum drift, stale serial data, or RTL framing changes.
 - A target may answer with `Pong`, `Ack/Ok`, `ScratchValue32`, or `ResultValue32` during early bring-up.
@@ -293,6 +297,13 @@ OK: result window read 3 opcode=ResultValue32, sequence=8, offset=0x0000200c, va
 
 ```text
 53 50 01 31 08 00 00 00 08 00 00 00 00 00 00 00 0c 20 00 00 2e 5d a6 da 29 4f 5b 2f 00 00 00 00
+```
+
+- Result window OOB host result: `OK: result oob rejected read opcode=Error, sequence=9, status=HardwareFault, detail=0x00002010`.
+- Result window OOB raw response bytes:
+
+```text
+53 50 01 7f 09 00 00 00 08 00 00 00 00 00 00 00 05 00 00 00 10 20 00 00 5a e7 19 48 00 00 00 00
 ```
 
 ## Implementation Standards
