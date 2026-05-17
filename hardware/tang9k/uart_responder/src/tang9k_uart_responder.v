@@ -45,6 +45,11 @@ module tang9k_uart_responder (
     localparam [15:0] SCRATCH_VALUE32_PAYLOAD_LEN = 16'd8;
     localparam [15:0] RESULT_READ32_PAYLOAD_LEN = 16'd4;
     localparam [15:0] RESULT_VALUE32_PAYLOAD_LEN = 16'd8;
+    localparam [31:0] RESULT_WORD_STRIDE_BYTES = 32'd4;
+    localparam [31:0] RESULT_MIX_0 = 32'h00000000;
+    localparam [31:0] RESULT_MIX_1 = 32'h9e3779b9;
+    localparam [31:0] RESULT_MIX_2 = 32'h3c6ef372;
+    localparam [31:0] RESULT_MIX_3 = 32'hdaa66d2b;
 
     localparam [15:0] STATUS_OK                 = 16'h0000;
     localparam [15:0] STATUS_UNSUPPORTED_OPCODE = 16'h0002;
@@ -115,8 +120,11 @@ module tang9k_uart_responder (
     reg [31:0] matmul_out_offset_high = 32'd0;
     reg [31:0] matmul_flags = 32'd0;
     reg [31:0] result_request_offset = 32'd0;
-    reg [31:0] result_stored_offset = 32'd0;
-    reg [31:0] result_stored_value = 32'd0;
+    reg [31:0] result_base_offset = 32'd0;
+    reg [31:0] result_value_0 = 32'd0;
+    reg [31:0] result_value_1 = 32'd0;
+    reg [31:0] result_value_2 = 32'd0;
+    reg [31:0] result_value_3 = 32'd0;
     reg        result_stored_valid = 1'b0;
 
     reg        tx_frame_active = 1'b0;
@@ -376,15 +384,43 @@ module tang9k_uart_responder (
                 response_request_status_code <= STATUS_INVALID_PAYLOAD;
                 response_request_status_detail <= {16'd0, payload_len};
             end else if (command_opcode == OPCODE_MATMUL32X32) begin
-                result_stored_offset <= matmul_out_offset_low;
-                result_stored_value <= matmul_tile_id
+                result_base_offset <= matmul_out_offset_low;
+                result_value_0 <= matmul_tile_id
                     ^ matmul_flags
                     ^ matmul_a_offset_low
                     ^ matmul_a_offset_high
                     ^ matmul_b_offset_low
                     ^ matmul_b_offset_high
                     ^ matmul_out_offset_low
-                    ^ matmul_out_offset_high;
+                    ^ matmul_out_offset_high
+                    ^ RESULT_MIX_0;
+                result_value_1 <= matmul_tile_id
+                    ^ matmul_flags
+                    ^ matmul_a_offset_low
+                    ^ matmul_a_offset_high
+                    ^ matmul_b_offset_low
+                    ^ matmul_b_offset_high
+                    ^ matmul_out_offset_low
+                    ^ matmul_out_offset_high
+                    ^ RESULT_MIX_1;
+                result_value_2 <= matmul_tile_id
+                    ^ matmul_flags
+                    ^ matmul_a_offset_low
+                    ^ matmul_a_offset_high
+                    ^ matmul_b_offset_low
+                    ^ matmul_b_offset_high
+                    ^ matmul_out_offset_low
+                    ^ matmul_out_offset_high
+                    ^ RESULT_MIX_2;
+                result_value_3 <= matmul_tile_id
+                    ^ matmul_flags
+                    ^ matmul_a_offset_low
+                    ^ matmul_a_offset_high
+                    ^ matmul_b_offset_low
+                    ^ matmul_b_offset_high
+                    ^ matmul_out_offset_low
+                    ^ matmul_out_offset_high
+                    ^ RESULT_MIX_3;
                 result_stored_valid <= 1'b1;
                 response_request_opcode <= OPCODE_ACK;
                 response_request_status_code <= STATUS_OK;
@@ -416,12 +452,30 @@ module tang9k_uart_responder (
                 end
             end else if (command_opcode == OPCODE_RESULT_READ32) begin
                 if (result_stored_valid) begin
-                    if (result_request_offset == result_stored_offset) begin
+                    if (result_request_offset == result_base_offset) begin
                         response_request_opcode <= OPCODE_RESULT_VALUE32;
                         response_request_status_code <= STATUS_OK;
                         response_request_status_detail <= 32'd0;
-                        response_request_scratch_offset <= result_stored_offset;
-                        response_request_scratch_value <= result_stored_value;
+                        response_request_scratch_offset <= result_base_offset;
+                        response_request_scratch_value <= result_value_0;
+                    end else if (result_request_offset == result_base_offset + RESULT_WORD_STRIDE_BYTES) begin
+                        response_request_opcode <= OPCODE_RESULT_VALUE32;
+                        response_request_status_code <= STATUS_OK;
+                        response_request_status_detail <= 32'd0;
+                        response_request_scratch_offset <= result_base_offset + RESULT_WORD_STRIDE_BYTES;
+                        response_request_scratch_value <= result_value_1;
+                    end else if (result_request_offset == result_base_offset + (RESULT_WORD_STRIDE_BYTES << 1)) begin
+                        response_request_opcode <= OPCODE_RESULT_VALUE32;
+                        response_request_status_code <= STATUS_OK;
+                        response_request_status_detail <= 32'd0;
+                        response_request_scratch_offset <= result_base_offset + (RESULT_WORD_STRIDE_BYTES << 1);
+                        response_request_scratch_value <= result_value_2;
+                    end else if (result_request_offset == result_base_offset + (RESULT_WORD_STRIDE_BYTES + (RESULT_WORD_STRIDE_BYTES << 1))) begin
+                        response_request_opcode <= OPCODE_RESULT_VALUE32;
+                        response_request_status_code <= STATUS_OK;
+                        response_request_status_detail <= 32'd0;
+                        response_request_scratch_offset <= result_base_offset + (RESULT_WORD_STRIDE_BYTES + (RESULT_WORD_STRIDE_BYTES << 1));
+                        response_request_scratch_value <= result_value_3;
                     end else begin
                         response_request_opcode <= OPCODE_ERROR;
                         response_request_status_code <= STATUS_HARDWARE_FAULT;

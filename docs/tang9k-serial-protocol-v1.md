@@ -108,8 +108,8 @@ Rules:
 ## Result Window Smoke Frames
 
 `ResultRead32` and `ResultValue32` are the first MatMul-adjacent readback contract. They do not transfer the
-full 32x32 output tile yet. Instead, the target stores a 32-bit result summary after accepting a `Matmul32x32`
-command, and the host reads that summary from a small result window.
+full 32x32 output tile yet. Instead, the target stores a small result window after accepting a `Matmul32x32`
+command, and the host reads that window one 32-bit word at a time.
 
 Payloads:
 
@@ -126,9 +126,11 @@ Rules:
 
 - `ResultRead32` must reply with `ResultValue32`, not `Ack`, when the requested offset matches a valid result slot.
 - A result read before any MatMul command may return `Error/HardwareFault`.
-- The current responder writes `offset = Matmul32x32Command.out_offset[31:0]`.
-- The current responder writes `value = tile_id ^ flags ^ a_offset_low ^ a_offset_high ^ b_offset_low ^ b_offset_high ^ out_offset_low ^ out_offset_high`.
+- The current responder exposes four smoke words at `out_offset[31:0] + word_index * 4`.
+- The current responder starts with `base_value = tile_id ^ flags ^ a_offset_low ^ a_offset_high ^ b_offset_low ^ b_offset_high ^ out_offset_low ^ out_offset_high`.
+- The current responder writes `value[word_index] = base_value ^ [0x00000000, 0x9e3779b9, 0x3c6ef372, 0xdaa66d2b][word_index]`.
 - The Rust host computes the same smoke value through `Matmul32x32Command::smoke_result_summary`.
+- The Rust host computes the full smoke window through `Matmul32x32Command::smoke_result_window`.
 - This path only proves command-triggered result-window visibility. Real PE output and larger buffer readback remain future work.
 
 ## Matmul32x32 Command
@@ -209,7 +211,7 @@ This split keeps recovery behavior consistent across loopback, UART, and future 
 ## UART Bring-Up
 
 The first real-board host path is implemented by `sptorch-hal-ffi::serial_backend::UartTang9kTransport`.
-The first minimal target-side smoke-test bitstream lives in `hardware/tang9k/uart_responder`: it validates serial-v1 `Ping` frames and returns an empty `Pong` with the same sequence. The command-lifecycle version also accepts a `Matmul32x32` frame and returns `Ack/Ok` after validating payload length, checksum, and padding; the scratch smoke version stores one 32-bit word on `ScratchWrite32` and returns it via `ScratchValue32` on `ScratchRead32`; the result smoke version records a deterministic MatMul summary and returns it through `ResultValue32`.
+The first minimal target-side smoke-test bitstream lives in `hardware/tang9k/uart_responder`: it validates serial-v1 `Ping` frames and returns an empty `Pong` with the same sequence. The command-lifecycle version also accepts a `Matmul32x32` frame and returns `Ack/Ok` after validating payload length, checksum, and padding; the scratch smoke version stores one 32-bit word on `ScratchWrite32` and returns it via `ScratchValue32` on `ScratchRead32`; the result smoke version records a deterministic four-word MatMul summary window and returns it through `ResultValue32`.
 
 Safe bring-up sequence:
 
@@ -223,6 +225,8 @@ cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --matmul-smoke --
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --matmul-smoke --baud 115200 --timeout-ms 1000 --dump-raw
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-smoke --baud 115200 --timeout-ms 1000
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-smoke --baud 115200 --timeout-ms 1000 --dump-raw
+cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-window-smoke --baud 115200 --timeout-ms 1000
+cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-window-smoke --baud 115200 --timeout-ms 1000 --dump-raw
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --scratch-smoke --baud 115200 --timeout-ms 1000
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --scratch-smoke --baud 115200 --timeout-ms 1000 --dump-raw
 ```
@@ -233,6 +237,7 @@ Rules:
 - `--port` sends exactly one `Ping` frame with sequence `0` and payload `sptorch-ping`.
 - `--matmul-smoke` sends exactly one `Matmul32x32` command frame with sequence `1`.
 - `--result-smoke` sends one `Matmul32x32` command frame with sequence `4`, then one `ResultRead32` frame with sequence `5`, and checks the returned `ResultValue32`.
+- `--result-window-smoke` sends one `Matmul32x32` command frame with sequence `4`, then four `ResultRead32` frames with sequences `5..8`, and checks all four returned `ResultValue32` words.
 - `--scratch-smoke` sends one `ScratchWrite32` followed by one `ScratchRead32`, then checks the returned `ScratchValue32`.
 - `--dump-raw` prints host request bytes and target response bytes; keep it enabled when debugging checksum drift, stale serial data, or RTL framing changes.
 - A target may answer with `Pong`, `Ack/Ok`, `ScratchValue32`, or `ResultValue32` during early bring-up.
@@ -273,6 +278,21 @@ Real-board acceptance recorded on 2026-05-18:
 
 ```text
 53 50 01 31 05 00 00 00 08 00 00 00 00 00 00 00 00 20 00 00 05 30 00 00 d4 d0 6f 06 00 00 00 00
+```
+
+- Result window smoke host results:
+
+```text
+OK: result window read 0 opcode=ResultValue32, sequence=5, offset=0x00002000, value=0x00003005
+OK: result window read 1 opcode=ResultValue32, sequence=6, offset=0x00002004, value=0x9e3749bc
+OK: result window read 2 opcode=ResultValue32, sequence=7, offset=0x00002008, value=0x3c6ec377
+OK: result window read 3 opcode=ResultValue32, sequence=8, offset=0x0000200c, value=0xdaa65d2e
+```
+
+- Result window read 3 raw response bytes:
+
+```text
+53 50 01 31 08 00 00 00 08 00 00 00 00 00 00 00 0c 20 00 00 2e 5d a6 da 29 4f 5b 2f 00 00 00 00
 ```
 
 ## Implementation Standards

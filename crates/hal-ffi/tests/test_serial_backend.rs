@@ -175,6 +175,32 @@ fn result_smoke_readback_contract_matches_matmul_summary() {
 }
 
 #[test]
+fn result_window_smoke_contract_covers_four_stable_words() {
+    let matmul_frame = tang9k_matmul_smoke_frame(4);
+    let matmul_command = Matmul32x32Command::decode_payload(&matmul_frame.payload).unwrap();
+    let expected_window = matmul_command.smoke_result_window();
+
+    assert_eq!(
+        expected_window,
+        [
+            ResultValue32Payload::new(0x0000_2000, 0x0000_3005),
+            ResultValue32Payload::new(0x0000_2004, 0x9e37_49bc),
+            ResultValue32Payload::new(0x0000_2008, 0x3c6e_c377),
+            ResultValue32Payload::new(0x0000_200c, 0xdaa6_5d2e),
+        ]
+    );
+
+    for (idx, expected) in expected_window.iter().enumerate() {
+        let read_frame = ResultRead32Command::new(expected.offset).into_frame(5 + idx as u32);
+        let response = expected.into_frame(5 + idx as u32);
+        assert_eq!(
+            validate_result_value_response(&read_frame, &response).unwrap(),
+            *expected
+        );
+    }
+}
+
+#[test]
 #[should_panic(expected = "Tang9k serial dry-run failed to submit MatMul frames")]
 fn serial_dry_run_backend_rejects_mismatched_transport_echo() {
     let device = Device::Custom(904);

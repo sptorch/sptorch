@@ -817,6 +817,20 @@ pub const MATMUL32X32_FLAG_ACCUMULATE: u32 = 0x0000_0002;
 /// 当前指令是该输出 tile 的最后一个 K 分片，可触发硬件侧 done/flush。
 pub const MATMUL32X32_FLAG_LAST_K_TILE: u32 = 0x0000_0004;
 
+/// Tang9k result-window smoke 阶段固定读回的 32-bit word 数量。
+///
+/// 这不是最终矩阵结果大小，而是一个足够小、能在 UART 上快速复测的窗口。4 个 word 可以验证
+/// offset 选择、连续读回和多值 checksum，比单槽摘要更接近后续 BRAM/FIFO 结果缓冲区。
+pub const TANG9K_RESULT_WINDOW_SMOKE_WORDS: usize = 4;
+/// result-window 以 32-bit word 作为寻址步长。
+pub const TANG9K_RESULT_WINDOW_WORD_STRIDE_BYTES: u32 = 4;
+/// 多槽 smoke 值的确定性扰动常量。
+///
+/// 第一项必须是 0，以保持旧的 `smoke_result_summary()` 与已烧录验证过的单槽结果兼容。
+/// 后面三个常量只用于制造稳定、非重复的 word，避免 RTL 地址选择错误时仍然“看起来通过”。
+pub const TANG9K_RESULT_WINDOW_SMOKE_MIX: [u32; TANG9K_RESULT_WINDOW_SMOKE_WORDS] =
+    [0x0000_0000, 0x9e37_79b9, 0x3c6e_f372, 0xdaa6_6d2b];
+
 impl Matmul32x32Command {
     pub const M: usize = 32;
     pub const K: usize = 32;
@@ -869,13 +883,24 @@ impl Matmul32x32Command {
         SerialFrame::new(SerialOpcode::Matmul32x32, sequence, self.encode_payload())
     }
 
-    /// 由 MatMul 命令字段稳定派生出的结果窗口摘要。
+    /// 由 MatMul 命令字段稳定派生出的单槽结果窗口摘要。
     ///
-    /// v1 的 Tang9k 结果窗口还不是完整矩阵回读，所以这里先把 command 字段折叠成一个
-    /// 32-bit 摘要，作为板端结果槽的 smoke 值。这样 host 和 RTL 都能用同一条语义链路
-    /// 证明“MatMul 命令确实触发了一个可读回结果窗口”。
+    /// 这个函数保留给最早的 `--result-smoke` 路径：它始终返回窗口的第 0 个 word。
+    /// 多槽 bring-up 请使用 [`Matmul32x32Command::smoke_result_window`]，这样可以同时验证
+    /// offset 选择和连续读回。
     pub fn smoke_result_summary(&self) -> ResultValue32Payload {
-        let value = self.tile_id
+        self.smoke_result_word(0)
+            .expect("word 0 is always inside the fixed Tang9k smoke window")
+    }
+
+    /// 生成 result-window smoke 的第 `word_index` 个 32-bit word。
+    ///
+    /// v1 的结果窗口还不是完整矩阵回读，所以这里先把 MatMul command 字段折叠成一个 base
+    /// 摘要，再用固定 mix 常量生成 4 个可区分 word。RTL 使用同一套规则，host 就能证明
+    /// “MatMul 命令更新了板端窗口，并且不同 offset 能读到不同 word”。
+    pub fn smoke_result_word(&self, word_index: usize) -> Option<ResultValue32Payload> {
+        let mix = *TANG9K_RESULT_WINDOW_SMOKE_MIX.get(word_index)?;
+        let base_value = self.tile_id
             ^ self.flags
             ^ self.a_offset as u32
             ^ (self.a_offset >> 32) as u32
@@ -883,7 +908,17 @@ impl Matmul32x32Command {
             ^ (self.b_offset >> 32) as u32
             ^ self.out_offset as u32
             ^ (self.out_offset >> 32) as u32;
-        ResultValue32Payload::new(self.out_offset as u32, value)
+        let offset = (self.out_offset as u32)
+            .wrapping_add((word_index as u32).wrapping_mul(TANG9K_RESULT_WINDOW_WORD_STRIDE_BYTES));
+        Some(ResultValue32Payload::new(offset, base_value ^ mix))
+    }
+
+    /// 生成固定 4-word result-window smoke 期望值。
+    pub fn smoke_result_window(&self) -> [ResultValue32Payload; TANG9K_RESULT_WINDOW_SMOKE_WORDS] {
+        core::array::from_fn(|idx| {
+            self.smoke_result_word(idx)
+                .expect("index generated from fixed Tang9k smoke window length")
+        })
     }
 }
 
@@ -1635,6 +1670,28 @@ mod tests {
             command.smoke_result_summary(),
             ResultValue32Payload::new(0x3536_3738, 0x0506_070d)
         );
+    }
+
+    #[test]
+    fn matmul32x32_smoke_result_window_has_stable_offsets_and_values() {
+        let mut command = Matmul32x32Command::new(
+            0x0102_0304,
+            0x1112_1314_1516_1718,
+            0x2122_2324_2526_2728,
+            0x3132_3334_3536_3738,
+        );
+        command.flags = MATMUL32X32_FLAG_CLEAR_OUTPUT | MATMUL32X32_FLAG_LAST_K_TILE;
+
+        assert_eq!(
+            command.smoke_result_window(),
+            [
+                ResultValue32Payload::new(0x3536_3738, 0x0506_070d),
+                ResultValue32Payload::new(0x3536_373c, 0x9b31_7eb4),
+                ResultValue32Payload::new(0x3536_3740, 0x3968_f47f),
+                ResultValue32Payload::new(0x3536_3744, 0xdfa0_6a26),
+            ]
+        );
+        assert_eq!(command.smoke_result_word(4), None);
     }
 
     #[test]

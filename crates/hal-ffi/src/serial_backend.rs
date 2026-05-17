@@ -466,6 +466,75 @@ pub fn probe_tang9k_result_smoke_with_trace(
     Ok((matmul_trace, read_trace))
 }
 
+/// 发送 MatMul 控制帧后连续读回 4 个 result-window word。
+///
+/// 单槽摘要只能证明“有一个结果寄存器会变”；这个 helper 多走三次 `ResultRead32`，用不同 offset
+/// 逼迫 RTL 做真正的窗口选择。它仍然不代表 PE 阵列已经算出矩阵，只是在完整 DMA/result buffer
+/// 之前，把 host/RTL 的读回协议地基夯实。
+pub fn probe_tang9k_result_window_smoke_with_trace(
+    port_name: &str,
+    baud_rate: u32,
+    timeout: Duration,
+) -> Result<Vec<UartTang9kExchangeTrace>, UartTang9kExchangeError> {
+    let transport = UartTang9kTransport::new(port_name, baud_rate, timeout);
+    let matmul_command = tang9k_matmul_smoke_frame(4);
+    let matmul_trace = transport.exchange_with_trace(&matmul_command)?;
+    if let Err(error) = validate_status_response(&matmul_command, &matmul_trace.response) {
+        return Err(UartTang9kExchangeError::new(
+            error,
+            matmul_trace.request_bytes,
+            matmul_trace.raw_response_bytes,
+        ));
+    }
+
+    let decoded_matmul = match Matmul32x32Command::decode_payload(&matmul_command.payload) {
+        Ok(command) => command,
+        Err(error) => {
+            return Err(UartTang9kExchangeError::new(
+                error,
+                matmul_trace.request_bytes.clone(),
+                matmul_trace.raw_response_bytes.clone(),
+            ));
+        }
+    };
+    let expected_window = decoded_matmul.smoke_result_window();
+    let mut traces = Vec::with_capacity(1 + expected_window.len());
+    traces.push(matmul_trace);
+
+    for (idx, expected_result) in expected_window.iter().enumerate() {
+        let read_sequence = 5 + idx as u32;
+        let read_command = ResultRead32Command::new(expected_result.offset).into_frame(read_sequence);
+        let read_trace = transport.exchange_with_trace(&read_command)?;
+        let read_value = match validate_result_value_response(&read_command, &read_trace.response) {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(UartTang9kExchangeError::new(
+                    error,
+                    read_trace.request_bytes.clone(),
+                    read_trace.raw_response_bytes.clone(),
+                ));
+            }
+        };
+
+        if read_value != *expected_result {
+            return Err(UartTang9kExchangeError::new(
+                SerialProtocolError::ResultValueMismatch {
+                    expected_offset: expected_result.offset,
+                    expected_value: expected_result.value,
+                    actual_offset: read_value.offset,
+                    actual_value: read_value.value,
+                },
+                read_trace.request_bytes,
+                read_trace.raw_response_bytes,
+            ));
+        }
+
+        traces.push(read_trace);
+    }
+
+    Ok(traces)
+}
+
 /// Tang9k serial backend 的纯 Rust dry-run 实现。
 ///
 /// elementwise kernel 先保持 CPU 语义；MatMul 会额外生成并 loopback 校验 Tang9k 指令帧。

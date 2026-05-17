@@ -1,7 +1,8 @@
 use sptorch_hal::serial::{ResultValue32Payload, ScratchValue32Payload, SerialOpcode};
 use sptorch_hal_ffi::serial_backend::{
     list_tang9k_serial_ports, probe_tang9k_matmul_smoke_with_trace, probe_tang9k_ping_with_trace,
-    probe_tang9k_result_smoke_with_trace, probe_tang9k_scratch_smoke_with_trace,
+    probe_tang9k_result_smoke_with_trace, probe_tang9k_result_window_smoke_with_trace,
+    probe_tang9k_scratch_smoke_with_trace,
 };
 use std::time::Duration;
 
@@ -19,6 +20,7 @@ enum ProbeCommand {
     Ping,
     MatmulSmoke,
     ResultSmoke,
+    ResultWindowSmoke,
     ScratchSmoke,
 }
 
@@ -94,6 +96,31 @@ fn main() {
                                 &read_trace.request_bytes,
                                 &read_trace.raw_response_bytes,
                             );
+                        }
+                    }
+                    Err(err) => {
+                        print_probe_error(args.dump_raw, err);
+                    }
+                }
+            }
+            ProbeCommand::ResultWindowSmoke => {
+                let result = probe_tang9k_result_window_smoke_with_trace(
+                    &port,
+                    args.baud,
+                    Duration::from_millis(args.timeout_ms),
+                );
+                match result {
+                    Ok(traces) => {
+                        for (idx, trace) in traces.iter().enumerate() {
+                            let label = if idx == 0 {
+                                "result window matmul".to_string()
+                            } else {
+                                format!("result window read {}", idx - 1)
+                            };
+                            print_trace_summary(&label, trace);
+                            if args.dump_raw {
+                                print_raw_exchange(&label, &trace.request_bytes, &trace.raw_response_bytes);
+                            }
                         }
                     }
                     Err(err) => {
@@ -186,6 +213,10 @@ fn parse_args(raw: Vec<String>) -> Result<Args, String> {
             }
             "--result-smoke" => {
                 args.command = ProbeCommand::ResultSmoke;
+                idx += 1;
+            }
+            "--result-window-smoke" => {
+                args.command = ProbeCommand::ResultWindowSmoke;
                 idx += 1;
             }
             "--scratch-smoke" => {
@@ -283,6 +314,9 @@ fn print_usage() {
         "  cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --matmul-smoke --baud 115200 --timeout-ms 1000"
     );
     println!(
+        "  cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-window-smoke --baud 115200 --timeout-ms 1000"
+    );
+    println!(
         "  cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --scratch-smoke --baud 115200 --timeout-ms 1000"
     );
     println!("  add --dump-raw to print request/response bytes for board bring-up diagnostics");
@@ -345,6 +379,14 @@ mod tests {
 
         assert_eq!(args.port.as_deref(), Some("COM3"));
         assert_eq!(args.command, ProbeCommand::ResultSmoke);
+    }
+
+    #[test]
+    fn parse_result_window_smoke_arguments() {
+        let args = parse_args(vec!["--port".into(), "COM3".into(), "--result-window-smoke".into()]).unwrap();
+
+        assert_eq!(args.port.as_deref(), Some("COM3"));
+        assert_eq!(args.command, ProbeCommand::ResultWindowSmoke);
     }
 
     #[test]
