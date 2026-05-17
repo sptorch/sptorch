@@ -4,7 +4,9 @@
 // Ping frame from the host and replies with a Pong frame that echoes the same
 // sequence number.  It also accepts a Matmul32x32 control frame and returns
 // Ack/Ok, so the host can test command submission before any PE array or DMA
-// datapath is introduced.
+// datapath is introduced.  A small result window is also exposed so the host can
+// prove that a Matmul command updated board-visible state before real PE output
+// readback is wired in.
 
 module tang9k_uart_responder (
     input  wire       clk,
@@ -29,6 +31,8 @@ module tang9k_uart_responder (
     localparam [7:0] OPCODE_SCRATCH_WRITE32 = 8'h20;
     localparam [7:0] OPCODE_SCRATCH_READ32  = 8'h21;
     localparam [7:0] OPCODE_SCRATCH_VALUE32 = 8'h22;
+    localparam [7:0] OPCODE_RESULT_READ32  = 8'h30;
+    localparam [7:0] OPCODE_RESULT_VALUE32 = 8'h31;
     localparam [7:0] OPCODE_ACK    = 8'h7e;
     localparam [7:0] OPCODE_ERROR  = 8'h7f;
     localparam [7:0] HEADER_LEN     = 8'd16;
@@ -39,6 +43,8 @@ module tang9k_uart_responder (
     localparam [15:0] SCRATCH_WRITE32_PAYLOAD_LEN = 16'd8;
     localparam [15:0] SCRATCH_READ32_PAYLOAD_LEN = 16'd4;
     localparam [15:0] SCRATCH_VALUE32_PAYLOAD_LEN = 16'd8;
+    localparam [15:0] RESULT_READ32_PAYLOAD_LEN = 16'd4;
+    localparam [15:0] RESULT_VALUE32_PAYLOAD_LEN = 16'd8;
 
     localparam [15:0] STATUS_OK                 = 16'h0000;
     localparam [15:0] STATUS_UNSUPPORTED_OPCODE = 16'h0002;
@@ -100,6 +106,18 @@ module tang9k_uart_responder (
     reg [31:0] scratch_stored_offset = 32'd0;
     reg [31:0] scratch_stored_value = 32'd0;
     reg        scratch_stored_valid = 1'b0;
+    reg [31:0] matmul_tile_id = 32'd0;
+    reg [31:0] matmul_a_offset_low = 32'd0;
+    reg [31:0] matmul_a_offset_high = 32'd0;
+    reg [31:0] matmul_b_offset_low = 32'd0;
+    reg [31:0] matmul_b_offset_high = 32'd0;
+    reg [31:0] matmul_out_offset_low = 32'd0;
+    reg [31:0] matmul_out_offset_high = 32'd0;
+    reg [31:0] matmul_flags = 32'd0;
+    reg [31:0] result_request_offset = 32'd0;
+    reg [31:0] result_stored_offset = 32'd0;
+    reg [31:0] result_stored_value = 32'd0;
+    reg        result_stored_valid = 1'b0;
 
     reg        tx_frame_active = 1'b0;
     reg        tx_prepare_active = 1'b0;
@@ -181,6 +199,14 @@ module tang9k_uart_responder (
         end
     endfunction
 
+    function is_value_response;
+        input [7:0] response_opcode;
+        begin
+            is_value_response = response_opcode == OPCODE_SCRATCH_VALUE32
+                || response_opcode == OPCODE_RESULT_VALUE32;
+        end
+    endfunction
+
     function [7:0] response_byte;
         input [4:0] index;
         input [7:0] response_opcode;
@@ -203,8 +229,10 @@ module tang9k_uart_responder (
                 5'd8: begin
                     if (response_opcode == OPCODE_PONG) begin
                         response_byte = 8'h00;
-                    end else if (response_opcode == OPCODE_SCRATCH_VALUE32) begin
-                        response_byte = SCRATCH_VALUE32_PAYLOAD_LEN[7:0];
+                    end else if (is_value_response(response_opcode)) begin
+                        response_byte = response_opcode == OPCODE_RESULT_VALUE32
+                            ? RESULT_VALUE32_PAYLOAD_LEN[7:0]
+                            : SCRATCH_VALUE32_PAYLOAD_LEN[7:0];
                     end else begin
                         response_byte = STATUS_PAYLOAD_LEN[7:0];
                     end
@@ -212,8 +240,10 @@ module tang9k_uart_responder (
                 5'd9: begin
                     if (response_opcode == OPCODE_PONG) begin
                         response_byte = 8'h00;
-                    end else if (response_opcode == OPCODE_SCRATCH_VALUE32) begin
-                        response_byte = SCRATCH_VALUE32_PAYLOAD_LEN[15:8];
+                    end else if (is_value_response(response_opcode)) begin
+                        response_byte = response_opcode == OPCODE_RESULT_VALUE32
+                            ? RESULT_VALUE32_PAYLOAD_LEN[15:8]
+                            : SCRATCH_VALUE32_PAYLOAD_LEN[15:8];
                     end else begin
                         response_byte = STATUS_PAYLOAD_LEN[15:8];
                     end
@@ -227,7 +257,7 @@ module tang9k_uart_responder (
                 5'd16: begin
                     if (response_opcode == OPCODE_PONG) begin
                         response_byte = csum[7:0];
-                    end else if (response_opcode == OPCODE_SCRATCH_VALUE32) begin
+                    end else if (is_value_response(response_opcode)) begin
                         response_byte = scratch_offset[7:0];
                     end else begin
                         response_byte = status_code[7:0];
@@ -236,7 +266,7 @@ module tang9k_uart_responder (
                 5'd17: begin
                     if (response_opcode == OPCODE_PONG) begin
                         response_byte = csum[15:8];
-                    end else if (response_opcode == OPCODE_SCRATCH_VALUE32) begin
+                    end else if (is_value_response(response_opcode)) begin
                         response_byte = scratch_offset[15:8];
                     end else begin
                         response_byte = status_code[15:8];
@@ -245,7 +275,7 @@ module tang9k_uart_responder (
                 5'd18: begin
                     if (response_opcode == OPCODE_PONG) begin
                         response_byte = csum[23:16];
-                    end else if (response_opcode == OPCODE_SCRATCH_VALUE32) begin
+                    end else if (is_value_response(response_opcode)) begin
                         response_byte = scratch_offset[23:16];
                     end else begin
                         response_byte = 8'h00;
@@ -254,7 +284,7 @@ module tang9k_uart_responder (
                 5'd19: begin
                     if (response_opcode == OPCODE_PONG) begin
                         response_byte = csum[31:24];
-                    end else if (response_opcode == OPCODE_SCRATCH_VALUE32) begin
+                    end else if (is_value_response(response_opcode)) begin
                         response_byte = scratch_offset[31:24];
                     end else begin
                         response_byte = 8'h00;
@@ -263,7 +293,7 @@ module tang9k_uart_responder (
                 5'd20: begin
                     if (response_opcode == OPCODE_PONG) begin
                         response_byte = 8'h00;
-                    end else if (response_opcode == OPCODE_SCRATCH_VALUE32) begin
+                    end else if (is_value_response(response_opcode)) begin
                         response_byte = scratch_value[7:0];
                     end else begin
                         response_byte = status_detail[7:0];
@@ -272,7 +302,7 @@ module tang9k_uart_responder (
                 5'd21: begin
                     if (response_opcode == OPCODE_PONG) begin
                         response_byte = 8'h00;
-                    end else if (response_opcode == OPCODE_SCRATCH_VALUE32) begin
+                    end else if (is_value_response(response_opcode)) begin
                         response_byte = scratch_value[15:8];
                     end else begin
                         response_byte = status_detail[15:8];
@@ -281,7 +311,7 @@ module tang9k_uart_responder (
                 5'd22: begin
                     if (response_opcode == OPCODE_PONG) begin
                         response_byte = 8'h00;
-                    end else if (response_opcode == OPCODE_SCRATCH_VALUE32) begin
+                    end else if (is_value_response(response_opcode)) begin
                         response_byte = scratch_value[23:16];
                     end else begin
                         response_byte = status_detail[23:16];
@@ -290,7 +320,7 @@ module tang9k_uart_responder (
                 5'd23: begin
                     if (response_opcode == OPCODE_PONG) begin
                         response_byte = 8'h00;
-                    end else if (response_opcode == OPCODE_SCRATCH_VALUE32) begin
+                    end else if (is_value_response(response_opcode)) begin
                         response_byte = scratch_value[31:24];
                     end else begin
                         response_byte = status_detail[31:24];
@@ -320,6 +350,15 @@ module tang9k_uart_responder (
             payload_invalid <= 1'b0;
             scratch_request_offset <= 32'd0;
             scratch_request_value <= 32'd0;
+            result_request_offset <= 32'd0;
+            matmul_tile_id <= 32'd0;
+            matmul_a_offset_low <= 32'd0;
+            matmul_a_offset_high <= 32'd0;
+            matmul_b_offset_low <= 32'd0;
+            matmul_b_offset_high <= 32'd0;
+            matmul_out_offset_low <= 32'd0;
+            matmul_out_offset_high <= 32'd0;
+            matmul_flags <= 32'd0;
         end
     endtask
 
@@ -337,6 +376,16 @@ module tang9k_uart_responder (
                 response_request_status_code <= STATUS_INVALID_PAYLOAD;
                 response_request_status_detail <= {16'd0, payload_len};
             end else if (command_opcode == OPCODE_MATMUL32X32) begin
+                result_stored_offset <= matmul_out_offset_low;
+                result_stored_value <= matmul_tile_id
+                    ^ matmul_flags
+                    ^ matmul_a_offset_low
+                    ^ matmul_a_offset_high
+                    ^ matmul_b_offset_low
+                    ^ matmul_b_offset_high
+                    ^ matmul_out_offset_low
+                    ^ matmul_out_offset_high;
+                result_stored_valid <= 1'b1;
                 response_request_opcode <= OPCODE_ACK;
                 response_request_status_code <= STATUS_OK;
                 response_request_status_detail <= 32'd0;
@@ -359,6 +408,24 @@ module tang9k_uart_responder (
                         response_request_opcode <= OPCODE_ERROR;
                         response_request_status_code <= STATUS_HARDWARE_FAULT;
                         response_request_status_detail <= scratch_request_offset;
+                    end
+                end else begin
+                    response_request_opcode <= OPCODE_ERROR;
+                    response_request_status_code <= STATUS_HARDWARE_FAULT;
+                    response_request_status_detail <= 32'd0;
+                end
+            end else if (command_opcode == OPCODE_RESULT_READ32) begin
+                if (result_stored_valid) begin
+                    if (result_request_offset == result_stored_offset) begin
+                        response_request_opcode <= OPCODE_RESULT_VALUE32;
+                        response_request_status_code <= STATUS_OK;
+                        response_request_status_detail <= 32'd0;
+                        response_request_scratch_offset <= result_stored_offset;
+                        response_request_scratch_value <= result_stored_value;
+                    end else begin
+                        response_request_opcode <= OPCODE_ERROR;
+                        response_request_status_code <= STATUS_HARDWARE_FAULT;
+                        response_request_status_detail <= result_request_offset;
                     end
                 end else begin
                     response_request_opcode <= OPCODE_ERROR;
@@ -518,7 +585,8 @@ module tang9k_uart_responder (
                             unsupported_opcode <= rx_byte != OPCODE_PING
                                 && rx_byte != OPCODE_MATMUL32X32
                                 && rx_byte != OPCODE_SCRATCH_WRITE32
-                                && rx_byte != OPCODE_SCRATCH_READ32;
+                                && rx_byte != OPCODE_SCRATCH_READ32
+                                && rx_byte != OPCODE_RESULT_READ32;
                             header_index <= header_index + 5'd1;
                         end
                         5'd4: begin
@@ -581,7 +649,9 @@ module tang9k_uart_responder (
                                     || (command_opcode == OPCODE_SCRATCH_WRITE32
                                         && payload_len != SCRATCH_WRITE32_PAYLOAD_LEN)
                                     || (command_opcode == OPCODE_SCRATCH_READ32
-                                        && payload_len != SCRATCH_READ32_PAYLOAD_LEN);
+                                        && payload_len != SCRATCH_READ32_PAYLOAD_LEN)
+                                    || (command_opcode == OPCODE_RESULT_READ32
+                                        && payload_len != RESULT_READ32_PAYLOAD_LEN);
                                 checksum_index <= 2'd0;
                                 if (payload_len == 16'd0) begin
                                     rx_state <= RX_CSUM;
@@ -615,6 +685,50 @@ module tang9k_uart_responder (
                             16'd1: scratch_request_offset[15:8] <= rx_byte;
                             16'd2: scratch_request_offset[23:16] <= rx_byte;
                             16'd3: scratch_request_offset[31:24] <= rx_byte;
+                        endcase
+                    end
+                    if (command_opcode == OPCODE_RESULT_READ32) begin
+                        case (payload_count)
+                            16'd0: result_request_offset[7:0] <= rx_byte;
+                            16'd1: result_request_offset[15:8] <= rx_byte;
+                            16'd2: result_request_offset[23:16] <= rx_byte;
+                            16'd3: result_request_offset[31:24] <= rx_byte;
+                        endcase
+                    end
+                    if (command_opcode == OPCODE_MATMUL32X32) begin
+                        case (payload_count)
+                            16'd0: matmul_tile_id[7:0] <= rx_byte;
+                            16'd1: matmul_tile_id[15:8] <= rx_byte;
+                            16'd2: matmul_tile_id[23:16] <= rx_byte;
+                            16'd3: matmul_tile_id[31:24] <= rx_byte;
+                            16'd4: matmul_a_offset_low[7:0] <= rx_byte;
+                            16'd5: matmul_a_offset_low[15:8] <= rx_byte;
+                            16'd6: matmul_a_offset_low[23:16] <= rx_byte;
+                            16'd7: matmul_a_offset_low[31:24] <= rx_byte;
+                            16'd8: matmul_a_offset_high[7:0] <= rx_byte;
+                            16'd9: matmul_a_offset_high[15:8] <= rx_byte;
+                            16'd10: matmul_a_offset_high[23:16] <= rx_byte;
+                            16'd11: matmul_a_offset_high[31:24] <= rx_byte;
+                            16'd12: matmul_b_offset_low[7:0] <= rx_byte;
+                            16'd13: matmul_b_offset_low[15:8] <= rx_byte;
+                            16'd14: matmul_b_offset_low[23:16] <= rx_byte;
+                            16'd15: matmul_b_offset_low[31:24] <= rx_byte;
+                            16'd16: matmul_b_offset_high[7:0] <= rx_byte;
+                            16'd17: matmul_b_offset_high[15:8] <= rx_byte;
+                            16'd18: matmul_b_offset_high[23:16] <= rx_byte;
+                            16'd19: matmul_b_offset_high[31:24] <= rx_byte;
+                            16'd20: matmul_out_offset_low[7:0] <= rx_byte;
+                            16'd21: matmul_out_offset_low[15:8] <= rx_byte;
+                            16'd22: matmul_out_offset_low[23:16] <= rx_byte;
+                            16'd23: matmul_out_offset_low[31:24] <= rx_byte;
+                            16'd24: matmul_out_offset_high[7:0] <= rx_byte;
+                            16'd25: matmul_out_offset_high[15:8] <= rx_byte;
+                            16'd26: matmul_out_offset_high[23:16] <= rx_byte;
+                            16'd27: matmul_out_offset_high[31:24] <= rx_byte;
+                            16'd28: matmul_flags[7:0] <= rx_byte;
+                            16'd29: matmul_flags[15:8] <= rx_byte;
+                            16'd30: matmul_flags[23:16] <= rx_byte;
+                            16'd31: matmul_flags[31:24] <= rx_byte;
                         endcase
                     end
                     if (payload_count + 16'd1 == payload_len) begin

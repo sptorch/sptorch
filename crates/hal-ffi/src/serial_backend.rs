@@ -7,9 +7,10 @@
 
 use sptorch_core_tensor::{register_backend, BackendDispatch, Device};
 use sptorch_hal::serial::{
-    plan_matmul32x32_commands, validate_scratch_value_response, validate_status_response, LoopbackSerialTransport,
-    Matmul32x32Command, Matmul32x32Plan, MatmulMemoryLayout, ScratchRead32Command, ScratchWrite32Command, SerialFrame,
-    SerialOpcode, SerialProtocolError, SerialStatusPayload, SerialStreamDecoder, SerialSubmitQueue, SerialSubmitReport,
+    plan_matmul32x32_commands, validate_result_value_response, validate_scratch_value_response,
+    validate_status_response, LoopbackSerialTransport, Matmul32x32Command, Matmul32x32Plan, MatmulMemoryLayout,
+    ResultRead32Command, ScratchRead32Command, ScratchWrite32Command, SerialFrame, SerialOpcode, SerialProtocolError,
+    SerialStatusPayload, SerialStreamDecoder, SerialSubmitQueue, SerialSubmitReport,
 };
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -402,6 +403,67 @@ pub fn probe_tang9k_scratch_smoke_with_trace(
     }
 
     Ok((write_trace, read_trace))
+}
+
+/// 发送一条最小 MatMul 控制帧，再从结果窗口读回一个 32-bit 摘要值。
+///
+/// 这条路径仍然不是“真正矩阵乘法完成确认”，而是把板端的结果窗口语义先练稳：
+/// MatMul 命令负责更新结果槽，随后 `ResultRead32` 负责把这个槽读回。这样 host 以后就
+/// 能把“命令生命周期”与“结果回读”分成两个稳定步骤。
+pub fn probe_tang9k_result_smoke_with_trace(
+    port_name: &str,
+    baud_rate: u32,
+    timeout: Duration,
+) -> Result<(UartTang9kExchangeTrace, UartTang9kExchangeTrace), UartTang9kExchangeError> {
+    let transport = UartTang9kTransport::new(port_name, baud_rate, timeout);
+    let matmul_command = tang9k_matmul_smoke_frame(4);
+    let matmul_trace = transport.exchange_with_trace(&matmul_command)?;
+    if let Err(error) = validate_status_response(&matmul_command, &matmul_trace.response) {
+        return Err(UartTang9kExchangeError::new(
+            error,
+            matmul_trace.request_bytes,
+            matmul_trace.raw_response_bytes,
+        ));
+    }
+
+    let decoded_matmul = match Matmul32x32Command::decode_payload(&matmul_command.payload) {
+        Ok(command) => command,
+        Err(error) => {
+            return Err(UartTang9kExchangeError::new(
+                error,
+                matmul_trace.request_bytes.clone(),
+                matmul_trace.raw_response_bytes.clone(),
+            ));
+        }
+    };
+    let expected_result = decoded_matmul.smoke_result_summary();
+    let read_command = ResultRead32Command::new(expected_result.offset).into_frame(5);
+    let read_trace = transport.exchange_with_trace(&read_command)?;
+    let read_value = match validate_result_value_response(&read_command, &read_trace.response) {
+        Ok(value) => value,
+        Err(error) => {
+            return Err(UartTang9kExchangeError::new(
+                error,
+                read_trace.request_bytes.clone(),
+                read_trace.raw_response_bytes.clone(),
+            ));
+        }
+    };
+
+    if read_value != expected_result {
+        return Err(UartTang9kExchangeError::new(
+            SerialProtocolError::ResultValueMismatch {
+                expected_offset: expected_result.offset,
+                expected_value: expected_result.value,
+                actual_offset: read_value.offset,
+                actual_value: read_value.value,
+            },
+            read_trace.request_bytes,
+            read_trace.raw_response_bytes,
+        ));
+    }
+
+    Ok((matmul_trace, read_trace))
 }
 
 /// Tang9k serial backend 的纯 Rust dry-run 实现。

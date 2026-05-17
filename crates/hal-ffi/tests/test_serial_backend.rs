@@ -1,6 +1,9 @@
 use sptorch_core_ops::matmul;
 use sptorch_core_tensor::{Device, Tensor};
-use sptorch_hal::serial::{SerialFrame, SerialOpcode, SerialProtocolError, SerialStatusCode, SerialStatusPayload};
+use sptorch_hal::serial::{
+    validate_result_value_response, Matmul32x32Command, ResultRead32Command, ResultValue32Payload, SerialFrame,
+    SerialOpcode, SerialProtocolError, SerialStatusCode, SerialStatusPayload,
+};
 use sptorch_hal_ffi::serial_backend::{
     register_tang9k_serial_dry_run_backend_for, register_tang9k_serial_dry_run_backend_with_transport,
     tang9k_matmul_smoke_frame, Tang9kSerialTransport, MATMUL32X32_FLAG_CLEAR_OUTPUT, MATMUL32X32_FLAG_LAST_K_TILE,
@@ -151,6 +154,23 @@ fn matmul_smoke_frame_matches_minimal_board_command_contract() {
     assert_eq!(
         u32::from_le_bytes(frame.payload[28..32].try_into().unwrap()),
         MATMUL32X32_FLAG_CLEAR_OUTPUT | MATMUL32X32_FLAG_LAST_K_TILE
+    );
+}
+
+#[test]
+fn result_smoke_readback_contract_matches_matmul_summary() {
+    let matmul_frame = tang9k_matmul_smoke_frame(4);
+    let matmul_command = Matmul32x32Command::decode_payload(&matmul_frame.payload).unwrap();
+    let expected = matmul_command.smoke_result_summary();
+    let read_frame = ResultRead32Command::new(expected.offset).into_frame(5);
+    let response = ResultValue32Payload::new(expected.offset, expected.value).into_frame(5);
+
+    assert_eq!(expected, ResultValue32Payload::new(0x0000_2000, 0x0000_3005));
+    assert_eq!(read_frame.opcode, SerialOpcode::ResultRead32);
+    assert_eq!(response.opcode, SerialOpcode::ResultValue32);
+    assert_eq!(
+        validate_result_value_response(&read_frame, &response).unwrap(),
+        expected
     );
 }
 

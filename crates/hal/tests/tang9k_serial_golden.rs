@@ -1,7 +1,7 @@
 use sptorch_hal::serial::{
-    Matmul32x32Command, ScratchRead32Command, ScratchValue32Payload, ScratchWrite32Command, SerialFrame, SerialOpcode,
-    SerialStatusCode, SerialStatusPayload, SerialStreamDecoder, MATMUL32X32_FLAG_CLEAR_OUTPUT,
-    MATMUL32X32_FLAG_LAST_K_TILE,
+    Matmul32x32Command, ResultRead32Command, ResultValue32Payload, ScratchRead32Command, ScratchValue32Payload,
+    ScratchWrite32Command, SerialFrame, SerialOpcode, SerialStatusCode, SerialStatusPayload, SerialStreamDecoder,
+    MATMUL32X32_FLAG_CLEAR_OUTPUT, MATMUL32X32_FLAG_LAST_K_TILE,
 };
 
 const PING_FRAME_GOLDEN: &[u8] = &[
@@ -45,6 +45,17 @@ const SCRATCH_VALUE32_PAYLOAD_GOLDEN: &[u8] = &[0x44, 0x00, 0x00, 0x00, 0x44, 0x
 const SCRATCH_VALUE32_FRAME_GOLDEN: &[u8] = &[
     0x53, 0x50, 0x01, 0x22, 0x0b, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x44, 0x00, 0x00,
     0x00, 0x44, 0x33, 0x22, 0x11, 0x86, 0x82, 0xc3, 0xd0, 0x00, 0x00, 0x00, 0x00,
+];
+
+const RESULT_READ32_PAYLOAD_GOLDEN: &[u8] = &[0x38, 0x37, 0x36, 0x35];
+const RESULT_READ32_FRAME_GOLDEN: &[u8] = &[
+    0x53, 0x50, 0x01, 0x30, 0x0c, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x38, 0x37, 0x36,
+    0x35, 0x07, 0x6b, 0xac, 0x7e,
+];
+const RESULT_VALUE32_PAYLOAD_GOLDEN: &[u8] = &[0x38, 0x37, 0x36, 0x35, 0x0d, 0x07, 0x06, 0x05];
+const RESULT_VALUE32_FRAME_GOLDEN: &[u8] = &[
+    0x53, 0x50, 0x01, 0x31, 0x0c, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x38, 0x37, 0x36,
+    0x35, 0x0d, 0x07, 0x06, 0x05, 0xc9, 0x2a, 0xb3, 0x89, 0x00, 0x00, 0x00, 0x00,
 ];
 
 #[test]
@@ -127,6 +138,28 @@ fn scratch32_commands_and_frames_match_wire_golden_vectors() {
 }
 
 #[test]
+fn result32_commands_and_frames_match_wire_golden_vectors() {
+    let read_command = ResultRead32Command::new(0x3536_3738);
+    assert_eq!(read_command.encode_payload(), RESULT_READ32_PAYLOAD_GOLDEN);
+    let read_frame = read_command.into_frame(12);
+    assert_eq!(read_frame.encode().unwrap(), RESULT_READ32_FRAME_GOLDEN);
+    assert_eq!(
+        ResultRead32Command::decode_payload(&SerialFrame::decode(RESULT_READ32_FRAME_GOLDEN).unwrap().payload).unwrap(),
+        read_command
+    );
+
+    let value_payload = ResultValue32Payload::new(0x3536_3738, 0x0506_070d);
+    assert_eq!(value_payload.encode_payload(), RESULT_VALUE32_PAYLOAD_GOLDEN);
+    let value_frame = value_payload.into_frame(12);
+    assert_eq!(value_frame.encode().unwrap(), RESULT_VALUE32_FRAME_GOLDEN);
+    assert_eq!(
+        ResultValue32Payload::decode_payload(&SerialFrame::decode(RESULT_VALUE32_FRAME_GOLDEN).unwrap().payload)
+            .unwrap(),
+        value_payload
+    );
+}
+
+#[test]
 fn stream_decoder_accepts_golden_vectors_with_chunk_boundaries() {
     let mut stream = vec![0x00, 0xff];
     stream.extend_from_slice(PING_FRAME_GOLDEN);
@@ -136,12 +169,14 @@ fn stream_decoder_accepts_golden_vectors_with_chunk_boundaries() {
     stream.extend_from_slice(SCRATCH_ACK_FRAME_GOLDEN);
     stream.extend_from_slice(SCRATCH_READ32_FRAME_GOLDEN);
     stream.extend_from_slice(SCRATCH_VALUE32_FRAME_GOLDEN);
+    stream.extend_from_slice(RESULT_READ32_FRAME_GOLDEN);
+    stream.extend_from_slice(RESULT_VALUE32_FRAME_GOLDEN);
 
     let mut decoder = SerialStreamDecoder::new();
     assert!(decoder.push_bytes(&stream[..3]).unwrap().is_empty());
     let frames = decoder.push_bytes(&stream[3..]).unwrap();
 
-    assert_eq!(frames.len(), 7);
+    assert_eq!(frames.len(), 9);
     assert_eq!(frames[0].opcode, SerialOpcode::Ping);
     assert_eq!(frames[1].opcode, SerialOpcode::Ack);
     assert_eq!(frames[2].opcode, SerialOpcode::Matmul32x32);
@@ -149,4 +184,6 @@ fn stream_decoder_accepts_golden_vectors_with_chunk_boundaries() {
     assert_eq!(frames[4].opcode, SerialOpcode::Ack);
     assert_eq!(frames[5].opcode, SerialOpcode::ScratchRead32);
     assert_eq!(frames[6].opcode, SerialOpcode::ScratchValue32);
+    assert_eq!(frames[7].opcode, SerialOpcode::ResultRead32);
+    assert_eq!(frames[8].opcode, SerialOpcode::ResultValue32);
 }

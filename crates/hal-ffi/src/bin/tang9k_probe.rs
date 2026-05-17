@@ -1,7 +1,7 @@
-use sptorch_hal::serial::{ScratchValue32Payload, SerialOpcode};
+use sptorch_hal::serial::{ResultValue32Payload, ScratchValue32Payload, SerialOpcode};
 use sptorch_hal_ffi::serial_backend::{
     list_tang9k_serial_ports, probe_tang9k_matmul_smoke_with_trace, probe_tang9k_ping_with_trace,
-    probe_tang9k_scratch_smoke_with_trace,
+    probe_tang9k_result_smoke_with_trace, probe_tang9k_scratch_smoke_with_trace,
 };
 use std::time::Duration;
 
@@ -18,6 +18,7 @@ struct Args {
 enum ProbeCommand {
     Ping,
     MatmulSmoke,
+    ResultSmoke,
     ScratchSmoke,
 }
 
@@ -68,6 +69,31 @@ fn main() {
                         print_trace_summary("matmul", &trace);
                         if args.dump_raw {
                             print_raw_exchange("matmul", &trace.request_bytes, &trace.raw_response_bytes);
+                        }
+                    }
+                    Err(err) => {
+                        print_probe_error(args.dump_raw, err);
+                    }
+                }
+            }
+            ProbeCommand::ResultSmoke => {
+                let result =
+                    probe_tang9k_result_smoke_with_trace(&port, args.baud, Duration::from_millis(args.timeout_ms));
+                match result {
+                    Ok((matmul_trace, read_trace)) => {
+                        print_trace_summary("result matmul", &matmul_trace);
+                        print_trace_summary("result read", &read_trace);
+                        if args.dump_raw {
+                            print_raw_exchange(
+                                "result matmul",
+                                &matmul_trace.request_bytes,
+                                &matmul_trace.raw_response_bytes,
+                            );
+                            print_raw_exchange(
+                                "result read",
+                                &read_trace.request_bytes,
+                                &read_trace.raw_response_bytes,
+                            );
                         }
                     }
                     Err(err) => {
@@ -158,6 +184,10 @@ fn parse_args(raw: Vec<String>) -> Result<Args, String> {
                 args.command = ProbeCommand::MatmulSmoke;
                 idx += 1;
             }
+            "--result-smoke" => {
+                args.command = ProbeCommand::ResultSmoke;
+                idx += 1;
+            }
             "--scratch-smoke" => {
                 args.command = ProbeCommand::ScratchSmoke;
                 idx += 1;
@@ -176,6 +206,22 @@ fn parse_args(raw: Vec<String>) -> Result<Args, String> {
 fn print_trace_summary(label: &str, trace: &sptorch_hal_ffi::serial_backend::UartTang9kExchangeTrace) {
     match trace.response.opcode {
         SerialOpcode::ScratchValue32 => match ScratchValue32Payload::decode_payload(&trace.response.payload) {
+            Ok(payload) => {
+                println!(
+                    "OK: {label} opcode={:?}, sequence={}, offset=0x{:08x}, value=0x{:08x}",
+                    trace.response.opcode, trace.response.sequence, payload.offset, payload.value
+                );
+            }
+            Err(_) => {
+                println!(
+                    "OK: {label} opcode={:?}, sequence={}, payload_len={}",
+                    trace.response.opcode,
+                    trace.response.sequence,
+                    trace.response.payload.len()
+                );
+            }
+        },
+        SerialOpcode::ResultValue32 => match ResultValue32Payload::decode_payload(&trace.response.payload) {
             Ok(payload) => {
                 println!(
                     "OK: {label} opcode={:?}, sequence={}, offset=0x{:08x}, value=0x{:08x}",
@@ -291,6 +337,14 @@ mod tests {
         assert_eq!(args.timeout_ms, 250);
         assert_eq!(args.command, ProbeCommand::MatmulSmoke);
         assert!(args.dump_raw);
+    }
+
+    #[test]
+    fn parse_result_smoke_arguments() {
+        let args = parse_args(vec!["--port".into(), "COM3".into(), "--result-smoke".into()]).unwrap();
+
+        assert_eq!(args.port.as_deref(), Some("COM3"));
+        assert_eq!(args.command, ProbeCommand::ResultSmoke);
     }
 
     #[test]

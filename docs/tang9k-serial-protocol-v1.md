@@ -6,8 +6,8 @@ This document is the wire-level contract for the Tang9k bring-up path. It is int
 
 - Owner crate: `sptorch-hal::serial`.
 - Dispatch bridge: `sptorch-hal-ffi::serial_backend`.
-- Current operation scope: control frames and 32x32 F32 MatMul tile commands.
-- Out of scope for v1: large tensor payload transfer, arbitrary tile sizes, real UART timing, DMA descriptor rings, and result readback protocol.
+- Current operation scope: control frames, 32x32 F32 MatMul tile commands, scratch read/write smoke frames, and a 32-bit result-window smoke readback.
+- Out of scope for v1: large tensor payload transfer, arbitrary tile sizes, real UART timing, DMA descriptor rings, and full matrix-result buffer transfer.
 
 ## Frame Format
 
@@ -46,6 +46,8 @@ Normative rules:
 | `ScratchWrite32` | `0x20` | host -> device | `ScratchWrite32Command` |
 | `ScratchRead32` | `0x21` | host -> device | `ScratchRead32Command` |
 | `ScratchValue32` | `0x22` | device -> host | `ScratchValue32Payload` |
+| `ResultRead32` | `0x30` | host -> device | `ResultRead32Command` |
+| `ResultValue32` | `0x31` | device -> host | `ResultValue32Payload` |
 | `Ack` | `0x7e` | device -> host | `SerialStatusPayload` |
 | `Error` | `0x7f` | device -> host | `SerialStatusPayload` |
 
@@ -102,6 +104,32 @@ Rules:
 - `ScratchValue32` is the host-visible readback payload; it is not a status frame.
 - A read before any write may return `Error/HardwareFault`.
 - The board-side responder currently stores one 32-bit slot and uses it as the scratch smoke baseline.
+
+## Result Window Smoke Frames
+
+`ResultRead32` and `ResultValue32` are the first MatMul-adjacent readback contract. They do not transfer the
+full 32x32 output tile yet. Instead, the target stores a 32-bit result summary after accepting a `Matmul32x32`
+command, and the host reads that summary from a small result window.
+
+Payloads:
+
+```text
+ResultRead32Command
+0..4    offset  u32
+
+ResultValue32Payload
+0..4    offset  u32
+4..8    value   u32
+```
+
+Rules:
+
+- `ResultRead32` must reply with `ResultValue32`, not `Ack`, when the requested offset matches a valid result slot.
+- A result read before any MatMul command may return `Error/HardwareFault`.
+- The current responder writes `offset = Matmul32x32Command.out_offset[31:0]`.
+- The current responder writes `value = tile_id ^ flags ^ a_offset_low ^ a_offset_high ^ b_offset_low ^ b_offset_high ^ out_offset_low ^ out_offset_high`.
+- The Rust host computes the same smoke value through `Matmul32x32Command::smoke_result_summary`.
+- This path only proves command-triggered result-window visibility. Real PE output and larger buffer readback remain future work.
 
 ## Matmul32x32 Command
 
@@ -181,7 +209,7 @@ This split keeps recovery behavior consistent across loopback, UART, and future 
 ## UART Bring-Up
 
 The first real-board host path is implemented by `sptorch-hal-ffi::serial_backend::UartTang9kTransport`.
-The first minimal target-side smoke-test bitstream lives in `hardware/tang9k/uart_responder`: it validates serial-v1 `Ping` frames and returns an empty `Pong` with the same sequence. The command-lifecycle version also accepts a `Matmul32x32` frame and returns `Ack/Ok` after validating payload length, checksum, and padding; the newer scratch smoke version stores one 32-bit word on `ScratchWrite32` and returns it via `ScratchValue32` on `ScratchRead32`.
+The first minimal target-side smoke-test bitstream lives in `hardware/tang9k/uart_responder`: it validates serial-v1 `Ping` frames and returns an empty `Pong` with the same sequence. The command-lifecycle version also accepts a `Matmul32x32` frame and returns `Ack/Ok` after validating payload length, checksum, and padding; the scratch smoke version stores one 32-bit word on `ScratchWrite32` and returns it via `ScratchValue32` on `ScratchRead32`; the result smoke version records a deterministic MatMul summary and returns it through `ResultValue32`.
 
 Safe bring-up sequence:
 
@@ -193,6 +221,8 @@ cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --list
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --baud 115200 --timeout-ms 1000
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --matmul-smoke --baud 115200 --timeout-ms 1000
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --matmul-smoke --baud 115200 --timeout-ms 1000 --dump-raw
+cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-smoke --baud 115200 --timeout-ms 1000
+cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-smoke --baud 115200 --timeout-ms 1000 --dump-raw
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --scratch-smoke --baud 115200 --timeout-ms 1000
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --scratch-smoke --baud 115200 --timeout-ms 1000 --dump-raw
 ```
@@ -202,13 +232,14 @@ Rules:
 - `--list` must be used first because it does not write to any device.
 - `--port` sends exactly one `Ping` frame with sequence `0` and payload `sptorch-ping`.
 - `--matmul-smoke` sends exactly one `Matmul32x32` command frame with sequence `1`.
+- `--result-smoke` sends one `Matmul32x32` command frame with sequence `4`, then one `ResultRead32` frame with sequence `5`, and checks the returned `ResultValue32`.
 - `--scratch-smoke` sends one `ScratchWrite32` followed by one `ScratchRead32`, then checks the returned `ScratchValue32`.
 - `--dump-raw` prints host request bytes and target response bytes; keep it enabled when debugging checksum drift, stale serial data, or RTL framing changes.
-- A target may answer with `Pong`, `Ack/Ok`, or `ScratchValue32` during early bring-up.
+- A target may answer with `Pong`, `Ack/Ok`, `ScratchValue32`, or `ResultValue32` during early bring-up.
 - `Busy`, `Error`, bad sequence, malformed frames, transport I/O errors, and timeouts are all reported explicitly.
 - If Windows only shows `COM1 Unknown`, treat it as suspicious unless the board documentation confirms Tang9k is mapped there; many built-in ACPI serial ports appear this way.
 
-Real-board acceptance recorded on 2026-05-17:
+Real-board acceptance recorded on 2026-05-18:
 
 - JTAG cable: `USB Debugger A`.
 - Device scan: `GW1NR-9C`, ID `0x1100481B`.
@@ -234,6 +265,14 @@ Real-board acceptance recorded on 2026-05-17:
 
 ```text
 53 50 01 22 03 00 00 00 08 00 00 00 00 00 00 00 44 00 00 00 44 33 22 11 86 82 c3 d0 00 00 00 00
+```
+
+- Result smoke host result: `OK: result matmul opcode=Ack, sequence=4, payload_len=8`.
+- Result smoke host result: `OK: result read opcode=ResultValue32, sequence=5, offset=0x00002000, value=0x00003005`.
+- Result smoke read raw response bytes:
+
+```text
+53 50 01 31 05 00 00 00 08 00 00 00 00 00 00 00 00 20 00 00 05 30 00 00 d4 d0 6f 06 00 00 00 00
 ```
 
 ## Implementation Standards
@@ -270,7 +309,7 @@ Golden coverage:
 - `Ping` frame with flags, payload, checksum, and padding.
 - `Ack` frame using `SerialStatusPayload { Busy, detail = 0x11223344 }`.
 - `Matmul32x32Command` payload and full frame.
-- `ScratchWrite32`, `ScratchRead32`, and `ScratchValue32` payloads and full frames.
+- `ScratchWrite32`, `ScratchRead32`, `ScratchValue32`, `ResultRead32`, and `ResultValue32` payloads and full frames.
 - Stream decoder behavior with leading noise and multiple golden frames in one byte stream.
 
 Any non-Rust implementation should reproduce these exact bytes before being treated as protocol-compatible.

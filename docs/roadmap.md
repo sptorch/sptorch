@@ -215,7 +215,7 @@ External ecosystem repositories (not part of framework workspace):
    - 验收：CPU 参考结果对齐（容差阈值固定），错误可定位到 tile 级
 3. **Week 3（hal-ffi 接入）**
    - 交付：`serial_backend` 注册到 `BACKEND_REGISTRY`，`dispatch_matmul` 可路由到硬件
-   - 进度：`sptorch-hal-ffi::serial_backend` 已提供 Tang9k serial dry-run backend，可注册到 `core-tensor` dispatch 表，`core-ops::matmul` 能生成 serial tile frames，并通过 `SerialSubmitQueue` 校验 ACK/OK、Busy 背压、sequence 和队列深度；`Tang9kSerialTransport` 已抽象发送/接收边界，`UartTang9kTransport` 与 `tang9k_probe` 已提供真实串口列举、单帧 Ping、`Matmul32x32 -> Ack/Ok` 命令生命周期探测和 `--dump-raw` 字节级诊断入口，真实 DMA/结果回读层待实现
+   - 进度：`sptorch-hal-ffi::serial_backend` 已提供 Tang9k serial dry-run backend，可注册到 `core-tensor` dispatch 表，`core-ops::matmul` 能生成 serial tile frames，并通过 `SerialSubmitQueue` 校验 ACK/OK、Busy 背压、sequence 和队列深度；`Tang9kSerialTransport` 已抽象发送/接收边界，`UartTang9kTransport` 与 `tang9k_probe` 已提供真实串口列举、单帧 Ping、`Matmul32x32 -> Ack/Ok` 命令生命周期探测、`ScratchWrite32/ScratchRead32` 数据面回环、`ResultRead32/ResultValue32` 结果窗口摘要读回和 `--dump-raw` 字节级诊断入口，真实 DMA/完整矩阵结果缓冲区待实现
    - 验收：不改上层 API 即可切换 CPU/serial backend，核心回归测试通过
 4. **Week 4（端到端点亮）**
    - 交付：`sptorch -> serial_backend -> Tang 9k -> result` 全链路打通
@@ -826,7 +826,7 @@ External ecosystem repositories (not part of framework workspace):
 5. **SPTorch Studio**：Tauri 桌面应用，可视化训练/推理/Schema 管理
 
 ### 新增验收项（管理口径）
-1. **P8 硬件协议主线**：benchmark 基线已补齐，`hal::serial` 已具备串口帧协议、ACK/Error 标准载荷、host submit queue、stream framing、golden vectors、10k loopback、32×32 MatMul 指令编码与 tile 指令流规划；`hal-ffi::serial_backend` 已完成 dispatch dry-run 注册、ACK/Busy 生命周期校验、UART Ping 探测工具、`Matmul32x32 -> Ack/Ok` 真实板卡命令生命周期烟测和 transport 边界抽象，下一步推进 DMA 数据面、结果回读和 32×32 端到端数值验证
+1. **P8 硬件协议主线**：benchmark 基线已补齐，`hal::serial` 已具备串口帧协议、ACK/Error 标准载荷、host submit queue、stream framing、golden vectors、10k loopback、32×32 MatMul 指令编码与 tile 指令流规划；`hal-ffi::serial_backend` 已完成 dispatch dry-run 注册、ACK/Busy 生命周期校验、UART Ping 探测工具、`Matmul32x32 -> Ack/Ok` 真实板卡命令生命周期烟测、scratch 数据面回环、result window 摘要读回协议和 transport 边界抽象，下一步推进 DMA 数据面、完整结果缓冲区回读和 32×32 端到端数值验证
 2. **真实数据集评估**：在 Spider/WikiSQL 上给出 Text2SQL 准确率与错误类型分布
 3. **TokenTrie 线上约束验证**：`generate_constrained` 接入线上生成路径，验证 SQL 幻觉下降幅度
 
@@ -911,10 +911,10 @@ bdf6661 GPU Attention模型: 单头attention+手动backward, loss 3.13→2.38
 - [x] Tank9k multi-board topology model: `sptorch-hal::topology` now represents board nodes, serial/PCIe/Ethernet links, link roles, queue-depth hints, online state, and connectivity diagnostics.
 - [x] Multi-board planning primitives: HAL can derive deterministic ring order, estimate Ring-AllReduce transfer cost, and generate 32x32 MatMul shard plans for Tank9k-style validation.
 - [x] Tang9k serial protocol scaffold: `sptorch-hal::serial` defines v1 aligned frames, checksum validation, 10k-frame loopback testing, and 32x32 MatMul command payloads.
-- [x] Tang9k serial protocol standard: `docs/tang9k-serial-protocol-v1.md` documents frame layout, opcode/status tables, ACK/Error payloads, MatMul command format, scratch data-plane smoke frames, and compatibility rules.
+- [x] Tang9k serial protocol standard: `docs/tang9k-serial-protocol-v1.md` documents frame layout, opcode/status tables, ACK/Error payloads, MatMul command format, scratch data-plane smoke frames, result-window smoke frames, and compatibility rules.
 - [x] Tang9k stream framing: `SerialStreamDecoder` turns arbitrary UART/USB-CDC byte chunks into strict `SerialFrame` values with noise recovery and partial-frame buffering.
 - [x] Tang9k host submit lifecycle: `SerialSubmitQueue` owns sequence allocation, ACK/OK validation, Busy rejection, queue-depth drain, and high-watermark telemetry for dry-run and future UART/DMA transports.
-- [x] Tang9k golden vectors: `crates/hal/tests/tang9k_serial_golden.rs` locks byte-for-byte Ping, Ack, MatMul, scratch read/write/value, and stream framing conformance cases.
+- [x] Tang9k golden vectors: `crates/hal/tests/tang9k_serial_golden.rs` locks byte-for-byte Ping, Ack, MatMul, scratch read/write/value, result read/value, and stream framing conformance cases.
 - [x] Tang9k MatMul tile command planner: `plan_matmul32x32_commands` maps row-major board memory layouts into deterministic 32x32 tile command streams with clear/accumulate/last-k flags.
 - [x] Tang9k serial backend dry-run: `sptorch-hal-ffi::serial_backend` registers into core dispatch and lets `core-ops::matmul` exercise serial tile frames before real UART/DMA is connected.
 - [x] Tang9k transport boundary: `Tang9kSerialTransport` isolates the send/receive layer so loopback, UART, or DMA transports can share the same MatMul dispatch path.
@@ -922,5 +922,6 @@ bdf6661 GPU Attention模型: 单头attention+手动backward, loss 3.13→2.38
 - [x] Tang9k real-board UART smoke test: `hardware/tang9k/uart_responder` builds a minimal Gowin `GW1NR-9C` bitstream; SRAM Program via `USB Debugger A` succeeded with status `0x0003F020`, and `COM3 @ 115200` returned `OK: response opcode=Pong, sequence=0, payload_len=0`.
 - [x] Tang9k command-lifecycle smoke test: host `tang9k_probe --matmul-smoke --dump-raw` and responder RTL validate `Matmul32x32 -> Ack/Ok` on real hardware; SRAM Program via `USB Debugger A` returned status `0x0003F020`, and `COM3 @ 115200` returned `OK: response opcode=Ack, sequence=1, payload_len=8` with ACK checksum bytes `b8 59 20 24`.
 - [x] Tang9k scratch smoke test: `tang9k_probe --scratch-smoke --dump-raw` and responder RTL validate `ScratchWrite32 -> Ack/Ok -> ScratchRead32 -> ScratchValue32` on real hardware; SRAM Program via `USB Debugger A` returned status `0x0003F020`, and `COM3 @ 115200` returned `OK: scratch write opcode=Ack, sequence=2, payload_len=8` plus `OK: scratch read opcode=ScratchValue32, sequence=3, offset=0x00000044, value=0x11223344`.
+- [x] Tang9k result-window smoke path: `hal::serial` now defines `ResultRead32/ResultValue32`, golden vectors cover the wire bytes, `hal-ffi::serial_backend` exposes `tang9k_probe --result-smoke`, and the responder RTL records a deterministic MatMul summary in a 32-bit result slot. Real-board SRAM reflash via `USB Debugger A` passed on `COM3 @ 115200`, returning `offset=0x00002000, value=0x00003005`.
 - [x] Hardware-aware distributed dry-run: `sptorch-distributed::hardware_parallel` turns a topology into a validation plan combining MatMul sharding and Ring-AllReduce, so multi-board bring-up can be tested before real serial/PCIe DMA is connected.
 
