@@ -33,6 +33,8 @@ module tang9k_uart_responder (
     localparam [7:0] OPCODE_SCRATCH_VALUE32 = 8'h22;
     localparam [7:0] OPCODE_RESULT_READ32  = 8'h30;
     localparam [7:0] OPCODE_RESULT_VALUE32 = 8'h31;
+    localparam [7:0] OPCODE_RESULT_WINDOW_STATUS_READ = 8'h32;
+    localparam [7:0] OPCODE_RESULT_WINDOW_STATUS = 8'h33;
     localparam [7:0] OPCODE_ACK    = 8'h7e;
     localparam [7:0] OPCODE_ERROR  = 8'h7f;
     localparam [7:0] HEADER_LEN     = 8'd16;
@@ -45,6 +47,9 @@ module tang9k_uart_responder (
     localparam [15:0] SCRATCH_VALUE32_PAYLOAD_LEN = 16'd8;
     localparam [15:0] RESULT_READ32_PAYLOAD_LEN = 16'd4;
     localparam [15:0] RESULT_VALUE32_PAYLOAD_LEN = 16'd8;
+    localparam [15:0] RESULT_WINDOW_STATUS_PAYLOAD_LEN = 16'd16;
+    localparam [7:0] RESULT_WINDOW_WORD_COUNT = 8'd4;
+    localparam [7:0] RESULT_WINDOW_STATUS_VALID = 8'h01;
     localparam [31:0] RESULT_WORD_STRIDE_BYTES = 32'd4;
     localparam [31:0] RESULT_MIX_0 = 32'h00000000;
     localparam [31:0] RESULT_MIX_1 = 32'h9e3779b9;
@@ -125,12 +130,13 @@ module tang9k_uart_responder (
     reg [31:0] result_value_1 = 32'd0;
     reg [31:0] result_value_2 = 32'd0;
     reg [31:0] result_value_3 = 32'd0;
+    reg [31:0] result_last_sequence = 32'd0;
     reg        result_stored_valid = 1'b0;
 
     reg        tx_frame_active = 1'b0;
     reg        tx_prepare_active = 1'b0;
-    reg [4:0]  tx_frame_index = 5'd0;
-    reg [4:0]  tx_hash_index = 5'd0;
+    reg [5:0]  tx_frame_index = 6'd0;
+    reg [5:0]  tx_hash_index = 6'd0;
     reg [1:0]  tx_phase = TX_SEND;
     reg [31:0] tx_sequence = 32'd0;
     reg [31:0] tx_hash = FNV_OFFSET;
@@ -140,6 +146,8 @@ module tang9k_uart_responder (
     reg [31:0] tx_status_detail = 32'd0;
     reg [31:0] tx_scratch_offset = 32'd0;
     reg [31:0] tx_scratch_value = 32'd0;
+    reg [31:0] tx_result_last_sequence = 32'd0;
+    reg        tx_result_valid = 1'b0;
     reg        response_request_toggle = 1'b0;
     reg        response_request_seen = 1'b0;
     reg [31:0] response_request_sequence = 32'd0;
@@ -148,6 +156,8 @@ module tang9k_uart_responder (
     reg [31:0] response_request_status_detail = 32'd0;
     reg [31:0] response_request_scratch_offset = 32'd0;
     reg [31:0] response_request_scratch_value = 32'd0;
+    reg [31:0] response_request_result_last_sequence = 32'd0;
+    reg        response_request_result_valid = 1'b0;
 
     reg [25:0] heartbeat = 26'd0;
     reg        led_heartbeat = 1'b0;
@@ -185,24 +195,28 @@ module tang9k_uart_responder (
         end
     endfunction
 
-    function [4:0] response_last_index;
+    function [5:0] response_last_index;
         input [7:0] response_opcode;
         begin
             if (response_opcode == OPCODE_PONG) begin
-                response_last_index = 5'd23;
+                response_last_index = 6'd23;
+            end else if (response_opcode == OPCODE_RESULT_WINDOW_STATUS) begin
+                response_last_index = 6'd39;
             end else begin
-                response_last_index = 5'd31;
+                response_last_index = 6'd31;
             end
         end
     endfunction
 
-    function [4:0] response_checksum_body_last_index;
+    function [5:0] response_checksum_body_last_index;
         input [7:0] response_opcode;
         begin
             if (response_opcode == OPCODE_PONG) begin
-                response_checksum_body_last_index = 5'd15;
+                response_checksum_body_last_index = 6'd15;
+            end else if (response_opcode == OPCODE_RESULT_WINDOW_STATUS) begin
+                response_checksum_body_last_index = 6'd31;
             end else begin
-                response_checksum_body_last_index = 5'd23;
+                response_checksum_body_last_index = 6'd23;
             end
         end
     endfunction
@@ -215,129 +229,190 @@ module tang9k_uart_responder (
         end
     endfunction
 
+    function is_result_window_status_response;
+        input [7:0] response_opcode;
+        begin
+            is_result_window_status_response = response_opcode == OPCODE_RESULT_WINDOW_STATUS;
+        end
+    endfunction
+
     function [7:0] response_byte;
-        input [4:0] index;
+        input [5:0] index;
         input [7:0] response_opcode;
         input [31:0] seq;
         input [15:0] status_code;
         input [31:0] status_detail;
         input [31:0] scratch_offset;
         input [31:0] scratch_value;
+        input [31:0] last_sequence;
+        input        result_valid;
         input [31:0] csum;
         begin
             case (index)
-                5'd0:  response_byte = SERIAL_MAGIC_S;
-                5'd1:  response_byte = SERIAL_MAGIC_P;
-                5'd2:  response_byte = SERIAL_VERSION;
-                5'd3:  response_byte = response_opcode;
-                5'd4:  response_byte = seq[7:0];
-                5'd5:  response_byte = seq[15:8];
-                5'd6:  response_byte = seq[23:16];
-                5'd7:  response_byte = seq[31:24];
-                5'd8: begin
+                6'd0:  response_byte = SERIAL_MAGIC_S;
+                6'd1:  response_byte = SERIAL_MAGIC_P;
+                6'd2:  response_byte = SERIAL_VERSION;
+                6'd3:  response_byte = response_opcode;
+                6'd4:  response_byte = seq[7:0];
+                6'd5:  response_byte = seq[15:8];
+                6'd6:  response_byte = seq[23:16];
+                6'd7:  response_byte = seq[31:24];
+                6'd8: begin
                     if (response_opcode == OPCODE_PONG) begin
                         response_byte = 8'h00;
                     end else if (is_value_response(response_opcode)) begin
                         response_byte = response_opcode == OPCODE_RESULT_VALUE32
                             ? RESULT_VALUE32_PAYLOAD_LEN[7:0]
                             : SCRATCH_VALUE32_PAYLOAD_LEN[7:0];
+                    end else if (is_result_window_status_response(response_opcode)) begin
+                        response_byte = RESULT_WINDOW_STATUS_PAYLOAD_LEN[7:0];
                     end else begin
                         response_byte = STATUS_PAYLOAD_LEN[7:0];
                     end
                 end
-                5'd9: begin
+                6'd9: begin
                     if (response_opcode == OPCODE_PONG) begin
                         response_byte = 8'h00;
                     end else if (is_value_response(response_opcode)) begin
                         response_byte = response_opcode == OPCODE_RESULT_VALUE32
                             ? RESULT_VALUE32_PAYLOAD_LEN[15:8]
                             : SCRATCH_VALUE32_PAYLOAD_LEN[15:8];
+                    end else if (is_result_window_status_response(response_opcode)) begin
+                        response_byte = RESULT_WINDOW_STATUS_PAYLOAD_LEN[15:8];
                     end else begin
                         response_byte = STATUS_PAYLOAD_LEN[15:8];
                     end
                 end
-                5'd10: response_byte = 8'h00;
-                5'd11: response_byte = 8'h00;
-                5'd12: response_byte = 8'h00;
-                5'd13: response_byte = 8'h00;
-                5'd14: response_byte = 8'h00;
-                5'd15: response_byte = 8'h00;
-                5'd16: begin
+                6'd10: response_byte = 8'h00;
+                6'd11: response_byte = 8'h00;
+                6'd12: response_byte = 8'h00;
+                6'd13: response_byte = 8'h00;
+                6'd14: response_byte = 8'h00;
+                6'd15: response_byte = 8'h00;
+                6'd16: begin
                     if (response_opcode == OPCODE_PONG) begin
                         response_byte = csum[7:0];
                     end else if (is_value_response(response_opcode)) begin
                         response_byte = scratch_offset[7:0];
+                    end else if (is_result_window_status_response(response_opcode)) begin
+                        response_byte = result_valid ? RESULT_WINDOW_STATUS_VALID : 8'h00;
                     end else begin
                         response_byte = status_code[7:0];
                     end
                 end
-                5'd17: begin
+                6'd17: begin
                     if (response_opcode == OPCODE_PONG) begin
                         response_byte = csum[15:8];
                     end else if (is_value_response(response_opcode)) begin
                         response_byte = scratch_offset[15:8];
+                    end else if (is_result_window_status_response(response_opcode)) begin
+                        response_byte = RESULT_WINDOW_WORD_COUNT;
                     end else begin
                         response_byte = status_code[15:8];
                     end
                 end
-                5'd18: begin
+                6'd18: begin
                     if (response_opcode == OPCODE_PONG) begin
                         response_byte = csum[23:16];
                     end else if (is_value_response(response_opcode)) begin
                         response_byte = scratch_offset[23:16];
+                    end else if (is_result_window_status_response(response_opcode)) begin
+                        response_byte = RESULT_WORD_STRIDE_BYTES[7:0];
                     end else begin
                         response_byte = 8'h00;
                     end
                 end
-                5'd19: begin
+                6'd19: begin
                     if (response_opcode == OPCODE_PONG) begin
                         response_byte = csum[31:24];
                     end else if (is_value_response(response_opcode)) begin
                         response_byte = scratch_offset[31:24];
+                    end else if (is_result_window_status_response(response_opcode)) begin
+                        response_byte = RESULT_WORD_STRIDE_BYTES[15:8];
                     end else begin
                         response_byte = 8'h00;
                     end
                 end
-                5'd20: begin
+                6'd20: begin
                     if (response_opcode == OPCODE_PONG) begin
                         response_byte = 8'h00;
                     end else if (is_value_response(response_opcode)) begin
                         response_byte = scratch_value[7:0];
+                    end else if (is_result_window_status_response(response_opcode)) begin
+                        response_byte = scratch_offset[7:0];
                     end else begin
                         response_byte = status_detail[7:0];
                     end
                 end
-                5'd21: begin
+                6'd21: begin
                     if (response_opcode == OPCODE_PONG) begin
                         response_byte = 8'h00;
                     end else if (is_value_response(response_opcode)) begin
                         response_byte = scratch_value[15:8];
+                    end else if (is_result_window_status_response(response_opcode)) begin
+                        response_byte = scratch_offset[15:8];
                     end else begin
                         response_byte = status_detail[15:8];
                     end
                 end
-                5'd22: begin
+                6'd22: begin
                     if (response_opcode == OPCODE_PONG) begin
                         response_byte = 8'h00;
                     end else if (is_value_response(response_opcode)) begin
                         response_byte = scratch_value[23:16];
+                    end else if (is_result_window_status_response(response_opcode)) begin
+                        response_byte = scratch_offset[23:16];
                     end else begin
                         response_byte = status_detail[23:16];
                     end
                 end
-                5'd23: begin
+                6'd23: begin
                     if (response_opcode == OPCODE_PONG) begin
                         response_byte = 8'h00;
                     end else if (is_value_response(response_opcode)) begin
                         response_byte = scratch_value[31:24];
+                    end else if (is_result_window_status_response(response_opcode)) begin
+                        response_byte = scratch_offset[31:24];
                     end else begin
                         response_byte = status_detail[31:24];
                     end
                 end
-                5'd24: response_byte = csum[7:0];
-                5'd25: response_byte = csum[15:8];
-                5'd26: response_byte = csum[23:16];
-                5'd27: response_byte = csum[31:24];
+                6'd24: begin
+                    if (is_result_window_status_response(response_opcode)) begin
+                        response_byte = last_sequence[7:0];
+                    end else begin
+                        response_byte = csum[7:0];
+                    end
+                end
+                6'd25: begin
+                    if (is_result_window_status_response(response_opcode)) begin
+                        response_byte = last_sequence[15:8];
+                    end else begin
+                        response_byte = csum[15:8];
+                    end
+                end
+                6'd26: begin
+                    if (is_result_window_status_response(response_opcode)) begin
+                        response_byte = last_sequence[23:16];
+                    end else begin
+                        response_byte = csum[23:16];
+                    end
+                end
+                6'd27: begin
+                    if (is_result_window_status_response(response_opcode)) begin
+                        response_byte = last_sequence[31:24];
+                    end else begin
+                        response_byte = csum[31:24];
+                    end
+                end
+                6'd28: response_byte = 8'h00;
+                6'd29: response_byte = 8'h00;
+                6'd30: response_byte = 8'h00;
+                6'd31: response_byte = 8'h00;
+                6'd32: response_byte = csum[7:0];
+                6'd33: response_byte = csum[15:8];
+                6'd34: response_byte = csum[23:16];
+                6'd35: response_byte = csum[31:24];
                 default: response_byte = 8'h00;
             endcase
         end
@@ -375,6 +450,8 @@ module tang9k_uart_responder (
             response_request_sequence <= sequence;
             response_request_scratch_offset <= 32'd0;
             response_request_scratch_value <= 32'd0;
+            response_request_result_last_sequence <= result_last_sequence;
+            response_request_result_valid <= result_stored_valid;
             if (unsupported_opcode) begin
                 response_request_opcode <= OPCODE_ERROR;
                 response_request_status_code <= STATUS_UNSUPPORTED_OPCODE;
@@ -421,6 +498,7 @@ module tang9k_uart_responder (
                     ^ matmul_out_offset_low
                     ^ matmul_out_offset_high
                     ^ RESULT_MIX_3;
+                result_last_sequence <= sequence;
                 result_stored_valid <= 1'b1;
                 response_request_opcode <= OPCODE_ACK;
                 response_request_status_code <= STATUS_OK;
@@ -486,6 +564,13 @@ module tang9k_uart_responder (
                     response_request_status_code <= STATUS_HARDWARE_FAULT;
                     response_request_status_detail <= 32'd0;
                 end
+            end else if (command_opcode == OPCODE_RESULT_WINDOW_STATUS_READ) begin
+                response_request_opcode <= OPCODE_RESULT_WINDOW_STATUS;
+                response_request_status_code <= STATUS_OK;
+                response_request_status_detail <= 32'd0;
+                response_request_scratch_offset <= result_base_offset;
+                response_request_result_last_sequence <= result_last_sequence;
+                response_request_result_valid <= result_stored_valid;
             end else begin
                 response_request_opcode <= OPCODE_PONG;
                 response_request_status_code <= STATUS_OK;
@@ -515,8 +600,10 @@ module tang9k_uart_responder (
             tx_status_detail <= response_request_status_detail;
             tx_scratch_offset <= response_request_scratch_offset;
             tx_scratch_value <= response_request_scratch_value;
+            tx_result_last_sequence <= response_request_result_last_sequence;
+            tx_result_valid <= response_request_result_valid;
             tx_hash <= FNV_OFFSET;
-            tx_hash_index <= 5'd0;
+            tx_hash_index <= 6'd0;
             tx_prepare_active <= 1'b1;
         end else if (tx_prepare_active) begin
             // 一拍只喂一个响应字节。之前把 24 次 FNV 乘法串在同一个组合函数里，
@@ -532,6 +619,8 @@ module tang9k_uart_responder (
                     tx_status_detail,
                     tx_scratch_offset,
                     tx_scratch_value,
+                    tx_result_last_sequence,
+                    tx_result_valid,
                     32'd0
                 )
             );
@@ -546,15 +635,17 @@ module tang9k_uart_responder (
                         tx_status_detail,
                         tx_scratch_offset,
                         tx_scratch_value,
+                        tx_result_last_sequence,
+                        tx_result_valid,
                         32'd0
                     )
                 );
                 tx_prepare_active <= 1'b0;
-                tx_frame_index <= 5'd0;
+                tx_frame_index <= 6'd0;
                 tx_phase <= TX_SEND;
                 tx_frame_active <= 1'b1;
             end else begin
-                tx_hash_index <= tx_hash_index + 5'd1;
+                tx_hash_index <= tx_hash_index + 6'd1;
             end
         end else if (tx_frame_active) begin
             case (tx_phase)
@@ -568,6 +659,8 @@ module tang9k_uart_responder (
                             tx_status_detail,
                             tx_scratch_offset,
                             tx_scratch_value,
+                            tx_result_last_sequence,
+                            tx_result_valid,
                             tx_checksum
                         );
                         tx_start <= 1'b1;
@@ -586,10 +679,10 @@ module tang9k_uart_responder (
                     if (!tx_busy) begin
                         if (tx_frame_index == response_last_index(tx_response_opcode)) begin
                             tx_frame_active <= 1'b0;
-                            tx_frame_index <= 5'd0;
+                            tx_frame_index <= 6'd0;
                             tx_phase <= TX_SEND;
                         end else begin
-                            tx_frame_index <= tx_frame_index + 5'd1;
+                            tx_frame_index <= tx_frame_index + 6'd1;
                             tx_phase <= TX_SEND;
                         end
                     end
@@ -640,7 +733,8 @@ module tang9k_uart_responder (
                                 && rx_byte != OPCODE_MATMUL32X32
                                 && rx_byte != OPCODE_SCRATCH_WRITE32
                                 && rx_byte != OPCODE_SCRATCH_READ32
-                                && rx_byte != OPCODE_RESULT_READ32;
+                                && rx_byte != OPCODE_RESULT_READ32
+                                && rx_byte != OPCODE_RESULT_WINDOW_STATUS_READ;
                             header_index <= header_index + 5'd1;
                         end
                         5'd4: begin
@@ -705,7 +799,9 @@ module tang9k_uart_responder (
                                     || (command_opcode == OPCODE_SCRATCH_READ32
                                         && payload_len != SCRATCH_READ32_PAYLOAD_LEN)
                                     || (command_opcode == OPCODE_RESULT_READ32
-                                        && payload_len != RESULT_READ32_PAYLOAD_LEN);
+                                        && payload_len != RESULT_READ32_PAYLOAD_LEN)
+                                    || (command_opcode == OPCODE_RESULT_WINDOW_STATUS_READ
+                                        && payload_len != 16'd0);
                                 checksum_index <= 2'd0;
                                 if (payload_len == 16'd0) begin
                                     rx_state <= RX_CSUM;

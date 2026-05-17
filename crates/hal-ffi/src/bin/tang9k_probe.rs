@@ -1,8 +1,11 @@
-use sptorch_hal::serial::{ResultValue32Payload, ScratchValue32Payload, SerialOpcode, SerialStatusPayload};
+use sptorch_hal::serial::{
+    ResultValue32Payload, ResultWindowStatusPayload, ScratchValue32Payload, SerialOpcode, SerialStatusPayload,
+};
 use sptorch_hal_ffi::serial_backend::{
     list_tang9k_serial_ports, probe_tang9k_matmul_smoke_with_trace, probe_tang9k_ping_with_trace,
     probe_tang9k_result_oob_smoke_with_trace, probe_tang9k_result_smoke_with_trace,
-    probe_tang9k_result_window_smoke_with_trace, probe_tang9k_scratch_smoke_with_trace,
+    probe_tang9k_result_window_smoke_with_trace, probe_tang9k_result_window_status_smoke_with_trace,
+    probe_tang9k_scratch_smoke_with_trace,
 };
 use std::time::Duration;
 
@@ -21,6 +24,7 @@ enum ProbeCommand {
     MatmulSmoke,
     ResultSmoke,
     ResultWindowSmoke,
+    ResultWindowStatusSmoke,
     ResultOobSmoke,
     ScratchSmoke,
 }
@@ -122,6 +126,34 @@ fn main() {
                             if args.dump_raw {
                                 print_raw_exchange(&label, &trace.request_bytes, &trace.raw_response_bytes);
                             }
+                        }
+                    }
+                    Err(err) => {
+                        print_probe_error(args.dump_raw, err);
+                    }
+                }
+            }
+            ProbeCommand::ResultWindowStatusSmoke => {
+                let result = probe_tang9k_result_window_status_smoke_with_trace(
+                    &port,
+                    args.baud,
+                    Duration::from_millis(args.timeout_ms),
+                );
+                match result {
+                    Ok((matmul_trace, status_trace)) => {
+                        print_trace_summary("result window status matmul", &matmul_trace);
+                        print_trace_summary("result window status", &status_trace);
+                        if args.dump_raw {
+                            print_raw_exchange(
+                                "result window status matmul",
+                                &matmul_trace.request_bytes,
+                                &matmul_trace.raw_response_bytes,
+                            );
+                            print_raw_exchange(
+                                "result window status",
+                                &status_trace.request_bytes,
+                                &status_trace.raw_response_bytes,
+                            );
                         }
                     }
                     Err(err) => {
@@ -250,6 +282,10 @@ fn parse_args(raw: Vec<String>) -> Result<Args, String> {
                 args.command = ProbeCommand::ResultWindowSmoke;
                 idx += 1;
             }
+            "--result-window-status-smoke" => {
+                args.command = ProbeCommand::ResultWindowStatusSmoke;
+                idx += 1;
+            }
             "--result-oob-smoke" => {
                 args.command = ProbeCommand::ResultOobSmoke;
                 idx += 1;
@@ -292,6 +328,28 @@ fn print_trace_summary(label: &str, trace: &sptorch_hal_ffi::serial_backend::Uar
                 println!(
                     "OK: {label} opcode={:?}, sequence={}, offset=0x{:08x}, value=0x{:08x}",
                     trace.response.opcode, trace.response.sequence, payload.offset, payload.value
+                );
+            }
+            Err(_) => {
+                println!(
+                    "OK: {label} opcode={:?}, sequence={}, payload_len={}",
+                    trace.response.opcode,
+                    trace.response.sequence,
+                    trace.response.payload.len()
+                );
+            }
+        },
+        SerialOpcode::ResultWindowStatus => match ResultWindowStatusPayload::decode_payload(&trace.response.payload) {
+            Ok(payload) => {
+                println!(
+                    "OK: {label} opcode={:?}, sequence={}, valid={}, words={}, stride={}, base=0x{:08x}, last_sequence={}",
+                    trace.response.opcode,
+                    trace.response.sequence,
+                    payload.valid(),
+                    payload.word_count,
+                    payload.stride_bytes,
+                    payload.base_offset,
+                    payload.last_sequence
                 );
             }
             Err(_) => {
@@ -368,6 +426,9 @@ fn print_usage() {
         "  cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-window-smoke --baud 115200 --timeout-ms 1000"
     );
     println!(
+        "  cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-window-status-smoke --baud 115200 --timeout-ms 1000"
+    );
+    println!(
         "  cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-oob-smoke --baud 115200 --timeout-ms 1000"
     );
     println!(
@@ -441,6 +502,19 @@ mod tests {
 
         assert_eq!(args.port.as_deref(), Some("COM3"));
         assert_eq!(args.command, ProbeCommand::ResultWindowSmoke);
+    }
+
+    #[test]
+    fn parse_result_window_status_smoke_arguments() {
+        let args = parse_args(vec![
+            "--port".into(),
+            "COM3".into(),
+            "--result-window-status-smoke".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(args.port.as_deref(), Some("COM3"));
+        assert_eq!(args.command, ProbeCommand::ResultWindowStatusSmoke);
     }
 
     #[test]

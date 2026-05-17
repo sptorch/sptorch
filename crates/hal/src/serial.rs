@@ -45,6 +45,8 @@ pub enum SerialOpcode {
     ScratchValue32 = 0x22,
     ResultRead32 = 0x30,
     ResultValue32 = 0x31,
+    ResultWindowStatusRead = 0x32,
+    ResultWindowStatus = 0x33,
     Ack = 0x7e,
     Error = 0x7f,
 }
@@ -61,6 +63,8 @@ impl SerialOpcode {
             0x22 => Ok(Self::ScratchValue32),
             0x30 => Ok(Self::ResultRead32),
             0x31 => Ok(Self::ResultValue32),
+            0x32 => Ok(Self::ResultWindowStatusRead),
+            0x33 => Ok(Self::ResultWindowStatus),
             0x7e => Ok(Self::Ack),
             0x7f => Ok(Self::Error),
             other => Err(SerialProtocolError::UnknownOpcode(other)),
@@ -248,6 +252,9 @@ pub enum SerialProtocolError {
         actual_offset: u32,
         actual_value: u32,
     },
+    ResultWindowStatusMismatch {
+        reason: String,
+    },
     TransportIo {
         reason: String,
     },
@@ -351,6 +358,9 @@ impl fmt::Display for SerialProtocolError {
                 f,
                 "serial result readback mismatch: expected offset=0x{expected_offset:08x} value=0x{expected_value:08x}, got offset=0x{actual_offset:08x} value=0x{actual_value:08x}"
             ),
+            Self::ResultWindowStatusMismatch { reason } => {
+                write!(f, "serial result-window status mismatch: {reason}")
+            }
             Self::TransportIo { reason } => write!(f, "serial transport I/O failed: {reason}"),
             Self::ResponseTimeout { timeout_ms } => {
                 write!(f, "serial response timed out after {timeout_ms} ms")
@@ -796,6 +806,27 @@ pub fn validate_result_value_response(
     }
 }
 
+/// 验证 result-window status query 的响应是否结构正确。
+///
+/// 这个 helper 只关心线协议形态：sequence 必须回显，opcode 必须是 `ResultWindowStatus`，
+/// payload 必须能解码。至于 `valid/word_count/stride` 是否满足某个 bring-up 场景，留给调用者判断。
+pub fn validate_result_window_status_response(
+    command: &SerialFrame,
+    response: &SerialFrame,
+) -> Result<ResultWindowStatusPayload, SerialProtocolError> {
+    if response.sequence != command.sequence {
+        return Err(SerialProtocolError::SequenceMismatch {
+            expected: command.sequence,
+            actual: response.sequence,
+        });
+    }
+
+    match response.opcode {
+        SerialOpcode::ResultWindowStatus => ResultWindowStatusPayload::decode_payload(&response.payload),
+        actual => Err(SerialProtocolError::UnexpectedResponseOpcode { actual }),
+    }
+}
+
 /// Tang9k 第一轮硬件验证使用的 32x32 MatMul tile 指令。
 ///
 /// 指令只携带三段设备侧偏移与 tile 编号，不携带矩阵内容本身。这样它更接近真实硬件路径：
@@ -830,6 +861,8 @@ pub const TANG9K_RESULT_WINDOW_WORD_STRIDE_BYTES: u32 = 4;
 /// 后面三个常量只用于制造稳定、非重复的 word，避免 RTL 地址选择错误时仍然“看起来通过”。
 pub const TANG9K_RESULT_WINDOW_SMOKE_MIX: [u32; TANG9K_RESULT_WINDOW_SMOKE_WORDS] =
     [0x0000_0000, 0x9e37_79b9, 0x3c6e_f372, 0xdaa6_6d2b];
+/// result-window status payload 中表示“当前窗口已有有效 MatMul 写入”的 flag。
+pub const TANG9K_RESULT_WINDOW_STATUS_FLAG_VALID: u8 = 0x01;
 
 impl Matmul32x32Command {
     pub const M: usize = 32;
@@ -1121,6 +1154,108 @@ impl ResultValue32Payload {
 
     pub fn into_frame(self, sequence: u32) -> SerialFrame {
         SerialFrame::new(SerialOpcode::ResultValue32, sequence, self.encode_payload())
+    }
+}
+
+/// 查询当前 result-window 元信息的命令。
+///
+/// 命令本身没有 payload：它只问“板端当前结果窗口是什么状态”。这样 host 在做多 word 读回前，
+/// 可以先确认窗口是否 valid、base offset 是多少、word 数和 stride 是否符合当前协议预期。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResultWindowStatusReadCommand;
+
+impl ResultWindowStatusReadCommand {
+    pub const PAYLOAD_LEN: usize = 0;
+
+    pub fn decode_payload(payload: &[u8]) -> Result<Self, SerialProtocolError> {
+        if !payload.is_empty() {
+            return Err(SerialProtocolError::InvalidReadbackPayloadLen {
+                opcode: SerialOpcode::ResultWindowStatusRead,
+                actual: payload.len(),
+                expected: Self::PAYLOAD_LEN,
+            });
+        }
+        Ok(Self)
+    }
+
+    pub fn into_frame(self, sequence: u32) -> SerialFrame {
+        SerialFrame::new(SerialOpcode::ResultWindowStatusRead, sequence, Vec::new())
+    }
+}
+
+/// `ResultWindowStatusRead` 的状态响应 payload。
+///
+/// 这个响应是 result-window 的“问诊口”：它不返回矩阵数据，只返回 host 做安全读回需要的边界。
+/// 后续接入真实 BRAM/FIFO 时，只要保持这四个字段稳定，调试工具就能先判断窗口有没有准备好。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResultWindowStatusPayload {
+    pub flags: u8,
+    pub word_count: u8,
+    pub stride_bytes: u16,
+    pub base_offset: u32,
+    pub last_sequence: u32,
+    pub reserved: u32,
+}
+
+impl ResultWindowStatusPayload {
+    pub const PAYLOAD_LEN: usize = 16;
+
+    pub fn new(valid: bool, word_count: u8, stride_bytes: u16, base_offset: u32, last_sequence: u32) -> Self {
+        Self {
+            flags: if valid {
+                TANG9K_RESULT_WINDOW_STATUS_FLAG_VALID
+            } else {
+                0
+            },
+            word_count,
+            stride_bytes,
+            base_offset,
+            last_sequence,
+            reserved: 0,
+        }
+    }
+
+    pub fn valid(&self) -> bool {
+        self.flags & TANG9K_RESULT_WINDOW_STATUS_FLAG_VALID != 0
+    }
+
+    pub fn encode_payload(&self) -> [u8; Self::PAYLOAD_LEN] {
+        let mut payload = [0u8; Self::PAYLOAD_LEN];
+        payload[0] = self.flags;
+        payload[1] = self.word_count;
+        payload[2..4].copy_from_slice(&self.stride_bytes.to_le_bytes());
+        payload[4..8].copy_from_slice(&self.base_offset.to_le_bytes());
+        payload[8..12].copy_from_slice(&self.last_sequence.to_le_bytes());
+        payload[12..16].copy_from_slice(&self.reserved.to_le_bytes());
+        payload
+    }
+
+    pub fn decode_payload(payload: &[u8]) -> Result<Self, SerialProtocolError> {
+        if payload.len() != Self::PAYLOAD_LEN {
+            return Err(SerialProtocolError::InvalidReadbackPayloadLen {
+                opcode: SerialOpcode::ResultWindowStatus,
+                actual: payload.len(),
+                expected: Self::PAYLOAD_LEN,
+            });
+        }
+        let reserved = u32::from_le_bytes(payload[12..16].try_into().expect("payload length checked"));
+        if reserved != 0 {
+            return Err(SerialProtocolError::NonZeroReservedField {
+                field: "result_window_status.reserved",
+            });
+        }
+        Ok(Self {
+            flags: payload[0],
+            word_count: payload[1],
+            stride_bytes: u16::from_le_bytes(payload[2..4].try_into().expect("payload length checked")),
+            base_offset: u32::from_le_bytes(payload[4..8].try_into().expect("payload length checked")),
+            last_sequence: u32::from_le_bytes(payload[8..12].try_into().expect("payload length checked")),
+            reserved,
+        })
+    }
+
+    pub fn into_frame(self, sequence: u32) -> SerialFrame {
+        SerialFrame::new(SerialOpcode::ResultWindowStatus, sequence, self.encode_payload())
     }
 }
 
@@ -1744,6 +1879,41 @@ mod tests {
         assert_eq!(decoded_frame.opcode, SerialOpcode::ResultValue32);
         assert_eq!(decoded_frame.sequence, 81);
         assert_eq!(decoded_payload, payload);
+    }
+
+    #[test]
+    fn result_window_status_payload_roundtrips() {
+        let read_command = ResultWindowStatusReadCommand.into_frame(82);
+        let decoded_frame = SerialFrame::decode(&read_command.encode().unwrap()).unwrap();
+        let decoded_command = ResultWindowStatusReadCommand::decode_payload(&decoded_frame.payload).unwrap();
+        assert_eq!(decoded_frame.opcode, SerialOpcode::ResultWindowStatusRead);
+        assert_eq!(decoded_frame.sequence, 82);
+        assert_eq!(decoded_command, ResultWindowStatusReadCommand);
+
+        let payload = ResultWindowStatusPayload::new(true, 4, 4, 0x2000, 4);
+        let frame = payload.into_frame(82);
+        let decoded_frame = SerialFrame::decode(&frame.encode().unwrap()).unwrap();
+        let decoded_payload = ResultWindowStatusPayload::decode_payload(&decoded_frame.payload).unwrap();
+        assert_eq!(decoded_frame.opcode, SerialOpcode::ResultWindowStatus);
+        assert!(decoded_payload.valid());
+        assert_eq!(decoded_payload, payload);
+        assert_eq!(
+            validate_result_window_status_response(&read_command, &frame).unwrap(),
+            payload
+        );
+    }
+
+    #[test]
+    fn result_window_status_rejects_reserved_bits() {
+        let mut encoded = ResultWindowStatusPayload::new(true, 4, 4, 0x2000, 4).encode_payload();
+        encoded[12] = 1;
+        let err = ResultWindowStatusPayload::decode_payload(&encoded).unwrap_err();
+        assert_eq!(
+            err,
+            SerialProtocolError::NonZeroReservedField {
+                field: "result_window_status.reserved"
+            }
+        );
     }
 
     #[test]

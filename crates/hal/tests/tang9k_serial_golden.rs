@@ -1,7 +1,8 @@
 use sptorch_hal::serial::{
-    Matmul32x32Command, ResultRead32Command, ResultValue32Payload, ScratchRead32Command, ScratchValue32Payload,
-    ScratchWrite32Command, SerialFrame, SerialOpcode, SerialStatusCode, SerialStatusPayload, SerialStreamDecoder,
-    MATMUL32X32_FLAG_CLEAR_OUTPUT, MATMUL32X32_FLAG_LAST_K_TILE,
+    Matmul32x32Command, ResultRead32Command, ResultValue32Payload, ResultWindowStatusPayload,
+    ResultWindowStatusReadCommand, ScratchRead32Command, ScratchValue32Payload, ScratchWrite32Command, SerialFrame,
+    SerialOpcode, SerialStatusCode, SerialStatusPayload, SerialStreamDecoder, MATMUL32X32_FLAG_CLEAR_OUTPUT,
+    MATMUL32X32_FLAG_LAST_K_TILE,
 };
 
 const PING_FRAME_GOLDEN: &[u8] = &[
@@ -56,6 +57,18 @@ const RESULT_VALUE32_PAYLOAD_GOLDEN: &[u8] = &[0x38, 0x37, 0x36, 0x35, 0x0d, 0x0
 const RESULT_VALUE32_FRAME_GOLDEN: &[u8] = &[
     0x53, 0x50, 0x01, 0x31, 0x0c, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x38, 0x37, 0x36,
     0x35, 0x0d, 0x07, 0x06, 0x05, 0xc9, 0x2a, 0xb3, 0x89, 0x00, 0x00, 0x00, 0x00,
+];
+const RESULT_WINDOW_STATUS_READ_FRAME_GOLDEN: &[u8] = &[
+    0x53, 0x50, 0x01, 0x32, 0x0d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xa8, 0x56, 0x42,
+    0x10, 0x00, 0x00, 0x00, 0x00,
+];
+const RESULT_WINDOW_STATUS_PAYLOAD_GOLDEN: &[u8] = &[
+    0x01, 0x04, 0x04, 0x00, 0x00, 0x20, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+const RESULT_WINDOW_STATUS_FRAME_GOLDEN: &[u8] = &[
+    0x53, 0x50, 0x01, 0x33, 0x0d, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x04, 0x04,
+    0x00, 0x00, 0x20, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xea, 0xb4, 0x05, 0xfe, 0x00, 0x00,
+    0x00, 0x00,
 ];
 
 #[test]
@@ -160,6 +173,33 @@ fn result32_commands_and_frames_match_wire_golden_vectors() {
 }
 
 #[test]
+fn result_window_status_commands_and_frames_match_wire_golden_vectors() {
+    let read_frame = ResultWindowStatusReadCommand.into_frame(13);
+    assert_eq!(read_frame.encode().unwrap(), RESULT_WINDOW_STATUS_READ_FRAME_GOLDEN);
+    assert_eq!(
+        ResultWindowStatusReadCommand::decode_payload(
+            &SerialFrame::decode(RESULT_WINDOW_STATUS_READ_FRAME_GOLDEN)
+                .unwrap()
+                .payload
+        )
+        .unwrap(),
+        ResultWindowStatusReadCommand
+    );
+
+    let status_payload = ResultWindowStatusPayload::new(true, 4, 4, 0x2000, 4);
+    assert_eq!(status_payload.encode_payload(), RESULT_WINDOW_STATUS_PAYLOAD_GOLDEN);
+    let status_frame = status_payload.into_frame(13);
+    assert_eq!(status_frame.encode().unwrap(), RESULT_WINDOW_STATUS_FRAME_GOLDEN);
+    assert_eq!(
+        ResultWindowStatusPayload::decode_payload(
+            &SerialFrame::decode(RESULT_WINDOW_STATUS_FRAME_GOLDEN).unwrap().payload
+        )
+        .unwrap(),
+        status_payload
+    );
+}
+
+#[test]
 fn stream_decoder_accepts_golden_vectors_with_chunk_boundaries() {
     let mut stream = vec![0x00, 0xff];
     stream.extend_from_slice(PING_FRAME_GOLDEN);
@@ -171,12 +211,14 @@ fn stream_decoder_accepts_golden_vectors_with_chunk_boundaries() {
     stream.extend_from_slice(SCRATCH_VALUE32_FRAME_GOLDEN);
     stream.extend_from_slice(RESULT_READ32_FRAME_GOLDEN);
     stream.extend_from_slice(RESULT_VALUE32_FRAME_GOLDEN);
+    stream.extend_from_slice(RESULT_WINDOW_STATUS_READ_FRAME_GOLDEN);
+    stream.extend_from_slice(RESULT_WINDOW_STATUS_FRAME_GOLDEN);
 
     let mut decoder = SerialStreamDecoder::new();
     assert!(decoder.push_bytes(&stream[..3]).unwrap().is_empty());
     let frames = decoder.push_bytes(&stream[3..]).unwrap();
 
-    assert_eq!(frames.len(), 9);
+    assert_eq!(frames.len(), 11);
     assert_eq!(frames[0].opcode, SerialOpcode::Ping);
     assert_eq!(frames[1].opcode, SerialOpcode::Ack);
     assert_eq!(frames[2].opcode, SerialOpcode::Matmul32x32);
@@ -186,4 +228,6 @@ fn stream_decoder_accepts_golden_vectors_with_chunk_boundaries() {
     assert_eq!(frames[6].opcode, SerialOpcode::ScratchValue32);
     assert_eq!(frames[7].opcode, SerialOpcode::ResultRead32);
     assert_eq!(frames[8].opcode, SerialOpcode::ResultValue32);
+    assert_eq!(frames[9].opcode, SerialOpcode::ResultWindowStatusRead);
+    assert_eq!(frames[10].opcode, SerialOpcode::ResultWindowStatus);
 }

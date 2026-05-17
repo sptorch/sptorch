@@ -6,7 +6,7 @@ This document is the wire-level contract for the Tang9k bring-up path. It is int
 
 - Owner crate: `sptorch-hal::serial`.
 - Dispatch bridge: `sptorch-hal-ffi::serial_backend`.
-- Current operation scope: control frames, 32x32 F32 MatMul tile commands, scratch read/write smoke frames, and a 32-bit result-window smoke readback.
+- Current operation scope: control frames, 32x32 F32 MatMul tile commands, scratch read/write smoke frames, 32-bit result-window smoke readback, and result-window status metadata queries.
 - Out of scope for v1: large tensor payload transfer, arbitrary tile sizes, real UART timing, DMA descriptor rings, and full matrix-result buffer transfer.
 
 ## Frame Format
@@ -48,6 +48,8 @@ Normative rules:
 | `ScratchValue32` | `0x22` | device -> host | `ScratchValue32Payload` |
 | `ResultRead32` | `0x30` | host -> device | `ResultRead32Command` |
 | `ResultValue32` | `0x31` | device -> host | `ResultValue32Payload` |
+| `ResultWindowStatusRead` | `0x32` | host -> device | empty |
+| `ResultWindowStatus` | `0x33` | device -> host | `ResultWindowStatusPayload` |
 | `Ack` | `0x7e` | device -> host | `SerialStatusPayload` |
 | `Error` | `0x7f` | device -> host | `SerialStatusPayload` |
 
@@ -133,6 +135,38 @@ Rules:
 - The Rust host computes the full smoke window through `Matmul32x32Command::smoke_result_window`.
 - The first offset outside the current smoke window must return `Error + HardwareFault` with `detail = requested_offset`.
 - This path only proves command-triggered result-window visibility. Real PE output and larger buffer readback remain future work.
+
+## Result Window Status Query
+
+`ResultWindowStatusRead` is the metadata companion to the 4-word result-window smoke path. It lets the host
+ask whether the target currently has a valid result window and what bounds should be used before issuing
+`ResultRead32` commands.
+
+Payloads:
+
+```text
+ResultWindowStatusRead
+<empty>
+
+ResultWindowStatusPayload
+0       flags          u8   bit0 = valid
+1       word_count     u8
+2..4    stride_bytes   u16
+4..8    base_offset    u32
+8..12   last_sequence  u32
+12..16  reserved       u32 = 0
+```
+
+Rules:
+
+- `ResultWindowStatusRead` must have zero payload bytes.
+- `ResultWindowStatus` must echo the read command sequence, not the MatMul sequence.
+- `flags & 0x01 != 0` means a previous `Matmul32x32` command populated the result window.
+- `word_count` is currently `4`.
+- `stride_bytes` is currently `4`.
+- `base_offset` is the current window base, currently `out_offset[31:0]` from the latest accepted MatMul command.
+- `last_sequence` is the sequence of the latest accepted MatMul command that updated the window.
+- `reserved` must be zero. Hosts must reject non-zero reserved bits to keep v1 extension space clean.
 
 ## Matmul32x32 Command
 
@@ -228,6 +262,8 @@ cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-smoke --
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-smoke --baud 115200 --timeout-ms 1000 --dump-raw
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-window-smoke --baud 115200 --timeout-ms 1000
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-window-smoke --baud 115200 --timeout-ms 1000 --dump-raw
+cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-window-status-smoke --baud 115200 --timeout-ms 1000
+cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-window-status-smoke --baud 115200 --timeout-ms 1000 --dump-raw
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-oob-smoke --baud 115200 --timeout-ms 1000
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-oob-smoke --baud 115200 --timeout-ms 1000 --dump-raw
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --scratch-smoke --baud 115200 --timeout-ms 1000
@@ -241,6 +277,7 @@ Rules:
 - `--matmul-smoke` sends exactly one `Matmul32x32` command frame with sequence `1`.
 - `--result-smoke` sends one `Matmul32x32` command frame with sequence `4`, then one `ResultRead32` frame with sequence `5`, and checks the returned `ResultValue32`.
 - `--result-window-smoke` sends one `Matmul32x32` command frame with sequence `4`, then four `ResultRead32` frames with sequences `5..8`, and checks all four returned `ResultValue32` words.
+- `--result-window-status-smoke` sends one `Matmul32x32` command frame with sequence `4`, then one `ResultWindowStatusRead` frame with sequence `10`, and checks `valid=true`, `word_count=4`, `stride_bytes=4`, `base_offset=0x00002000`, and `last_sequence=4`.
 - `--result-oob-smoke` performs the four-word result-window smoke first, then reads `out_offset + 16` with sequence `9` and requires `Error/HardwareFault`.
 - `--scratch-smoke` sends one `ScratchWrite32` followed by one `ScratchRead32`, then checks the returned `ScratchValue32`.
 - `--dump-raw` prints host request bytes and target response bytes; keep it enabled when debugging checksum drift, stale serial data, or RTL framing changes.
@@ -291,6 +328,13 @@ OK: result window read 0 opcode=ResultValue32, sequence=5, offset=0x00002000, va
 OK: result window read 1 opcode=ResultValue32, sequence=6, offset=0x00002004, value=0x9e3749bc
 OK: result window read 2 opcode=ResultValue32, sequence=7, offset=0x00002008, value=0x3c6ec377
 OK: result window read 3 opcode=ResultValue32, sequence=8, offset=0x0000200c, value=0xdaa65d2e
+OK: result window status opcode=ResultWindowStatus, sequence=10, valid=true, words=4, stride=4, base=0x00002000, last_sequence=4
+```
+
+Real-board status raw response recorded on `COM3 @ 115200` after SRAM programming via `USB Debugger A`:
+
+```text
+53 50 01 33 0a 00 00 00 10 00 00 00 00 00 00 00 01 04 04 00 00 20 00 00 04 00 00 00 00 00 00 00 75 00 79 ea 00 00 00 00
 ```
 
 - Result window read 3 raw response bytes:
@@ -340,7 +384,7 @@ Golden coverage:
 - `Ping` frame with flags, payload, checksum, and padding.
 - `Ack` frame using `SerialStatusPayload { Busy, detail = 0x11223344 }`.
 - `Matmul32x32Command` payload and full frame.
-- `ScratchWrite32`, `ScratchRead32`, `ScratchValue32`, `ResultRead32`, and `ResultValue32` payloads and full frames.
+- `ScratchWrite32`, `ScratchRead32`, `ScratchValue32`, `ResultRead32`, `ResultValue32`, `ResultWindowStatusRead`, and `ResultWindowStatus` payloads and full frames.
 - Stream decoder behavior with leading noise and multiple golden frames in one byte stream.
 
 Any non-Rust implementation should reproduce these exact bytes before being treated as protocol-compatible.

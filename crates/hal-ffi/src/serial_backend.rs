@@ -7,11 +7,11 @@
 
 use sptorch_core_tensor::{register_backend, BackendDispatch, Device};
 use sptorch_hal::serial::{
-    plan_matmul32x32_commands, validate_result_value_response, validate_scratch_value_response,
-    validate_status_response, LoopbackSerialTransport, Matmul32x32Command, Matmul32x32Plan, MatmulMemoryLayout,
-    ResultRead32Command, ScratchRead32Command, ScratchWrite32Command, SerialFrame, SerialOpcode, SerialProtocolError,
-    SerialStatusCode, SerialStatusPayload, SerialStreamDecoder, SerialSubmitQueue, SerialSubmitReport,
-    TANG9K_RESULT_WINDOW_WORD_STRIDE_BYTES,
+    plan_matmul32x32_commands, validate_result_value_response, validate_result_window_status_response,
+    validate_scratch_value_response, validate_status_response, LoopbackSerialTransport, Matmul32x32Command,
+    Matmul32x32Plan, MatmulMemoryLayout, ResultRead32Command, ResultWindowStatusReadCommand, ScratchRead32Command,
+    ScratchWrite32Command, SerialFrame, SerialOpcode, SerialProtocolError, SerialStatusCode, SerialStatusPayload,
+    SerialStreamDecoder, SerialSubmitQueue, SerialSubmitReport, TANG9K_RESULT_WINDOW_WORD_STRIDE_BYTES,
 };
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -534,6 +534,116 @@ pub fn probe_tang9k_result_window_smoke_with_trace(
     }
 
     Ok(traces)
+}
+
+/// 发送 MatMul 后查询 result-window 元信息，验证板端是否记录了最新窗口边界。
+///
+/// 多 word 读回能证明数据口可用，但它没有单独回答“这个窗口现在是否有效、范围多大、来自哪次命令”。
+/// status query 把这些元信息变成稳定协议字段，后续真实 BRAM/FIFO 接入时，host 可以先问状态再决定读哪些 word。
+pub fn probe_tang9k_result_window_status_smoke_with_trace(
+    port_name: &str,
+    baud_rate: u32,
+    timeout: Duration,
+) -> Result<(UartTang9kExchangeTrace, UartTang9kExchangeTrace), UartTang9kExchangeError> {
+    let transport = UartTang9kTransport::new(port_name, baud_rate, timeout);
+    let matmul_command = tang9k_matmul_smoke_frame(4);
+    let matmul_trace = transport.exchange_with_trace(&matmul_command)?;
+    if let Err(error) = validate_status_response(&matmul_command, &matmul_trace.response) {
+        return Err(UartTang9kExchangeError::new(
+            error,
+            matmul_trace.request_bytes,
+            matmul_trace.raw_response_bytes,
+        ));
+    }
+
+    let decoded_matmul = match Matmul32x32Command::decode_payload(&matmul_command.payload) {
+        Ok(command) => command,
+        Err(error) => {
+            return Err(UartTang9kExchangeError::new(
+                error,
+                matmul_trace.request_bytes.clone(),
+                matmul_trace.raw_response_bytes.clone(),
+            ));
+        }
+    };
+    let expected_window = decoded_matmul.smoke_result_window();
+    let expected_base = expected_window
+        .first()
+        .expect("fixed Tang9k result smoke window is non-empty")
+        .offset;
+    let status_command = ResultWindowStatusReadCommand.into_frame(10);
+    let status_trace = transport.exchange_with_trace(&status_command)?;
+    let status = match validate_result_window_status_response(&status_command, &status_trace.response) {
+        Ok(status) => status,
+        Err(error) => {
+            return Err(UartTang9kExchangeError::new(
+                error,
+                status_trace.request_bytes.clone(),
+                status_trace.raw_response_bytes.clone(),
+            ));
+        }
+    };
+
+    if !status.valid() {
+        return Err(UartTang9kExchangeError::new(
+            SerialProtocolError::ResultWindowStatusMismatch {
+                reason: "status.valid flag is not set after MatMul smoke command".into(),
+            },
+            status_trace.request_bytes,
+            status_trace.raw_response_bytes,
+        ));
+    }
+    if status.word_count as usize != expected_window.len() {
+        return Err(UartTang9kExchangeError::new(
+            SerialProtocolError::ResultWindowStatusMismatch {
+                reason: format!(
+                    "word_count expected {}, got {}",
+                    expected_window.len(),
+                    status.word_count
+                ),
+            },
+            status_trace.request_bytes,
+            status_trace.raw_response_bytes,
+        ));
+    }
+    if u32::from(status.stride_bytes) != TANG9K_RESULT_WINDOW_WORD_STRIDE_BYTES {
+        return Err(UartTang9kExchangeError::new(
+            SerialProtocolError::ResultWindowStatusMismatch {
+                reason: format!(
+                    "stride_bytes expected {}, got {}",
+                    TANG9K_RESULT_WINDOW_WORD_STRIDE_BYTES, status.stride_bytes
+                ),
+            },
+            status_trace.request_bytes,
+            status_trace.raw_response_bytes,
+        ));
+    }
+    if status.base_offset != expected_base {
+        return Err(UartTang9kExchangeError::new(
+            SerialProtocolError::ResultWindowStatusMismatch {
+                reason: format!(
+                    "base_offset expected 0x{expected_base:08x}, got 0x{:08x}",
+                    status.base_offset
+                ),
+            },
+            status_trace.request_bytes,
+            status_trace.raw_response_bytes,
+        ));
+    }
+    if status.last_sequence != matmul_command.sequence {
+        return Err(UartTang9kExchangeError::new(
+            SerialProtocolError::ResultWindowStatusMismatch {
+                reason: format!(
+                    "last_sequence expected {}, got {}",
+                    matmul_command.sequence, status.last_sequence
+                ),
+            },
+            status_trace.request_bytes,
+            status_trace.raw_response_bytes,
+        ));
+    }
+
+    Ok((matmul_trace, status_trace))
 }
 
 /// 验证 result-window 的越界读会被板端明确拒绝。

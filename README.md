@@ -50,13 +50,13 @@ External ecosystem repositories:
 
 - Tank9k/Tang 9k bring-up is now treated as a framework capability, not a product feature.
 - `sptorch-hal::topology` models multi-board nodes, serial/PCIe/Ethernet links, connectivity validation, ring allreduce estimates, and matmul shard plans.
-- `sptorch-hal::serial` provides the first Tang9k protocol scaffold: aligned frames, checksum validation, loopback testing, 32x32 MatMul command payloads, `ScratchWrite32`/`ScratchRead32` data-plane smoke frames, and a 4-word `ResultRead32`/`ResultValue32` result-window smoke path.
+- `sptorch-hal::serial` provides the first Tang9k protocol scaffold: aligned frames, checksum validation, loopback testing, 32x32 MatMul command payloads, `ScratchWrite32`/`ScratchRead32` data-plane smoke frames, a 4-word `ResultRead32`/`ResultValue32` result-window smoke path, and `ResultWindowStatusRead` metadata queries for window validity and bounds.
 - `sptorch-hal::serial::SerialSubmitQueue` models host-side sequence allocation, ACK/OK response validation, queue depth, and Busy backpressure before real UART/DMA is wired in.
 - `sptorch-hal::serial::plan_matmul32x32_commands` turns row-major board memory layouts into deterministic Tang9k tile command streams.
 - `sptorch-hal-ffi::serial_backend` registers a Tang9k serial dry-run backend into core dispatch, so MatMul can exercise serial frames and ACK/Error lifecycle before real UART/DMA is connected.
 - `Tang9kSerialTransport` isolates the send/receive boundary, letting loopback, UART, or DMA transports plug into the same dispatch path.
-- `UartTang9kTransport` and `tang9k_probe` provide the first real serial bring-up path: list visible COM ports first, then send protocol `Ping`, `Matmul32x32`, scratch write/read, single result, or 4-word result-window probes after confirming the Tang9k port.
-- `hardware/tang9k/uart_responder` contains the first minimal Gowin bitstream project for real Tang9k smoke testing: it receives serial-v1 `Ping` over USB-UART and returns a checksum-valid `Pong`; it accepts `Matmul32x32` and returns checksum-valid `Ack/Ok`; it stores/reads back one 32-bit scratch value; it also records a deterministic 4-word MatMul summary window for result readback.
+- `UartTang9kTransport` and `tang9k_probe` provide the first real serial bring-up path: list visible COM ports first, then send protocol `Ping`, `Matmul32x32`, scratch write/read, single result, 4-word result-window, OOB, or result-window status probes after confirming the Tang9k port.
+- `hardware/tang9k/uart_responder` contains the first minimal Gowin bitstream project for real Tang9k smoke testing: it receives serial-v1 `Ping` over USB-UART and returns a checksum-valid `Pong`; it accepts `Matmul32x32` and returns checksum-valid `Ack/Ok`; it stores/reads back one 32-bit scratch value; it also records a deterministic 4-word MatMul summary window and exposes its validity/base/stride/last-sequence status for result readback.
 - `sptorch-hal::serial::SerialStreamDecoder` standardizes byte-stream framing for UART/USB-CDC transports before strict frame decoding.
 - Tang9k serial v1 is now documented as a strict wire contract: [docs/tang9k-serial-protocol-v1.md](docs/tang9k-serial-protocol-v1.md).
 - Tang9k protocol conformance is guarded by byte-level golden vectors in `crates/hal/tests/tang9k_serial_golden.rs`.
@@ -78,6 +78,9 @@ cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-smoke --
 # Sends Matmul32x32, then reads back all 4 smoke words from the result window.
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-window-smoke --baud 115200 --timeout-ms 1000
 
+# Sends Matmul32x32, then queries result-window metadata: valid bit, word count, stride, base offset, last sequence.
+cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-window-status-smoke --baud 115200 --timeout-ms 1000
+
 # Verifies that the first out-of-window result offset is rejected with HardwareFault.
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-oob-smoke --baud 115200 --timeout-ms 1000
 
@@ -97,8 +100,10 @@ Host command lifecycle: COM3 @ 115200 -> OK: response opcode=Ack, sequence=1, pa
 Host scratch data-plane: COM3 @ 115200 -> OK: ScratchValue32 offset=0x00000044, value=0x11223344
 Host result window: COM3 @ 115200 -> OK: ResultValue32 offset=0x00002000, value=0x00003005
 Host result window 4-word smoke: COM3 @ 115200 -> [0x00003005, 0x9e3749bc, 0x3c6ec377, 0xdaa65d2e]
+Host result window status: COM3 @ 115200 -> OK: ResultWindowStatus valid=true, words=4, stride=4, base=0x00002000, last_sequence=4
 Host result window OOB: COM3 @ 115200 -> Error HardwareFault detail=0x00002010
 Ack raw response: 53 50 01 7e 01 00 00 00 08 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 b8 59 20 24 00 00 00 00
+ResultWindowStatus raw response: 53 50 01 33 0a 00 00 00 10 00 00 00 00 00 00 00 01 04 04 00 00 20 00 00 04 00 00 00 00 00 00 00 75 00 79 ea 00 00 00 00
 ```
 
 ## Quick Start
