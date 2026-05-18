@@ -129,6 +129,14 @@ tang9k_probe
 | 结果窗口越界拒绝 | `cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-oob-smoke --baud 115200 --timeout-ms 1000 --dump-raw` |
 | 完整 bring-up suite | `cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --bringup-suite --baud 115200 --timeout-ms 1000 --dump-raw` |
 
+给任意 probe 追加 `--record-json <path>`，可以生成机器可读的验收记录。这个文件适合直接附到 issue、wiki 更新或后续 Studio 硬件面板中：
+
+```powershell
+cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --bringup-suite --baud 115200 --timeout-ms 1000 --dump-raw --record-json target\tang9k\bringup-suite.json
+```
+
+JSON 记录包含 schema、时间戳、命令、端口、波特率、timeout、每条 request/response raw bytes、opcode、sequence 和已知 payload 的解码字段。失败时也会写入同一 schema，并保留错误消息以及已收集到的 raw bytes。
+
 ## 工具准备
 
 Windows 当前推荐路径：

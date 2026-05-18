@@ -1,3 +1,4 @@
+use serde::Serialize;
 use sptorch_hal::serial::{
     DeviceInfoPayload, ResultValue32Payload, ResultWindowStatusPayload, ScratchValue32Payload, SerialOpcode,
     SerialStatusPayload,
@@ -8,7 +9,8 @@ use sptorch_hal_ffi::serial_backend::{
     probe_tang9k_result_smoke_with_trace, probe_tang9k_result_window_smoke_with_trace,
     probe_tang9k_result_window_status_smoke_with_trace, probe_tang9k_scratch_smoke_with_trace,
 };
-use std::time::Duration;
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug)]
 struct Args {
@@ -17,9 +19,10 @@ struct Args {
     timeout_ms: u64,
     command: ProbeCommand,
     dump_raw: bool,
+    record_json: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 enum ProbeCommand {
     Ping,
     DeviceInfo,
@@ -40,6 +43,7 @@ impl Default for Args {
             timeout_ms: 1_000,
             command: ProbeCommand::Ping,
             dump_raw: false,
+            record_json: None,
         }
     }
 }
@@ -51,7 +55,7 @@ fn main() {
         std::process::exit(2);
     });
 
-    if let Some(port) = args.port {
+    if let Some(port) = args.port.clone() {
         println!(
             "Probing Tang9k on {port} at {} baud, timeout={}ms, command={:?}",
             args.baud, args.timeout_ms, args.command
@@ -65,8 +69,10 @@ fn main() {
                         if args.dump_raw {
                             print_raw_exchange("response", &trace.request_bytes, &trace.raw_response_bytes);
                         }
+                        write_single_record_if_requested(&args, &port, TraceRecord::from_trace("response", &trace));
                     }
                     Err(err) => {
+                        write_error_record_if_requested(&args, &port, &err);
                         print_probe_error(args.dump_raw, err);
                     }
                 }
@@ -80,8 +86,10 @@ fn main() {
                         if args.dump_raw {
                             print_raw_exchange("device info", &trace.request_bytes, &trace.raw_response_bytes);
                         }
+                        write_single_record_if_requested(&args, &port, TraceRecord::from_trace("device info", &trace));
                     }
                     Err(err) => {
+                        write_error_record_if_requested(&args, &port, &err);
                         print_probe_error(args.dump_raw, err);
                     }
                 }
@@ -171,8 +179,11 @@ fn main() {
                                 &suite.result_oob_rejected_read.raw_response_bytes,
                             );
                         }
+                        let records = suite_records(&suite);
+                        write_suite_record_if_requested(&args, &port, records);
                     }
                     Err(err) => {
+                        write_error_record_if_requested(&args, &port, &err);
                         print_probe_error(args.dump_raw, err);
                     }
                 }
@@ -186,8 +197,10 @@ fn main() {
                         if args.dump_raw {
                             print_raw_exchange("matmul", &trace.request_bytes, &trace.raw_response_bytes);
                         }
+                        write_single_record_if_requested(&args, &port, TraceRecord::from_trace("matmul", &trace));
                     }
                     Err(err) => {
+                        write_error_record_if_requested(&args, &port, &err);
                         print_probe_error(args.dump_raw, err);
                     }
                 }
@@ -211,8 +224,17 @@ fn main() {
                                 &read_trace.raw_response_bytes,
                             );
                         }
+                        write_suite_record_if_requested(
+                            &args,
+                            &port,
+                            vec![
+                                TraceRecord::from_trace("result matmul", &matmul_trace),
+                                TraceRecord::from_trace("result read", &read_trace),
+                            ],
+                        );
                     }
                     Err(err) => {
+                        write_error_record_if_requested(&args, &port, &err);
                         print_probe_error(args.dump_raw, err);
                     }
                 }
@@ -225,6 +247,7 @@ fn main() {
                 );
                 match result {
                     Ok(traces) => {
+                        let mut records = Vec::with_capacity(traces.len());
                         for (idx, trace) in traces.iter().enumerate() {
                             let label = if idx == 0 {
                                 "result window matmul".to_string()
@@ -235,9 +258,12 @@ fn main() {
                             if args.dump_raw {
                                 print_raw_exchange(&label, &trace.request_bytes, &trace.raw_response_bytes);
                             }
+                            records.push(TraceRecord::from_trace(&label, trace));
                         }
+                        write_suite_record_if_requested(&args, &port, records);
                     }
                     Err(err) => {
+                        write_error_record_if_requested(&args, &port, &err);
                         print_probe_error(args.dump_raw, err);
                     }
                 }
@@ -264,8 +290,17 @@ fn main() {
                                 &status_trace.raw_response_bytes,
                             );
                         }
+                        write_suite_record_if_requested(
+                            &args,
+                            &port,
+                            vec![
+                                TraceRecord::from_trace("result window status matmul", &matmul_trace),
+                                TraceRecord::from_trace("result window status", &status_trace),
+                            ],
+                        );
                     }
                     Err(err) => {
+                        write_error_record_if_requested(&args, &port, &err);
                         print_probe_error(args.dump_raw, err);
                     }
                 }
@@ -275,6 +310,7 @@ fn main() {
                     probe_tang9k_result_oob_smoke_with_trace(&port, args.baud, Duration::from_millis(args.timeout_ms));
                 match result {
                     Ok((setup_traces, oob_trace)) => {
+                        let mut records = Vec::with_capacity(setup_traces.len() + 1);
                         for (idx, trace) in setup_traces.iter().enumerate() {
                             let label = if idx == 0 {
                                 "result oob matmul".to_string()
@@ -285,6 +321,7 @@ fn main() {
                             if args.dump_raw {
                                 print_raw_exchange(&label, &trace.request_bytes, &trace.raw_response_bytes);
                             }
+                            records.push(TraceRecord::from_trace(&label, trace));
                         }
                         print_trace_summary("result oob rejected read", &oob_trace);
                         if args.dump_raw {
@@ -294,8 +331,11 @@ fn main() {
                                 &oob_trace.raw_response_bytes,
                             );
                         }
+                        records.push(TraceRecord::from_trace("result oob rejected read", &oob_trace));
+                        write_suite_record_if_requested(&args, &port, records);
                     }
                     Err(err) => {
+                        write_error_record_if_requested(&args, &port, &err);
                         print_probe_error(args.dump_raw, err);
                     }
                 }
@@ -319,8 +359,17 @@ fn main() {
                                 &read_trace.raw_response_bytes,
                             );
                         }
+                        write_suite_record_if_requested(
+                            &args,
+                            &port,
+                            vec![
+                                TraceRecord::from_trace("scratch write", &write_trace),
+                                TraceRecord::from_trace("scratch read", &read_trace),
+                            ],
+                        );
                     }
                     Err(err) => {
+                        write_error_record_if_requested(&args, &port, &err);
                         print_probe_error(args.dump_raw, err);
                     }
                 }
@@ -415,11 +464,266 @@ fn parse_args(raw: Vec<String>) -> Result<Args, String> {
                 args.dump_raw = true;
                 idx += 1;
             }
+            "--record-json" => {
+                let value = raw.get(idx + 1).ok_or("--record-json requires an output path")?;
+                args.record_json = Some(PathBuf::from(value));
+                idx += 2;
+            }
             other => return Err(format!("unknown argument: {other}")),
         }
     }
 
     Ok(args)
+}
+
+#[derive(Debug, Serialize)]
+struct ProbeRecord {
+    schema: &'static str,
+    timestamp_unix_ms: u128,
+    command: ProbeCommand,
+    port: String,
+    baud: u32,
+    timeout_ms: u64,
+    status: &'static str,
+    traces: Vec<TraceRecord>,
+    error: Option<ErrorRecord>,
+}
+
+#[derive(Debug, Serialize)]
+struct TraceRecord {
+    label: String,
+    opcode: String,
+    sequence: u32,
+    payload_len: usize,
+    request_raw_len: usize,
+    request_raw_hex: String,
+    response_raw_len: usize,
+    response_raw_hex: String,
+    decoded: TraceDecodedRecord,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "record_type")]
+enum TraceDecodedRecord {
+    Generic {
+        payload_hex: String,
+    },
+    Status {
+        status: String,
+        detail: u32,
+    },
+    ScratchValue32 {
+        offset: u32,
+        value: u32,
+    },
+    ResultValue32 {
+        offset: u32,
+        value: u32,
+    },
+    ResultWindowStatus {
+        valid: bool,
+        words: u8,
+        stride: u16,
+        base: u32,
+        last_sequence: u32,
+    },
+    DeviceInfo {
+        protocol: u8,
+        kind: u8,
+        responder_version: u16,
+        capabilities: u32,
+        clk_hz: u32,
+        baud: u32,
+        result_words: u8,
+        result_stride: u8,
+        build_id: u32,
+    },
+}
+
+#[derive(Debug, Serialize)]
+struct ErrorRecord {
+    message: String,
+    request_raw_len: usize,
+    request_raw_hex: String,
+    response_raw_len: usize,
+    response_raw_hex: String,
+}
+
+impl TraceRecord {
+    fn from_trace(label: &str, trace: &sptorch_hal_ffi::serial_backend::UartTang9kExchangeTrace) -> Self {
+        Self {
+            label: label.to_string(),
+            opcode: format!("{:?}", trace.response.opcode),
+            sequence: trace.response.sequence,
+            payload_len: trace.response.payload.len(),
+            request_raw_len: trace.request_bytes.len(),
+            request_raw_hex: format_hex(&trace.request_bytes),
+            response_raw_len: trace.raw_response_bytes.len(),
+            response_raw_hex: format_hex(&trace.raw_response_bytes),
+            decoded: decode_trace_payload(trace),
+        }
+    }
+}
+
+fn decode_trace_payload(trace: &sptorch_hal_ffi::serial_backend::UartTang9kExchangeTrace) -> TraceDecodedRecord {
+    match trace.response.opcode {
+        SerialOpcode::ScratchValue32 => ScratchValue32Payload::decode_payload(&trace.response.payload)
+            .map(|payload| TraceDecodedRecord::ScratchValue32 {
+                offset: payload.offset,
+                value: payload.value,
+            })
+            .unwrap_or_else(|_| generic_decoded_payload(&trace.response.payload)),
+        SerialOpcode::ResultValue32 => ResultValue32Payload::decode_payload(&trace.response.payload)
+            .map(|payload| TraceDecodedRecord::ResultValue32 {
+                offset: payload.offset,
+                value: payload.value,
+            })
+            .unwrap_or_else(|_| generic_decoded_payload(&trace.response.payload)),
+        SerialOpcode::ResultWindowStatus => ResultWindowStatusPayload::decode_payload(&trace.response.payload)
+            .map(|payload| TraceDecodedRecord::ResultWindowStatus {
+                valid: payload.valid(),
+                words: payload.word_count,
+                stride: payload.stride_bytes,
+                base: payload.base_offset,
+                last_sequence: payload.last_sequence,
+            })
+            .unwrap_or_else(|_| generic_decoded_payload(&trace.response.payload)),
+        SerialOpcode::DeviceInfo => DeviceInfoPayload::decode_payload(&trace.response.payload)
+            .map(|payload| TraceDecodedRecord::DeviceInfo {
+                protocol: payload.protocol_version,
+                kind: payload.device_kind,
+                responder_version: payload.responder_version,
+                capabilities: payload.capabilities,
+                clk_hz: payload.clk_hz,
+                baud: payload.baud,
+                result_words: payload.result_window_words,
+                result_stride: payload.result_window_stride_bytes,
+                build_id: payload.build_id,
+            })
+            .unwrap_or_else(|_| generic_decoded_payload(&trace.response.payload)),
+        SerialOpcode::Ack | SerialOpcode::Error => SerialStatusPayload::decode(&trace.response.payload)
+            .map(|payload| TraceDecodedRecord::Status {
+                status: format!("{:?}", payload.code),
+                detail: payload.detail,
+            })
+            .unwrap_or_else(|_| generic_decoded_payload(&trace.response.payload)),
+        _ => generic_decoded_payload(&trace.response.payload),
+    }
+}
+
+fn generic_decoded_payload(payload: &[u8]) -> TraceDecodedRecord {
+    TraceDecodedRecord::Generic {
+        payload_hex: format_hex(payload),
+    }
+}
+
+fn suite_records(suite: &sptorch_hal_ffi::serial_backend::Tang9kBringupSuiteTrace) -> Vec<TraceRecord> {
+    let mut records = vec![
+        TraceRecord::from_trace("suite device info", &suite.device_info),
+        TraceRecord::from_trace("suite ping", &suite.ping),
+        TraceRecord::from_trace("suite matmul", &suite.matmul),
+        TraceRecord::from_trace("suite scratch write", &suite.scratch_write),
+        TraceRecord::from_trace("suite scratch read", &suite.scratch_read),
+        TraceRecord::from_trace("suite status matmul", &suite.result_window_status_matmul),
+        TraceRecord::from_trace("suite status", &suite.result_window_status),
+    ];
+    for (idx, trace) in suite.result_window.iter().enumerate() {
+        let label = if idx == 0 {
+            "suite result window matmul".to_string()
+        } else {
+            format!("suite result window read {}", idx - 1)
+        };
+        records.push(TraceRecord::from_trace(&label, trace));
+    }
+    for (idx, trace) in suite.result_oob_setup.iter().enumerate() {
+        let label = if idx == 0 {
+            "suite oob matmul".to_string()
+        } else {
+            format!("suite oob setup read {}", idx - 1)
+        };
+        records.push(TraceRecord::from_trace(&label, trace));
+    }
+    records.push(TraceRecord::from_trace(
+        "suite oob rejected read",
+        &suite.result_oob_rejected_read,
+    ));
+    records
+}
+
+fn write_single_record_if_requested(args: &Args, port: &str, trace: TraceRecord) {
+    write_suite_record_if_requested(args, port, vec![trace]);
+}
+
+fn write_suite_record_if_requested(args: &Args, port: &str, traces: Vec<TraceRecord>) {
+    if let Some(path) = &args.record_json {
+        let record = ProbeRecord {
+            schema: "sptorch.tang9k.probe.v1",
+            timestamp_unix_ms: timestamp_unix_ms(),
+            command: args.command,
+            port: port.to_string(),
+            baud: args.baud,
+            timeout_ms: args.timeout_ms,
+            status: "ok",
+            traces,
+            error: None,
+        };
+        write_record_json_or_exit(path, &record);
+        println!("record_json={}", path.display());
+    }
+}
+
+fn write_error_record_if_requested(
+    args: &Args,
+    port: &str,
+    err: &sptorch_hal_ffi::serial_backend::UartTang9kExchangeError,
+) {
+    if let Some(path) = &args.record_json {
+        let record = ProbeRecord {
+            schema: "sptorch.tang9k.probe.v1",
+            timestamp_unix_ms: timestamp_unix_ms(),
+            command: args.command,
+            port: port.to_string(),
+            baud: args.baud,
+            timeout_ms: args.timeout_ms,
+            status: "error",
+            traces: Vec::new(),
+            error: Some(ErrorRecord {
+                message: err.to_string(),
+                request_raw_len: err.request_bytes.len(),
+                request_raw_hex: format_hex(&err.request_bytes),
+                response_raw_len: err.raw_response_bytes.len(),
+                response_raw_hex: format_hex(&err.raw_response_bytes),
+            }),
+        };
+        write_record_json_or_exit(path, &record);
+        eprintln!("record_json={}", path.display());
+    }
+}
+
+fn write_record_json_or_exit(path: &PathBuf, record: &ProbeRecord) {
+    let json = serde_json::to_string_pretty(record).unwrap_or_else(|err| {
+        eprintln!("failed to encode probe record JSON: {err}");
+        std::process::exit(1);
+    });
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).unwrap_or_else(|err| {
+                eprintln!("failed to create record directory {}: {err}", parent.display());
+                std::process::exit(1);
+            });
+        }
+    }
+    std::fs::write(path, json).unwrap_or_else(|err| {
+        eprintln!("failed to write probe record {}: {err}", path.display());
+        std::process::exit(1);
+    });
+}
+
+fn timestamp_unix_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 fn print_trace_summary(label: &str, trace: &sptorch_hal_ffi::serial_backend::UartTang9kExchangeTrace) {
@@ -584,11 +888,13 @@ fn print_usage() {
         "  cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --scratch-smoke --baud 115200 --timeout-ms 1000"
     );
     println!("  add --dump-raw to print request/response bytes for board bring-up diagnostics");
+    println!("  add --record-json <path> to write a machine-readable acceptance record");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sptorch_hal::serial::{SerialFrame, TANG9K_UART_RESPONDER_BUILD_ID};
 
     #[test]
     fn parse_defaults_to_list_mode() {
@@ -598,6 +904,7 @@ mod tests {
         assert_eq!(args.timeout_ms, 1_000);
         assert_eq!(args.command, ProbeCommand::Ping);
         assert!(!args.dump_raw);
+        assert_eq!(args.record_json, None);
     }
 
     #[test]
@@ -635,6 +942,66 @@ mod tests {
         assert_eq!(args.timeout_ms, 250);
         assert_eq!(args.command, ProbeCommand::MatmulSmoke);
         assert!(args.dump_raw);
+    }
+
+    #[test]
+    fn parse_record_json_argument() {
+        let args = parse_args(vec![
+            "--port".into(),
+            "COM3".into(),
+            "--device-info".into(),
+            "--record-json".into(),
+            "target/tang9k/device-info.json".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(args.port.as_deref(), Some("COM3"));
+        assert_eq!(args.command, ProbeCommand::DeviceInfo);
+        assert_eq!(
+            args.record_json.as_deref(),
+            Some(std::path::Path::new("target/tang9k/device-info.json"))
+        );
+    }
+
+    #[test]
+    fn writes_probe_record_json_for_single_trace() {
+        let output = std::env::temp_dir().join(format!(
+            "sptorch-tang9k-probe-record-{}-{}.json",
+            std::process::id(),
+            timestamp_unix_ms()
+        ));
+        let args = Args {
+            port: Some("COM3".into()),
+            baud: 115_200,
+            timeout_ms: 1_000,
+            command: ProbeCommand::DeviceInfo,
+            dump_raw: false,
+            record_json: Some(output.clone()),
+        };
+        let payload = DeviceInfoPayload::tang9k_uart_responder();
+        let frame = payload.into_frame(11);
+        let trace = sptorch_hal_ffi::serial_backend::UartTang9kExchangeTrace {
+            request_bytes: SerialFrame::new(SerialOpcode::DeviceInfoRead, 11, Vec::new())
+                .encode()
+                .unwrap(),
+            raw_response_bytes: frame.encode().unwrap(),
+            response: frame,
+        };
+
+        write_single_record_if_requested(&args, "COM3", TraceRecord::from_trace("device info", &trace));
+
+        let json = std::fs::read_to_string(&output).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["schema"], "sptorch.tang9k.probe.v1");
+        assert_eq!(value["status"], "ok");
+        assert_eq!(value["command"], "DeviceInfo");
+        assert_eq!(value["traces"][0]["decoded"]["record_type"], "DeviceInfo");
+        assert_eq!(
+            value["traces"][0]["decoded"]["build_id"],
+            TANG9K_UART_RESPONDER_BUILD_ID
+        );
+
+        let _ = std::fs::remove_file(output);
     }
 
     #[test]
