@@ -7,6 +7,7 @@
 - 硬件文档总入口：[SPTorch Hardware Wiki](README.md)
 - 线协议标准：[Tang9k Serial Protocol v1](../tang9k-serial-protocol-v1.md)
 - responder 工程页：[Tang9k UART Responder README](../../hardware/tang9k/uart_responder/README.md)
+- 新板卡页面模板：[Hardware Board Wiki Template](board-template.md)
 
 ## 页面导航
 
@@ -58,13 +59,15 @@ Tang9k 是 SPTorch HAL 的第一块真实 FPGA 控制面验证板。它现在不
 
 | 能力 | Host / 测试 | RTL | COM3 真板 | 说明 |
 | --- | --- | --- | --- | --- |
-| `Ping -> Pong` | 已接入 | 已接入 | 已通过 | 最小 UART 闭环 |
-| `Matmul32x32 -> Ack/Ok` | 已接入 | 已接入 | 已通过 | 当前仍是控制面 smoke，不是真实矩阵计算 |
-| `ScratchWrite32/ScratchRead32` | 已接入 | 已接入 | 已通过 | 第一条非 ACK 数据面回环 |
-| `ResultRead32/ResultValue32` | 已接入 | 已接入 | 已通过 | 读取确定性摘要窗口 |
-| `ResultWindowStatus` | 已接入 | 已接入 | 已通过 | 暴露 valid/base/stride/last-sequence |
-| OOB 拒绝 | 已接入 | 已接入 | 已通过 | 越界读返回 `HardwareFault` |
+| `Ping -> Pong` | 已接入 | 已接入 | 真板已通过 | 最小 UART 闭环 |
+| `Matmul32x32 -> Ack/Ok` | 已接入 | 已接入 | 真板已通过 | 当前仍是控制面 smoke，不是真实矩阵计算 |
+| `ScratchWrite32/ScratchRead32` | 已接入 | 已接入 | 真板已通过 | 第一条非 ACK 数据面回环 |
+| `ResultRead32/ResultValue32` | 已接入 | 已接入 | 真板已通过 | 读取确定性摘要窗口 |
+| `ResultWindowStatus` | 已接入 | 已接入 | 真板已通过 | 暴露 valid/base/stride/last-sequence |
+| OOB 拒绝 | 已接入 | 已接入 | 真板已通过 | 越界读返回 `HardwareFault` |
 | `DeviceInfo` | 已接入 | 已接入 | 待复测 | 最新 RTL 还需重新 build、烧录、COM3 验收 |
+
+状态词遵循硬件 wiki 总入口的验收等级：`已接入` 不等于 `真板已通过`，`待复测` 表示最近实现已经变化，必须重新 build/烧录/COM3 跑通后才能升级。
 
 ## 连接与数据流
 
@@ -290,6 +293,13 @@ cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --bringup-suite -
 已实测通过：
 
 ```text
+date: 2026-05-18
+repo_commit: 未记录；这些结果来自 DeviceInfo 接入前的 responder 实测链路
+host_os: Windows
+toolchain: Gowin V1.9.12.02 SP2
+device: Tang Nano 9K / GW1NR-9C
+transport: USB Debugger A + COM3 @ 115200 8N1
+bitstream_or_firmware: hardware/tang9k/uart_responder/impl/pnr/tang9k_uart_responder.fs
 Gowin SRAM Program: USB Debugger A -> GW1NR-9C, Status Code 0x0003F020
 Host probe: COM3 @ 115200 -> OK: response opcode=Pong, sequence=0, payload_len=0
 Host command lifecycle: COM3 @ 115200 -> OK: response opcode=Ack, sequence=1, payload_len=8
