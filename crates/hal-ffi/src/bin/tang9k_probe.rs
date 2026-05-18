@@ -22,6 +22,7 @@ struct Args {
     command: ProbeCommand,
     dump_raw: bool,
     record_json: Option<PathBuf>,
+    validate_record: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +47,7 @@ impl Default for Args {
             command: ProbeCommand::Ping,
             dump_raw: false,
             record_json: None,
+            validate_record: None,
         }
     }
 }
@@ -62,6 +64,11 @@ fn main() {
         print_usage();
         std::process::exit(2);
     });
+
+    if let Some(path) = args.validate_record.as_ref() {
+        validate_record_or_exit(path);
+        return;
+    }
 
     if let Some(port) = args.port.clone() {
         println!(
@@ -477,11 +484,43 @@ fn parse_args(raw: Vec<String>) -> Result<Args, String> {
                 args.record_json = Some(PathBuf::from(value));
                 idx += 2;
             }
+            "--validate-record" => {
+                let value = raw
+                    .get(idx + 1)
+                    .ok_or("--validate-record requires an input JSON path")?;
+                args.validate_record = Some(PathBuf::from(value));
+                idx += 2;
+            }
             other => return Err(format!("unknown argument: {other}")),
         }
     }
 
     Ok(args)
+}
+
+fn validate_record_or_exit(path: &PathBuf) {
+    let record = ProbeRecord::read_json(path).unwrap_or_else(|err| {
+        eprintln!("failed to read probe record {}: {err}", path.display());
+        std::process::exit(1);
+    });
+    let summary = record.validate_tang9k_acceptance().unwrap_or_else(|err| {
+        eprintln!("probe record validation failed: {err}");
+        std::process::exit(1);
+    });
+
+    println!("OK: probe record accepted");
+    println!("record_path={}", path.display());
+    println!("schema={}", summary.schema);
+    println!("command={}", summary.command);
+    println!("port={}", summary.port);
+    println!("trace_count={}", summary.trace_count);
+    println!("device_info_seen={}", summary.device_info_seen);
+    println!("ping_seen={}", summary.ping_seen);
+    println!("matmul_ack_seen={}", summary.matmul_ack_seen);
+    println!("scratch_seen={}", summary.scratch_seen);
+    println!("result_window_status_seen={}", summary.result_window_status_seen);
+    println!("result_window_words_seen={}", summary.result_window_words_seen);
+    println!("oob_rejection_seen={}", summary.oob_rejection_seen);
 }
 
 fn write_single_record_if_requested(args: &Args, port: &str, trace: TraceRecord) {
@@ -672,11 +711,13 @@ fn print_usage() {
     );
     println!("  add --dump-raw to print request/response bytes for board bring-up diagnostics");
     println!("  add --record-json <path> to write a machine-readable acceptance record");
+    println!("  use --validate-record <path> to validate a saved acceptance record without opening COM ports");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sptorch_hal::serial::DeviceInfoReadCommand;
 
     #[test]
     fn parse_defaults_to_list_mode() {
@@ -687,6 +728,7 @@ mod tests {
         assert_eq!(args.command, ProbeCommand::Ping);
         assert!(!args.dump_raw);
         assert_eq!(args.record_json, None);
+        assert_eq!(args.validate_record, None);
     }
 
     #[test]
@@ -743,6 +785,46 @@ mod tests {
             args.record_json.as_deref(),
             Some(std::path::Path::new("target/tang9k/device-info.json"))
         );
+    }
+
+    #[test]
+    fn parse_validate_record_argument() {
+        let args = parse_args(vec![
+            "--validate-record".into(),
+            "target/tang9k/bringup-suite.json".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.validate_record.as_deref(),
+            Some(std::path::Path::new("target/tang9k/bringup-suite.json"))
+        );
+        assert_eq!(args.port, None);
+    }
+
+    #[test]
+    fn validate_record_entrypoint_accepts_device_info_record() {
+        let output = std::env::temp_dir().join(format!(
+            "sptorch-tang9k-validate-record-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        let metadata = ProbeRecordMetadata::new("DeviceInfo", "COM3", 115_200, 1_000);
+        let frame = DeviceInfoPayload::tang9k_uart_responder().into_frame(11);
+        let trace = sptorch_hal_ffi::serial_backend::UartTang9kExchangeTrace {
+            request_bytes: DeviceInfoReadCommand.into_frame(11).encode().unwrap(),
+            raw_response_bytes: frame.encode().unwrap(),
+            response: frame,
+        };
+        let record = ProbeRecord::ok(&metadata, vec![TraceRecord::from_trace("device info", &trace)]);
+        record.write_pretty_json(&output).unwrap();
+
+        validate_record_or_exit(&output);
+
+        let _ = std::fs::remove_file(output);
     }
 
     #[test]

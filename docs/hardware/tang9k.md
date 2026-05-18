@@ -128,6 +128,7 @@ tang9k_probe
 | 结果窗口 4-word 读回 | `cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-window-smoke --baud 115200 --timeout-ms 1000 --dump-raw` |
 | 结果窗口越界拒绝 | `cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-oob-smoke --baud 115200 --timeout-ms 1000 --dump-raw` |
 | 完整 bring-up suite | `cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --bringup-suite --baud 115200 --timeout-ms 1000 --dump-raw` |
+| 离线校验验收记录 | `cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --validate-record target\tang9k\bringup-suite.json` |
 
 给任意 probe 追加 `--record-json <path>`，可以生成机器可读的验收记录。这个文件适合直接附到 issue、wiki 更新或后续 Studio 硬件面板中：
 
