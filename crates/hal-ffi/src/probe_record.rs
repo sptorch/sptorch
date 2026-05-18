@@ -225,6 +225,7 @@ pub enum ProbeRecordValidationError {
     DeviceInfoMismatch { reason: String },
     ResultWindowStatusMismatch { reason: String },
     ResultWindowWordCountMismatch { expected: usize, actual: usize },
+    UnknownCommand { command: String },
     OobRejectionMissing,
 }
 
@@ -244,6 +245,7 @@ impl std::fmt::Display for ProbeRecordValidationError {
                 f,
                 "probe record result-window word count mismatch: expected {expected}, got {actual}"
             ),
+            Self::UnknownCommand { command } => write!(f, "probe record command is unknown: {command}"),
             Self::OobRejectionMissing => f.write_str("probe record is missing OOB HardwareFault rejection"),
         }
     }
@@ -307,15 +309,27 @@ pub fn validate_tang9k_acceptance(record: &ProbeRecord) -> Result<Tang9kAcceptan
             )
     });
 
-    if !device_info_seen {
-        return Err(ProbeRecordValidationError::MissingTrace {
-            label_hint: "DeviceInfo",
-        });
-    }
-
     match record.command.as_str() {
-        "DeviceInfo" => {}
+        "DeviceInfo" => {
+            if !device_info_seen {
+                return Err(ProbeRecordValidationError::MissingTrace {
+                    label_hint: "DeviceInfo",
+                });
+            }
+        }
+        "Ping" => {
+            if !ping_seen {
+                return Err(ProbeRecordValidationError::MissingTrace {
+                    label_hint: "Ping/Pong",
+                });
+            }
+        }
         "BringupSuite" => {
+            if !device_info_seen {
+                return Err(ProbeRecordValidationError::MissingTrace {
+                    label_hint: "DeviceInfo",
+                });
+            }
             if !ping_seen {
                 return Err(ProbeRecordValidationError::MissingTrace {
                     label_hint: "Ping/Pong",
@@ -346,7 +360,78 @@ pub fn validate_tang9k_acceptance(record: &ProbeRecord) -> Result<Tang9kAcceptan
                 return Err(ProbeRecordValidationError::OobRejectionMissing);
             }
         }
-        _ => {}
+        "MatmulSmoke" => {
+            if !matmul_ack_seen {
+                return Err(ProbeRecordValidationError::MissingTrace {
+                    label_hint: "Matmul32x32 Ack/Ok",
+                });
+            }
+        }
+        "ResultSmoke" => {
+            if !matmul_ack_seen {
+                return Err(ProbeRecordValidationError::MissingTrace {
+                    label_hint: "Matmul32x32 Ack/Ok",
+                });
+            }
+            if result_window_words_seen == 0 {
+                return Err(ProbeRecordValidationError::MissingTrace {
+                    label_hint: "ResultValue32",
+                });
+            }
+        }
+        "ResultWindowSmoke" => {
+            if !matmul_ack_seen {
+                return Err(ProbeRecordValidationError::MissingTrace {
+                    label_hint: "Matmul32x32 Ack/Ok",
+                });
+            }
+            if result_window_words_seen != TANG9K_RESULT_WINDOW_SMOKE_WORDS {
+                return Err(ProbeRecordValidationError::ResultWindowWordCountMismatch {
+                    expected: TANG9K_RESULT_WINDOW_SMOKE_WORDS,
+                    actual: result_window_words_seen,
+                });
+            }
+        }
+        "ResultWindowStatusSmoke" => {
+            if !matmul_ack_seen {
+                return Err(ProbeRecordValidationError::MissingTrace {
+                    label_hint: "Matmul32x32 Ack/Ok",
+                });
+            }
+            if !result_window_status_seen {
+                return Err(ProbeRecordValidationError::MissingTrace {
+                    label_hint: "ResultWindowStatus",
+                });
+            }
+        }
+        "ResultOobSmoke" => {
+            if !matmul_ack_seen {
+                return Err(ProbeRecordValidationError::MissingTrace {
+                    label_hint: "Matmul32x32 Ack/Ok",
+                });
+            }
+            if result_window_words_seen != TANG9K_RESULT_WINDOW_SMOKE_WORDS {
+                return Err(ProbeRecordValidationError::ResultWindowWordCountMismatch {
+                    expected: TANG9K_RESULT_WINDOW_SMOKE_WORDS,
+                    actual: result_window_words_seen,
+                });
+            }
+            if !oob_rejection_seen {
+                return Err(ProbeRecordValidationError::OobRejectionMissing);
+            }
+        }
+        "ScratchSmoke" => {
+            if !scratch_seen {
+                return Err(ProbeRecordValidationError::MissingTrace {
+                    label_hint: "ScratchValue32",
+                });
+            }
+        }
+        other => {
+            return Err(ProbeRecordValidationError::UnknownCommand {
+                command: other.to_string(),
+            });
+        }
     }
 
     Ok(Tang9kAcceptanceSummary {
@@ -738,6 +823,43 @@ mod tests {
             ProbeRecordValidationError::ResultWindowWordCountMismatch {
                 expected: TANG9K_RESULT_WINDOW_SMOKE_WORDS,
                 actual: 0
+            }
+        );
+    }
+
+    #[test]
+    fn accepts_single_command_records_without_device_info() {
+        let ping = ProbeRecord::ok(
+            &ProbeRecordMetadata::new("Ping", "COM3", 115_200, 1_000),
+            vec![TraceRecord::from_trace(
+                "response",
+                &simple_trace(SerialOpcode::Ping, SerialFrame::new(SerialOpcode::Pong, 0, Vec::new())),
+            )],
+        );
+        assert!(ping.validate_tang9k_acceptance().unwrap().ping_seen);
+
+        let matmul = ProbeRecord::ok(
+            &ProbeRecordMetadata::new("MatmulSmoke", "COM3", 115_200, 1_000),
+            vec![TraceRecord::from_trace(
+                "matmul",
+                &simple_trace(
+                    SerialOpcode::Matmul32x32,
+                    SerialFrame::ack(1, SerialStatusPayload::ok()),
+                ),
+            )],
+        );
+        assert!(matmul.validate_tang9k_acceptance().unwrap().matmul_ack_seen);
+    }
+
+    #[test]
+    fn rejects_unknown_command_records() {
+        let record = ProbeRecord::ok(&ProbeRecordMetadata::new("Mystery", "COM3", 115_200, 1_000), Vec::new());
+
+        let err = record.validate_tang9k_acceptance().unwrap_err();
+        assert_eq!(
+            err,
+            ProbeRecordValidationError::UnknownCommand {
+                command: "Mystery".into()
             }
         );
     }

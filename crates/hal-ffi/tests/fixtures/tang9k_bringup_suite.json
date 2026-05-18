@@ -1,0 +1,201 @@
+{
+  "schema": "sptorch.tang9k.probe.v1",
+  "timestamp_unix_ms": 1779145805928,
+  "command": "BringupSuite",
+  "port": "COM3",
+  "baud": 115200,
+  "timeout_ms": 1000,
+  "status": "ok",
+  "traces": [
+    {
+      "label": "suite device info",
+      "opcode": "DeviceInfo",
+      "sequence": 11,
+      "payload_len": 24,
+      "request_raw_len": 24,
+      "request_raw_hex": "53 50 01 03 0b 00 00 00 00 00 00 00 00 00 00 00 19 a8 15 b6 00 00 00 00",
+      "response_raw_len": 48,
+      "response_raw_hex": "53 50 01 04 0b 00 00 00 18 00 00 00 00 00 00 00 01 01 01 00 0f 00 00 00 c0 fc 9b 01 00 c2 01 00 04 04 00 00 18 05 26 20 f2 2b 98 83 00 00 00 00",
+      "decoded": {
+        "record_type": "DeviceInfo",
+        "protocol": 1,
+        "kind": 1,
+        "responder_version": 1,
+        "capabilities": 15,
+        "clk_hz": 27000000,
+        "baud": 115200,
+        "result_words": 4,
+        "result_stride": 4,
+        "build_id": 539362584
+      }
+    },
+    {
+      "label": "suite ping",
+      "opcode": "Pong",
+      "sequence": 0,
+      "payload_len": 0,
+      "request_raw_len": 32,
+      "request_raw_hex": "53 50 01 01 00 00 00 00 0c 00 00 00 00 00 00 00 73 70 74 6f 72 63 68 2d 70 69 6e 67 ae 3c 1d a7",
+      "response_raw_len": 24,
+      "response_raw_hex": "53 50 01 02 00 00 00 00 00 00 00 00 00 00 00 00 e5 33 53 24 00 00 00 00",
+      "decoded": {
+        "record_type": "Generic",
+        "payload_hex": "<empty>"
+      }
+    },
+    {
+      "label": "suite matmul",
+      "opcode": "Ack",
+      "sequence": 1,
+      "payload_len": 8,
+      "request_raw_len": 56,
+      "request_raw_hex": "53 50 01 10 01 00 00 00 20 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 10 00 00 00 00 00 00 00 20 00 00 00 00 00 00 05 00 00 00 9b 71 27 21 00 00 00 00",
+      "response_raw_len": 32,
+      "response_raw_hex": "53 50 01 7e 01 00 00 00 08 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 b8 59 20 24 00 00 00 00",
+      "decoded": {
+        "record_type": "Status",
+        "status": "Ok",
+        "detail": 0
+      }
+    },
+    {
+      "label": "suite scratch write",
+      "opcode": "Ack",
+      "sequence": 2,
+      "payload_len": 8,
+      "request_raw_len": 32,
+      "request_raw_hex": "53 50 01 20 02 00 00 00 08 00 00 00 00 00 00 00 44 00 00 00 44 33 22 11 19 fe 6d 94 00 00 00 00",
+      "response_raw_len": 32,
+      "response_raw_hex": "53 50 01 7e 02 00 00 00 08 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ab 49 09 3b 00 00 00 00",
+      "decoded": {
+        "record_type": "Status",
+        "status": "Ok",
+        "detail": 0
+      }
+    },
+    {
+      "label": "suite scratch read",
+      "opcode": "ScratchValue32",
+      "sequence": 3,
+      "payload_len": 8,
+      "request_raw_len": 24,
+      "request_raw_hex": "53 50 01 21 03 00 00 00 04 00 00 00 00 00 00 00 44 00 00 00 9f 30 c1 7d",
+      "response_raw_len": 32,
+      "response_raw_hex": "53 50 01 22 03 00 00 00 08 00 00 00 00 00 00 00 44 00 00 00 44 33 22 11 ce aa 99 46 00 00 00 00",
+      "decoded": {
+        "record_type": "ScratchValue32",
+        "offset": 68,
+        "value": 287454020
+      }
+    },
+    {
+      "label": "suite status matmul",
+      "opcode": "Ack",
+      "sequence": 4,
+      "payload_len": 8,
+      "request_raw_len": 56,
+      "request_raw_hex": "53 50 01 10 04 00 00 00 20 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 10 00 00 00 00 00 00 00 20 00 00 00 00 00 00 05 00 00 00 ce d4 1b d3 00 00 00 00",
+      "response_raw_len": 32,
+      "response_raw_hex": "53 50 01 7e 04 00 00 00 08 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 4d 94 a4 9f 00 00 00 00",
+      "decoded": {
+        "record_type": "Status",
+        "status": "Ok",
+        "detail": 0
+      }
+    },
+    {
+      "label": "suite status",
+      "opcode": "ResultWindowStatus",
+      "sequence": 10,
+      "payload_len": 16,
+      "request_raw_len": 24,
+      "request_raw_hex": "53 50 01 32 0a 00 00 00 00 00 00 00 00 00 00 00 ff 67 19 d9 00 00 00 00",
+      "response_raw_len": 40,
+      "response_raw_hex": "53 50 01 33 0a 00 00 00 10 00 00 00 00 00 00 00 01 04 04 00 00 20 00 00 04 00 00 00 00 00 00 00 75 00 79 ea 00 00 00 00",
+      "decoded": {
+        "record_type": "ResultWindowStatus",
+        "valid": true,
+        "words": 4,
+        "stride": 4,
+        "base": 8192,
+        "last_sequence": 4
+      }
+    },
+    {
+      "label": "suite result window read 0",
+      "opcode": "ResultValue32",
+      "sequence": 5,
+      "payload_len": 8,
+      "request_raw_len": 24,
+      "request_raw_hex": "53 50 01 30 05 00 00 00 04 00 00 00 00 00 00 00 00 20 00 00 de 45 fe 40",
+      "response_raw_len": 32,
+      "response_raw_hex": "53 50 01 31 05 00 00 00 08 00 00 00 00 00 00 00 00 20 00 00 05 30 00 00 d4 d0 6f 06 00 00 00 00",
+      "decoded": {
+        "record_type": "ResultValue32",
+        "offset": 8192,
+        "value": 12293
+      }
+    },
+    {
+      "label": "suite result window read 1",
+      "opcode": "ResultValue32",
+      "sequence": 6,
+      "payload_len": 8,
+      "request_raw_len": 24,
+      "request_raw_hex": "53 50 01 30 06 00 00 00 04 00 00 00 00 00 00 00 04 20 00 00 19 9a 9e 85",
+      "response_raw_len": 32,
+      "response_raw_hex": "53 50 01 31 06 00 00 00 08 00 00 00 00 00 00 00 04 20 00 00 bc 49 37 9e 38 d4 0f de 00 00 00 00",
+      "decoded": {
+        "record_type": "ResultValue32",
+        "offset": 8196,
+        "value": 2654423484
+      }
+    },
+    {
+      "label": "suite result window read 2",
+      "opcode": "ResultValue32",
+      "sequence": 7,
+      "payload_len": 8,
+      "request_raw_len": 24,
+      "request_raw_hex": "53 50 01 30 07 00 00 00 04 00 00 00 00 00 00 00 08 20 00 00 94 1b 92 10",
+      "response_raw_len": 32,
+      "response_raw_hex": "53 50 01 31 07 00 00 00 08 00 00 00 00 00 00 00 08 20 00 00 77 c3 6e 3c a7 29 0b 83 00 00 00 00",
+      "decoded": {
+        "record_type": "ResultValue32",
+        "offset": 8200,
+        "value": 1013891959
+      }
+    },
+    {
+      "label": "suite result window read 3",
+      "opcode": "ResultValue32",
+      "sequence": 8,
+      "payload_len": 8,
+      "request_raw_len": 24,
+      "request_raw_hex": "53 50 01 30 08 00 00 00 04 00 00 00 00 00 00 00 0c 20 00 00 1f 05 48 83",
+      "response_raw_len": 32,
+      "response_raw_hex": "53 50 01 31 08 00 00 00 08 00 00 00 00 00 00 00 0c 20 00 00 2e 5d a6 da 29 4f 5b 2f 00 00 00 00",
+      "decoded": {
+        "record_type": "ResultValue32",
+        "offset": 8204,
+        "value": 3668335918
+      }
+    },
+    {
+      "label": "suite oob rejected read",
+      "opcode": "Error",
+      "sequence": 9,
+      "payload_len": 8,
+      "request_raw_len": 24,
+      "request_raw_hex": "53 50 01 30 09 00 00 00 04 00 00 00 00 00 00 00 10 20 00 00 42 ca 68 d0",
+      "response_raw_len": 32,
+      "response_raw_hex": "53 50 01 7f 09 00 00 00 08 00 00 00 00 00 00 00 05 00 00 00 10 20 00 00 5a e7 19 48 00 00 00 00",
+      "decoded": {
+        "record_type": "Status",
+        "status": "HardwareFault",
+        "detail": 8208
+      }
+    }
+  ],
+  "error": null
+}

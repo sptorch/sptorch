@@ -17,6 +17,7 @@
 - [连接与数据流](#连接与数据流)
 - [仓库地图](#仓库地图)
 - [命令速查](#命令速查)
+- [离线回归夹具](#离线回归夹具)
 - [工具准备](#工具准备)
 - [构建 bitstream](#构建-bitstream)
 - [SRAM 烧录](#sram-烧录)
@@ -137,6 +138,32 @@ cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --bringup-suite -
 ```
 
 JSON 记录包含 schema、时间戳、命令、端口、波特率、timeout、每条 request/response raw bytes、opcode、sequence 和已知 payload 的解码字段。失败时也会写入同一 schema，并保留错误消息以及已收集到的 raw bytes。库层的 `sptorch_hal_ffi::probe_record::ProbeRecord::read_json` 和 `validate_tang9k_acceptance` 可以把记录读回并做基础验收校验，后续 CI、Studio 或多板脚本不需要重新解析 CLI 文本。
+
+## 离线回归夹具
+
+仓库内保留了一份合成的 bring-up suite 记录：
+
+```text
+crates/hal-ffi/tests/fixtures/tang9k_bringup_suite.json
+```
+
+它不是 COM3 真实板卡日志，而是固定的协议契约样本，用来约束 `DeviceInfo`、`Ping`、`Matmul32x32`、scratch、result-window 和 OOB 拒绝这些字段的 JSON 形状。这样一来，即使手边没有 Tang9k，也能在 CI 里发现 host 记录格式、解码字段或验收规则被意外改坏。
+
+常规回归命令：
+
+```powershell
+cargo test -p sptorch-hal-ffi --test tang9k_probe_record_fixture -- --nocapture
+```
+
+如果 serial v1 的 wire contract 确实升级了，可以显式重新生成夹具：
+
+```powershell
+$env:GENERATE_TANG9K_FIXTURE = '1'
+cargo test -p sptorch-hal-ffi --test tang9k_probe_record_fixture regenerate_fixture_when_requested -- --nocapture
+Remove-Item Env:GENERATE_TANG9K_FIXTURE
+```
+
+重新生成夹具后必须同时检查 `docs/tang9k-serial-protocol-v1.md`、`crates/hal/src/serial.rs`、`crates/hal/tests/tang9k_serial_golden.rs` 和 responder RTL。夹具变动只能说明 host 侧契约已更新，不能替代真实 Gowin build、SRAM 烧录和 COM3 验收。
 
 ## 工具准备
 
