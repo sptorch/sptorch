@@ -135,7 +135,7 @@ tang9k_probe
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --bringup-suite --baud 115200 --timeout-ms 1000 --dump-raw --record-json target\tang9k\bringup-suite.json
 ```
 
-JSON 记录包含 schema、时间戳、命令、端口、波特率、timeout、每条 request/response raw bytes、opcode、sequence 和已知 payload 的解码字段。失败时也会写入同一 schema，并保留错误消息以及已收集到的 raw bytes。
+JSON 记录包含 schema、时间戳、命令、端口、波特率、timeout、每条 request/response raw bytes、opcode、sequence 和已知 payload 的解码字段。失败时也会写入同一 schema，并保留错误消息以及已收集到的 raw bytes。库层的 `sptorch_hal_ffi::probe_record::ProbeRecord::read_json` 和 `validate_tang9k_acceptance` 可以把记录读回并做基础验收校验，后续 CI、Studio 或多板脚本不需要重新解析 CLI 文本。
 
 ## 工具准备
 
