@@ -6,7 +6,8 @@
 // Ack/Ok, so the host can test command submission before any PE array or DMA
 // datapath is introduced.  A small result window is also exposed so the host can
 // prove that a Matmul command updated board-visible state before real PE output
-// readback is wired in.
+// readback is wired in.  DeviceInfo lets the host prove which responder version
+// is actually programmed before it runs the longer acceptance suite.
 
 module tang9k_uart_responder (
     input  wire       clk,
@@ -27,6 +28,8 @@ module tang9k_uart_responder (
     localparam [7:0] SERIAL_VERSION = 8'h01;
     localparam [7:0] OPCODE_PING   = 8'h01;
     localparam [7:0] OPCODE_PONG   = 8'h02;
+    localparam [7:0] OPCODE_DEVICE_INFO_READ = 8'h03;
+    localparam [7:0] OPCODE_DEVICE_INFO = 8'h04;
     localparam [7:0] OPCODE_MATMUL32X32 = 8'h10;
     localparam [7:0] OPCODE_SCRATCH_WRITE32 = 8'h20;
     localparam [7:0] OPCODE_SCRATCH_READ32  = 8'h21;
@@ -48,6 +51,7 @@ module tang9k_uart_responder (
     localparam [15:0] RESULT_READ32_PAYLOAD_LEN = 16'd4;
     localparam [15:0] RESULT_VALUE32_PAYLOAD_LEN = 16'd8;
     localparam [15:0] RESULT_WINDOW_STATUS_PAYLOAD_LEN = 16'd16;
+    localparam [15:0] DEVICE_INFO_PAYLOAD_LEN = 16'd24;
     localparam [7:0] RESULT_WINDOW_WORD_COUNT = 8'd4;
     localparam [7:0] RESULT_WINDOW_STATUS_VALID = 8'h01;
     localparam [31:0] RESULT_WORD_STRIDE_BYTES = 32'd4;
@@ -60,6 +64,12 @@ module tang9k_uart_responder (
     localparam [15:0] STATUS_UNSUPPORTED_OPCODE = 16'h0002;
     localparam [15:0] STATUS_INVALID_PAYLOAD    = 16'h0003;
     localparam [15:0] STATUS_HARDWARE_FAULT     = 16'h0005;
+    localparam [7:0]  DEVICE_KIND_UART_RESPONDER = 8'd1;
+    localparam [15:0] RESPONDER_VERSION          = 16'd1;
+    localparam [31:0] RESPONDER_CAPABILITIES     = 32'h0000000f;
+    localparam [31:0] RESPONDER_CLK_HZ           = 32'd27000000;
+    localparam [31:0] RESPONDER_BAUD             = 32'd115200;
+    localparam [31:0] RESPONDER_BUILD_ID         = 32'h20260518;
 
     localparam [3:0] RX_WAIT_S  = 4'd0;
     localparam [3:0] RX_WAIT_P  = 4'd1;
@@ -200,6 +210,8 @@ module tang9k_uart_responder (
         begin
             if (response_opcode == OPCODE_PONG) begin
                 response_last_index = 6'd23;
+            end else if (response_opcode == OPCODE_DEVICE_INFO) begin
+                response_last_index = 6'd47;
             end else if (response_opcode == OPCODE_RESULT_WINDOW_STATUS) begin
                 response_last_index = 6'd39;
             end else begin
@@ -213,6 +225,8 @@ module tang9k_uart_responder (
         begin
             if (response_opcode == OPCODE_PONG) begin
                 response_checksum_body_last_index = 6'd15;
+            end else if (response_opcode == OPCODE_DEVICE_INFO) begin
+                response_checksum_body_last_index = 6'd39;
             end else if (response_opcode == OPCODE_RESULT_WINDOW_STATUS) begin
                 response_checksum_body_last_index = 6'd31;
             end else begin
@@ -233,6 +247,13 @@ module tang9k_uart_responder (
         input [7:0] response_opcode;
         begin
             is_result_window_status_response = response_opcode == OPCODE_RESULT_WINDOW_STATUS;
+        end
+    endfunction
+
+    function is_device_info_response;
+        input [7:0] response_opcode;
+        begin
+            is_device_info_response = response_opcode == OPCODE_DEVICE_INFO;
         end
     endfunction
 
@@ -260,6 +281,8 @@ module tang9k_uart_responder (
                 6'd8: begin
                     if (response_opcode == OPCODE_PONG) begin
                         response_byte = 8'h00;
+                    end else if (is_device_info_response(response_opcode)) begin
+                        response_byte = DEVICE_INFO_PAYLOAD_LEN[7:0];
                     end else if (is_value_response(response_opcode)) begin
                         response_byte = response_opcode == OPCODE_RESULT_VALUE32
                             ? RESULT_VALUE32_PAYLOAD_LEN[7:0]
@@ -273,6 +296,8 @@ module tang9k_uart_responder (
                 6'd9: begin
                     if (response_opcode == OPCODE_PONG) begin
                         response_byte = 8'h00;
+                    end else if (is_device_info_response(response_opcode)) begin
+                        response_byte = DEVICE_INFO_PAYLOAD_LEN[15:8];
                     end else if (is_value_response(response_opcode)) begin
                         response_byte = response_opcode == OPCODE_RESULT_VALUE32
                             ? RESULT_VALUE32_PAYLOAD_LEN[15:8]
@@ -290,7 +315,9 @@ module tang9k_uart_responder (
                 6'd14: response_byte = 8'h00;
                 6'd15: response_byte = 8'h00;
                 6'd16: begin
-                    if (response_opcode == OPCODE_PONG) begin
+                    if (is_device_info_response(response_opcode)) begin
+                        response_byte = SERIAL_VERSION;
+                    end else if (response_opcode == OPCODE_PONG) begin
                         response_byte = csum[7:0];
                     end else if (is_value_response(response_opcode)) begin
                         response_byte = scratch_offset[7:0];
@@ -301,7 +328,9 @@ module tang9k_uart_responder (
                     end
                 end
                 6'd17: begin
-                    if (response_opcode == OPCODE_PONG) begin
+                    if (is_device_info_response(response_opcode)) begin
+                        response_byte = DEVICE_KIND_UART_RESPONDER;
+                    end else if (response_opcode == OPCODE_PONG) begin
                         response_byte = csum[15:8];
                     end else if (is_value_response(response_opcode)) begin
                         response_byte = scratch_offset[15:8];
@@ -312,7 +341,9 @@ module tang9k_uart_responder (
                     end
                 end
                 6'd18: begin
-                    if (response_opcode == OPCODE_PONG) begin
+                    if (is_device_info_response(response_opcode)) begin
+                        response_byte = RESPONDER_VERSION[7:0];
+                    end else if (response_opcode == OPCODE_PONG) begin
                         response_byte = csum[23:16];
                     end else if (is_value_response(response_opcode)) begin
                         response_byte = scratch_offset[23:16];
@@ -323,7 +354,9 @@ module tang9k_uart_responder (
                     end
                 end
                 6'd19: begin
-                    if (response_opcode == OPCODE_PONG) begin
+                    if (is_device_info_response(response_opcode)) begin
+                        response_byte = RESPONDER_VERSION[15:8];
+                    end else if (response_opcode == OPCODE_PONG) begin
                         response_byte = csum[31:24];
                     end else if (is_value_response(response_opcode)) begin
                         response_byte = scratch_offset[31:24];
@@ -334,7 +367,9 @@ module tang9k_uart_responder (
                     end
                 end
                 6'd20: begin
-                    if (response_opcode == OPCODE_PONG) begin
+                    if (is_device_info_response(response_opcode)) begin
+                        response_byte = RESPONDER_CAPABILITIES[7:0];
+                    end else if (response_opcode == OPCODE_PONG) begin
                         response_byte = 8'h00;
                     end else if (is_value_response(response_opcode)) begin
                         response_byte = scratch_value[7:0];
@@ -345,7 +380,9 @@ module tang9k_uart_responder (
                     end
                 end
                 6'd21: begin
-                    if (response_opcode == OPCODE_PONG) begin
+                    if (is_device_info_response(response_opcode)) begin
+                        response_byte = RESPONDER_CAPABILITIES[15:8];
+                    end else if (response_opcode == OPCODE_PONG) begin
                         response_byte = 8'h00;
                     end else if (is_value_response(response_opcode)) begin
                         response_byte = scratch_value[15:8];
@@ -356,7 +393,9 @@ module tang9k_uart_responder (
                     end
                 end
                 6'd22: begin
-                    if (response_opcode == OPCODE_PONG) begin
+                    if (is_device_info_response(response_opcode)) begin
+                        response_byte = RESPONDER_CAPABILITIES[23:16];
+                    end else if (response_opcode == OPCODE_PONG) begin
                         response_byte = 8'h00;
                     end else if (is_value_response(response_opcode)) begin
                         response_byte = scratch_value[23:16];
@@ -367,7 +406,9 @@ module tang9k_uart_responder (
                     end
                 end
                 6'd23: begin
-                    if (response_opcode == OPCODE_PONG) begin
+                    if (is_device_info_response(response_opcode)) begin
+                        response_byte = RESPONDER_CAPABILITIES[31:24];
+                    end else if (response_opcode == OPCODE_PONG) begin
                         response_byte = 8'h00;
                     end else if (is_value_response(response_opcode)) begin
                         response_byte = scratch_value[31:24];
@@ -378,41 +419,159 @@ module tang9k_uart_responder (
                     end
                 end
                 6'd24: begin
-                    if (is_result_window_status_response(response_opcode)) begin
+                    if (is_device_info_response(response_opcode)) begin
+                        response_byte = RESPONDER_CLK_HZ[7:0];
+                    end else if (is_result_window_status_response(response_opcode)) begin
                         response_byte = last_sequence[7:0];
                     end else begin
                         response_byte = csum[7:0];
                     end
                 end
                 6'd25: begin
-                    if (is_result_window_status_response(response_opcode)) begin
+                    if (is_device_info_response(response_opcode)) begin
+                        response_byte = RESPONDER_CLK_HZ[15:8];
+                    end else if (is_result_window_status_response(response_opcode)) begin
                         response_byte = last_sequence[15:8];
                     end else begin
                         response_byte = csum[15:8];
                     end
                 end
                 6'd26: begin
-                    if (is_result_window_status_response(response_opcode)) begin
+                    if (is_device_info_response(response_opcode)) begin
+                        response_byte = RESPONDER_CLK_HZ[23:16];
+                    end else if (is_result_window_status_response(response_opcode)) begin
                         response_byte = last_sequence[23:16];
                     end else begin
                         response_byte = csum[23:16];
                     end
                 end
                 6'd27: begin
-                    if (is_result_window_status_response(response_opcode)) begin
+                    if (is_device_info_response(response_opcode)) begin
+                        response_byte = RESPONDER_CLK_HZ[31:24];
+                    end else if (is_result_window_status_response(response_opcode)) begin
                         response_byte = last_sequence[31:24];
                     end else begin
                         response_byte = csum[31:24];
                     end
                 end
-                6'd28: response_byte = 8'h00;
-                6'd29: response_byte = 8'h00;
-                6'd30: response_byte = 8'h00;
-                6'd31: response_byte = 8'h00;
-                6'd32: response_byte = csum[7:0];
-                6'd33: response_byte = csum[15:8];
-                6'd34: response_byte = csum[23:16];
-                6'd35: response_byte = csum[31:24];
+                6'd28: begin
+                    if (is_device_info_response(response_opcode)) begin
+                        response_byte = RESPONDER_BAUD[7:0];
+                    end else begin
+                        response_byte = 8'h00;
+                    end
+                end
+                6'd29: begin
+                    if (is_device_info_response(response_opcode)) begin
+                        response_byte = RESPONDER_BAUD[15:8];
+                    end else begin
+                        response_byte = 8'h00;
+                    end
+                end
+                6'd30: begin
+                    if (is_device_info_response(response_opcode)) begin
+                        response_byte = RESPONDER_BAUD[23:16];
+                    end else begin
+                        response_byte = 8'h00;
+                    end
+                end
+                6'd31: begin
+                    if (is_device_info_response(response_opcode)) begin
+                        response_byte = RESPONDER_BAUD[31:24];
+                    end else begin
+                        response_byte = 8'h00;
+                    end
+                end
+                6'd32: begin
+                    if (is_device_info_response(response_opcode)) begin
+                        response_byte = RESULT_WINDOW_WORD_COUNT;
+                    end else begin
+                        response_byte = csum[7:0];
+                    end
+                end
+                6'd33: begin
+                    if (is_device_info_response(response_opcode)) begin
+                        response_byte = RESULT_WORD_STRIDE_BYTES[7:0];
+                    end else begin
+                        response_byte = csum[15:8];
+                    end
+                end
+                6'd34: begin
+                    if (is_device_info_response(response_opcode)) begin
+                        response_byte = 8'h00;
+                    end else begin
+                        response_byte = csum[23:16];
+                    end
+                end
+                6'd35: begin
+                    if (is_device_info_response(response_opcode)) begin
+                        response_byte = 8'h00;
+                    end else begin
+                        response_byte = csum[31:24];
+                    end
+                end
+                6'd36: begin
+                    if (is_device_info_response(response_opcode)) begin
+                        response_byte = RESPONDER_BUILD_ID[7:0];
+                    end else begin
+                        response_byte = 8'h00;
+                    end
+                end
+                6'd37: begin
+                    if (is_device_info_response(response_opcode)) begin
+                        response_byte = RESPONDER_BUILD_ID[15:8];
+                    end else begin
+                        response_byte = 8'h00;
+                    end
+                end
+                6'd38: begin
+                    if (is_device_info_response(response_opcode)) begin
+                        response_byte = RESPONDER_BUILD_ID[23:16];
+                    end else begin
+                        response_byte = 8'h00;
+                    end
+                end
+                6'd39: begin
+                    if (is_device_info_response(response_opcode)) begin
+                        response_byte = RESPONDER_BUILD_ID[31:24];
+                    end else if (is_result_window_status_response(response_opcode)) begin
+                        response_byte = 8'h00;
+                    end else begin
+                        response_byte = 8'h00;
+                    end
+                end
+                6'd40: begin
+                    if (is_device_info_response(response_opcode)) begin
+                        response_byte = csum[7:0];
+                    end else begin
+                        response_byte = 8'h00;
+                    end
+                end
+                6'd41: begin
+                    if (is_device_info_response(response_opcode)) begin
+                        response_byte = csum[15:8];
+                    end else begin
+                        response_byte = 8'h00;
+                    end
+                end
+                6'd42: begin
+                    if (is_device_info_response(response_opcode)) begin
+                        response_byte = csum[23:16];
+                    end else begin
+                        response_byte = 8'h00;
+                    end
+                end
+                6'd43: begin
+                    if (is_device_info_response(response_opcode)) begin
+                        response_byte = csum[31:24];
+                    end else begin
+                        response_byte = 8'h00;
+                    end
+                end
+                6'd44: response_byte = 8'h00;
+                6'd45: response_byte = 8'h00;
+                6'd46: response_byte = 8'h00;
+                6'd47: response_byte = 8'h00;
                 default: response_byte = 8'h00;
             endcase
         end
@@ -501,6 +660,10 @@ module tang9k_uart_responder (
                 result_last_sequence <= sequence;
                 result_stored_valid <= 1'b1;
                 response_request_opcode <= OPCODE_ACK;
+                response_request_status_code <= STATUS_OK;
+                response_request_status_detail <= 32'd0;
+            end else if (command_opcode == OPCODE_DEVICE_INFO_READ) begin
+                response_request_opcode <= OPCODE_DEVICE_INFO;
                 response_request_status_code <= STATUS_OK;
                 response_request_status_detail <= 32'd0;
             end else if (command_opcode == OPCODE_SCRATCH_WRITE32) begin
@@ -730,6 +893,7 @@ module tang9k_uart_responder (
                         5'd3: begin
                             command_opcode <= rx_byte;
                             unsupported_opcode <= rx_byte != OPCODE_PING
+                                && rx_byte != OPCODE_DEVICE_INFO_READ
                                 && rx_byte != OPCODE_MATMUL32X32
                                 && rx_byte != OPCODE_SCRATCH_WRITE32
                                 && rx_byte != OPCODE_SCRATCH_READ32
@@ -794,6 +958,8 @@ module tang9k_uart_responder (
                                 reset_parser();
                             end else begin
                                 payload_invalid <= (command_opcode == OPCODE_MATMUL32X32 && payload_len != MATMUL32X32_PAYLOAD_LEN)
+                                    || (command_opcode == OPCODE_DEVICE_INFO_READ
+                                        && payload_len != 16'd0)
                                     || (command_opcode == OPCODE_SCRATCH_WRITE32
                                         && payload_len != SCRATCH_WRITE32_PAYLOAD_LEN)
                                     || (command_opcode == OPCODE_SCRATCH_READ32

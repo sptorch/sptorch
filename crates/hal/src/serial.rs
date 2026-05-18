@@ -39,6 +39,8 @@ pub const SERIAL_DEFAULT_QUEUE_CAPACITY: u32 = 64;
 pub enum SerialOpcode {
     Ping = 0x01,
     Pong = 0x02,
+    DeviceInfoRead = 0x03,
+    DeviceInfo = 0x04,
     Matmul32x32 = 0x10,
     ScratchWrite32 = 0x20,
     ScratchRead32 = 0x21,
@@ -57,6 +59,8 @@ impl SerialOpcode {
         match value {
             0x01 => Ok(Self::Ping),
             0x02 => Ok(Self::Pong),
+            0x03 => Ok(Self::DeviceInfoRead),
+            0x04 => Ok(Self::DeviceInfo),
             0x10 => Ok(Self::Matmul32x32),
             0x20 => Ok(Self::ScratchWrite32),
             0x21 => Ok(Self::ScratchRead32),
@@ -255,6 +259,9 @@ pub enum SerialProtocolError {
     ResultWindowStatusMismatch {
         reason: String,
     },
+    DeviceInfoMismatch {
+        reason: String,
+    },
     TransportIo {
         reason: String,
     },
@@ -360,6 +367,9 @@ impl fmt::Display for SerialProtocolError {
             ),
             Self::ResultWindowStatusMismatch { reason } => {
                 write!(f, "serial result-window status mismatch: {reason}")
+            }
+            Self::DeviceInfoMismatch { reason } => {
+                write!(f, "serial device-info mismatch: {reason}")
             }
             Self::TransportIo { reason } => write!(f, "serial transport I/O failed: {reason}"),
             Self::ResponseTimeout { timeout_ms } => {
@@ -827,6 +837,27 @@ pub fn validate_result_window_status_response(
     }
 }
 
+/// 验证 device-info query 的响应是否结构正确。
+///
+/// 设备信息是 host 与 bitstream 对齐语义的第一道门：跑长一点的 smoke suite 前，host 可以先确认
+/// 对端确实声明了当前 serial v1、Tang9k responder 类型以及所需能力位。
+pub fn validate_device_info_response(
+    command: &SerialFrame,
+    response: &SerialFrame,
+) -> Result<DeviceInfoPayload, SerialProtocolError> {
+    if response.sequence != command.sequence {
+        return Err(SerialProtocolError::SequenceMismatch {
+            expected: command.sequence,
+            actual: response.sequence,
+        });
+    }
+
+    match response.opcode {
+        SerialOpcode::DeviceInfo => DeviceInfoPayload::decode_payload(&response.payload),
+        actual => Err(SerialProtocolError::UnexpectedResponseOpcode { actual }),
+    }
+}
+
 /// Tang9k 第一轮硬件验证使用的 32x32 MatMul tile 指令。
 ///
 /// 指令只携带三段设备侧偏移与 tile 编号，不携带矩阵内容本身。这样它更接近真实硬件路径：
@@ -863,6 +894,25 @@ pub const TANG9K_RESULT_WINDOW_SMOKE_MIX: [u32; TANG9K_RESULT_WINDOW_SMOKE_WORDS
     [0x0000_0000, 0x9e37_79b9, 0x3c6e_f372, 0xdaa6_6d2b];
 /// result-window status payload 中表示“当前窗口已有有效 MatMul 写入”的 flag。
 pub const TANG9K_RESULT_WINDOW_STATUS_FLAG_VALID: u8 = 0x01;
+/// device-info 中的 responder 类型：当前最小 UART responder。
+pub const TANG9K_DEVICE_KIND_UART_RESPONDER: u8 = 1;
+/// device-info 能力位：支持 32x32 MatMul 控制帧。
+pub const TANG9K_CAP_MATMUL32X32: u32 = 0x0000_0001;
+/// device-info 能力位：支持 scratch write/read 数据面 smoke。
+pub const TANG9K_CAP_SCRATCH32: u32 = 0x0000_0002;
+/// device-info 能力位：支持 4-word result-window 读回。
+pub const TANG9K_CAP_RESULT_WINDOW: u32 = 0x0000_0004;
+/// device-info 能力位：支持 result-window status 元信息查询。
+pub const TANG9K_CAP_RESULT_WINDOW_STATUS: u32 = 0x0000_0008;
+/// 当前 Tang9k UART responder 在 host/RTL 两侧共同声明的能力集合。
+pub const TANG9K_UART_RESPONDER_CAPABILITIES: u32 =
+    TANG9K_CAP_MATMUL32X32 | TANG9K_CAP_SCRATCH32 | TANG9K_CAP_RESULT_WINDOW | TANG9K_CAP_RESULT_WINDOW_STATUS;
+/// 当前 responder 的板载时钟假设。
+pub const TANG9K_UART_RESPONDER_CLK_HZ: u32 = 27_000_000;
+/// 当前 responder 的 UART 波特率。
+pub const TANG9K_UART_RESPONDER_BAUD: u32 = 115_200;
+/// device-info build id。改动线协议或 RTL 行为时应同步推进，方便 host 识别旧 bitstream。
+pub const TANG9K_UART_RESPONDER_BUILD_ID: u32 = 0x2026_0518;
 
 impl Matmul32x32Command {
     pub const M: usize = 32;
@@ -952,6 +1002,120 @@ impl Matmul32x32Command {
             self.smoke_result_word(idx)
                 .expect("index generated from fixed Tang9k smoke window length")
         })
+    }
+}
+
+/// 查询板端 responder 身份和能力的命令。
+///
+/// 这条命令没有 payload。它存在的意义是把“我连到的到底是哪版 bitstream”变成线协议事实，
+/// 而不是靠 README、LED 状态或人工记忆判断。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceInfoReadCommand;
+
+impl DeviceInfoReadCommand {
+    pub const PAYLOAD_LEN: usize = 0;
+
+    pub fn decode_payload(payload: &[u8]) -> Result<Self, SerialProtocolError> {
+        if !payload.is_empty() {
+            return Err(SerialProtocolError::InvalidReadbackPayloadLen {
+                opcode: SerialOpcode::DeviceInfoRead,
+                actual: payload.len(),
+                expected: Self::PAYLOAD_LEN,
+            });
+        }
+        Ok(Self)
+    }
+
+    pub fn into_frame(self, sequence: u32) -> SerialFrame {
+        SerialFrame::new(SerialOpcode::DeviceInfoRead, sequence, Vec::new())
+    }
+}
+
+/// `DeviceInfoRead` 的固定响应 payload。
+///
+/// 布局固定为 24 字节，全部 little-endian。这里刻意只放“host 选择下一步 probe 所需的事实”，
+/// 不把运行时队列深度、错误计数等动态状态塞进来；动态状态后续应单独定义 telemetry opcode。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceInfoPayload {
+    pub protocol_version: u8,
+    pub device_kind: u8,
+    pub responder_version: u16,
+    pub capabilities: u32,
+    pub clk_hz: u32,
+    pub baud: u32,
+    pub result_window_words: u8,
+    pub result_window_stride_bytes: u8,
+    pub reserved: u16,
+    pub build_id: u32,
+}
+
+impl DeviceInfoPayload {
+    pub const PAYLOAD_LEN: usize = 24;
+
+    pub fn tang9k_uart_responder() -> Self {
+        Self {
+            protocol_version: SERIAL_VERSION,
+            device_kind: TANG9K_DEVICE_KIND_UART_RESPONDER,
+            responder_version: 1,
+            capabilities: TANG9K_UART_RESPONDER_CAPABILITIES,
+            clk_hz: TANG9K_UART_RESPONDER_CLK_HZ,
+            baud: TANG9K_UART_RESPONDER_BAUD,
+            result_window_words: TANG9K_RESULT_WINDOW_SMOKE_WORDS as u8,
+            result_window_stride_bytes: TANG9K_RESULT_WINDOW_WORD_STRIDE_BYTES as u8,
+            reserved: 0,
+            build_id: TANG9K_UART_RESPONDER_BUILD_ID,
+        }
+    }
+
+    pub fn has_capability(&self, capability: u32) -> bool {
+        self.capabilities & capability == capability
+    }
+
+    pub fn encode_payload(&self) -> [u8; Self::PAYLOAD_LEN] {
+        let mut payload = [0u8; Self::PAYLOAD_LEN];
+        payload[0] = self.protocol_version;
+        payload[1] = self.device_kind;
+        payload[2..4].copy_from_slice(&self.responder_version.to_le_bytes());
+        payload[4..8].copy_from_slice(&self.capabilities.to_le_bytes());
+        payload[8..12].copy_from_slice(&self.clk_hz.to_le_bytes());
+        payload[12..16].copy_from_slice(&self.baud.to_le_bytes());
+        payload[16] = self.result_window_words;
+        payload[17] = self.result_window_stride_bytes;
+        payload[18..20].copy_from_slice(&self.reserved.to_le_bytes());
+        payload[20..24].copy_from_slice(&self.build_id.to_le_bytes());
+        payload
+    }
+
+    pub fn decode_payload(payload: &[u8]) -> Result<Self, SerialProtocolError> {
+        if payload.len() != Self::PAYLOAD_LEN {
+            return Err(SerialProtocolError::InvalidReadbackPayloadLen {
+                opcode: SerialOpcode::DeviceInfo,
+                actual: payload.len(),
+                expected: Self::PAYLOAD_LEN,
+            });
+        }
+        let reserved = u16::from_le_bytes(payload[18..20].try_into().expect("payload length checked"));
+        if reserved != 0 {
+            return Err(SerialProtocolError::NonZeroReservedField {
+                field: "device_info.reserved",
+            });
+        }
+        Ok(Self {
+            protocol_version: payload[0],
+            device_kind: payload[1],
+            responder_version: u16::from_le_bytes(payload[2..4].try_into().expect("payload length checked")),
+            capabilities: u32::from_le_bytes(payload[4..8].try_into().expect("payload length checked")),
+            clk_hz: u32::from_le_bytes(payload[8..12].try_into().expect("payload length checked")),
+            baud: u32::from_le_bytes(payload[12..16].try_into().expect("payload length checked")),
+            result_window_words: payload[16],
+            result_window_stride_bytes: payload[17],
+            reserved,
+            build_id: u32::from_le_bytes(payload[20..24].try_into().expect("payload length checked")),
+        })
+    }
+
+    pub fn into_frame(self, sequence: u32) -> SerialFrame {
+        SerialFrame::new(SerialOpcode::DeviceInfo, sequence, self.encode_payload())
     }
 }
 
@@ -1912,6 +2076,30 @@ mod tests {
             err,
             SerialProtocolError::NonZeroReservedField {
                 field: "result_window_status.reserved"
+            }
+        );
+    }
+
+    #[test]
+    fn device_info_payload_roundtrips() {
+        let payload = DeviceInfoPayload::tang9k_uart_responder();
+        let encoded = payload.encode_payload();
+        assert_eq!(DeviceInfoPayload::decode_payload(&encoded).unwrap(), payload);
+        assert!(payload.has_capability(TANG9K_CAP_MATMUL32X32));
+        assert!(payload.has_capability(TANG9K_CAP_RESULT_WINDOW_STATUS));
+        assert_eq!(payload.result_window_words, 4);
+        assert_eq!(payload.result_window_stride_bytes, 4);
+    }
+
+    #[test]
+    fn device_info_rejects_reserved_bits() {
+        let mut encoded = DeviceInfoPayload::tang9k_uart_responder().encode_payload();
+        encoded[18] = 1;
+        let err = DeviceInfoPayload::decode_payload(&encoded).unwrap_err();
+        assert_eq!(
+            err,
+            SerialProtocolError::NonZeroReservedField {
+                field: "device_info.reserved"
             }
         );
     }

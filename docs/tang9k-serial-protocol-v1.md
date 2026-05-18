@@ -42,6 +42,8 @@ Normative rules:
 | --- | ---: | --- | --- |
 | `Ping` | `0x01` | host -> device | implementation-defined or empty |
 | `Pong` | `0x02` | device -> host | implementation-defined or empty |
+| `DeviceInfoRead` | `0x03` | host -> device | empty |
+| `DeviceInfo` | `0x04` | device -> host | `DeviceInfoPayload` |
 | `Matmul32x32` | `0x10` | host -> device | `Matmul32x32Command` |
 | `ScratchWrite32` | `0x20` | host -> device | `ScratchWrite32Command` |
 | `ScratchRead32` | `0x21` | host -> device | `ScratchRead32Command` |
@@ -168,6 +170,41 @@ Rules:
 - `last_sequence` is the sequence of the latest accepted MatMul command that updated the window.
 - `reserved` must be zero. Hosts must reject non-zero reserved bits to keep v1 extension space clean.
 
+## Device Info Query
+
+`DeviceInfoRead` is the first query the host should send after opening a Tang9k serial port. It does not move data;
+it simply asks the responder to state who it is and what it claims to support. That lets host-side bring-up reject
+stale bitstreams before it starts interpreting `Ping`, `Matmul32x32`, or result-window behavior.
+
+Payloads:
+
+```text
+DeviceInfoRead
+<empty>
+
+DeviceInfoPayload
+0       protocol_version        u8
+1       device_kind             u8
+2..4    responder_version       u16
+4..8    capabilities            u32
+8..12   clk_hz                  u32
+12..16  baud                    u32
+16      result_window_words     u8
+17      result_window_stride    u8
+18..20  reserved                u16 = 0
+20..24  build_id                u32
+```
+
+Rules:
+
+- `DeviceInfoRead` must have zero payload bytes.
+- `DeviceInfo` must echo the read command sequence.
+- `protocol_version` must equal `1`.
+- `device_kind` identifies the responder class; the current minimal bitstream uses `1`.
+- `capabilities` is a bitset, not a free-form enum.
+- `reserved` must be zero.
+- `build_id` is a stable board-side identity tag for host gating.
+
 ## Matmul32x32 Command
 
 The v1 MatMul command payload is fixed at 32 bytes.
@@ -255,6 +292,8 @@ Safe bring-up sequence:
 $fs = (Resolve-Path hardware\tang9k\uart_responder\impl\pnr\tang9k_uart_responder.fs).Path
 & 'C:\Gowin\Gowin_V1.9.12.02_SP2_x64\Programmer\bin\programmer_cli.exe' --device GW1NR-9C --operation_index 2 --fsFile $fs --cable "USB Debugger A" --frequency 2.5MHz
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --list
+cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --device-info --baud 115200 --timeout-ms 1000
+cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --device-info --baud 115200 --timeout-ms 1000 --dump-raw
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --baud 115200 --timeout-ms 1000
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --bringup-suite --baud 115200 --timeout-ms 1000
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --bringup-suite --baud 115200 --timeout-ms 1000 --dump-raw
@@ -275,8 +314,9 @@ cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --scratch-smoke -
 Rules:
 
 - `--list` must be used first because it does not write to any device.
+- `--device-info` is the recommended first live-board probe after `--list`: it confirms protocol version, device kind, capability bits, and build id before longer smoke runs.
 - `--port` sends exactly one `Ping` frame with sequence `0` and payload `sptorch-ping`.
-- `--bringup-suite` runs the current acceptance probes sequentially on one COM port: `Ping`, `Matmul32x32`, scratch write/read, result-window status, four result-window reads, and the OOB rejection check.
+- `--bringup-suite` runs the current acceptance probes sequentially on one COM port: `DeviceInfoRead`, `Ping`, `Matmul32x32`, scratch write/read, result-window status, four result-window reads, and the OOB rejection check.
 - `--matmul-smoke` sends exactly one `Matmul32x32` command frame with sequence `1`.
 - `--result-smoke` sends one `Matmul32x32` command frame with sequence `4`, then one `ResultRead32` frame with sequence `5`, and checks the returned `ResultValue32`.
 - `--result-window-smoke` sends one `Matmul32x32` command frame with sequence `4`, then four `ResultRead32` frames with sequences `5..8`, and checks all four returned `ResultValue32` words.
@@ -301,6 +341,12 @@ Real-board acceptance recorded on 2026-05-18:
 
 ```text
 53 50 01 7e 01 00 00 00 08 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 b8 59 20 24 00 00 00 00
+```
+
+Device-info expected result for the next fresh reflash:
+
+```text
+protocol=1, kind=1, responder_version=1, capabilities=0x0000000f, clk_hz=27000000, baud=115200, result_words=4, result_stride=4, build_id=0x20260518
 ```
 
 - Scratch smoke host result: `OK: scratch write opcode=Ack, sequence=2, payload_len=8`.
@@ -387,6 +433,7 @@ Golden coverage:
 
 - `Ping` frame with flags, payload, checksum, and padding.
 - `Ack` frame using `SerialStatusPayload { Busy, detail = 0x11223344 }`.
+- `DeviceInfoRead` and `DeviceInfo` payload/full-frame identity vectors.
 - `Matmul32x32Command` payload and full frame.
 - `ScratchWrite32`, `ScratchRead32`, `ScratchValue32`, `ResultRead32`, `ResultValue32`, `ResultWindowStatusRead`, and `ResultWindowStatus` payloads and full frames.
 - Stream decoder behavior with leading noise and multiple golden frames in one byte stream.

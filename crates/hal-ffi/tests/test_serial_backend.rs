@@ -1,9 +1,11 @@
 use sptorch_core_ops::matmul;
 use sptorch_core_tensor::{Device, Tensor};
 use sptorch_hal::serial::{
-    validate_result_value_response, validate_result_window_status_response, Matmul32x32Command, ResultRead32Command,
-    ResultValue32Payload, ResultWindowStatusPayload, ResultWindowStatusReadCommand, SerialFrame, SerialOpcode,
-    SerialProtocolError, SerialStatusCode, SerialStatusPayload, TANG9K_RESULT_WINDOW_WORD_STRIDE_BYTES,
+    validate_device_info_response, validate_result_value_response, validate_result_window_status_response,
+    DeviceInfoPayload, DeviceInfoReadCommand, Matmul32x32Command, ResultRead32Command, ResultValue32Payload,
+    ResultWindowStatusPayload, ResultWindowStatusReadCommand, SerialFrame, SerialOpcode, SerialProtocolError,
+    SerialStatusCode, SerialStatusPayload, TANG9K_CAP_MATMUL32X32, TANG9K_CAP_RESULT_WINDOW,
+    TANG9K_CAP_RESULT_WINDOW_STATUS, TANG9K_CAP_SCRATCH32, TANG9K_RESULT_WINDOW_WORD_STRIDE_BYTES,
 };
 use sptorch_hal_ffi::serial_backend::{
     register_tang9k_serial_dry_run_backend_for, register_tang9k_serial_dry_run_backend_with_transport,
@@ -156,6 +158,29 @@ fn matmul_smoke_frame_matches_minimal_board_command_contract() {
         u32::from_le_bytes(frame.payload[28..32].try_into().unwrap()),
         MATMUL32X32_FLAG_CLEAR_OUTPUT | MATMUL32X32_FLAG_LAST_K_TILE
     );
+}
+
+#[test]
+fn device_info_contract_reports_minimal_responder_capabilities() {
+    let read_frame = DeviceInfoReadCommand.into_frame(11);
+    let response = DeviceInfoPayload::tang9k_uart_responder().into_frame(11);
+
+    let info = validate_device_info_response(&read_frame, &response).unwrap();
+
+    assert_eq!(read_frame.opcode, SerialOpcode::DeviceInfoRead);
+    assert_eq!(response.opcode, SerialOpcode::DeviceInfo);
+    assert_eq!(info.protocol_version, sptorch_hal::serial::SERIAL_VERSION);
+    assert_eq!(info.device_kind, sptorch_hal::serial::TANG9K_DEVICE_KIND_UART_RESPONDER);
+    assert!(info.has_capability(TANG9K_CAP_MATMUL32X32));
+    assert!(info.has_capability(TANG9K_CAP_SCRATCH32));
+    assert!(info.has_capability(TANG9K_CAP_RESULT_WINDOW));
+    assert!(info.has_capability(TANG9K_CAP_RESULT_WINDOW_STATUS));
+    assert_eq!(info.result_window_words, 4);
+    assert_eq!(
+        info.result_window_stride_bytes,
+        TANG9K_RESULT_WINDOW_WORD_STRIDE_BYTES as u8
+    );
+    assert_eq!(info.build_id, sptorch_hal::serial::TANG9K_UART_RESPONDER_BUILD_ID);
 }
 
 #[test]

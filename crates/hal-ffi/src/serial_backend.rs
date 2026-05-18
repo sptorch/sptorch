@@ -7,11 +7,15 @@
 
 use sptorch_core_tensor::{register_backend, BackendDispatch, Device};
 use sptorch_hal::serial::{
-    plan_matmul32x32_commands, validate_result_value_response, validate_result_window_status_response,
-    validate_scratch_value_response, validate_status_response, LoopbackSerialTransport, Matmul32x32Command,
-    Matmul32x32Plan, MatmulMemoryLayout, ResultRead32Command, ResultWindowStatusReadCommand, ScratchRead32Command,
+    plan_matmul32x32_commands, validate_device_info_response, validate_result_value_response,
+    validate_result_window_status_response, validate_scratch_value_response, validate_status_response,
+    DeviceInfoPayload, DeviceInfoReadCommand, LoopbackSerialTransport, Matmul32x32Command, Matmul32x32Plan,
+    MatmulMemoryLayout, ResultRead32Command, ResultWindowStatusReadCommand, ScratchRead32Command,
     ScratchWrite32Command, SerialFrame, SerialOpcode, SerialProtocolError, SerialStatusCode, SerialStatusPayload,
-    SerialStreamDecoder, SerialSubmitQueue, SerialSubmitReport, TANG9K_RESULT_WINDOW_WORD_STRIDE_BYTES,
+    SerialStreamDecoder, SerialSubmitQueue, SerialSubmitReport, TANG9K_CAP_MATMUL32X32, TANG9K_CAP_RESULT_WINDOW,
+    TANG9K_CAP_RESULT_WINDOW_STATUS, TANG9K_CAP_SCRATCH32, TANG9K_DEVICE_KIND_UART_RESPONDER,
+    TANG9K_RESULT_WINDOW_SMOKE_WORDS, TANG9K_RESULT_WINDOW_WORD_STRIDE_BYTES, TANG9K_UART_RESPONDER_BAUD,
+    TANG9K_UART_RESPONDER_BUILD_ID, TANG9K_UART_RESPONDER_CLK_HZ,
 };
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -97,6 +101,7 @@ impl std::error::Error for UartTang9kExchangeError {}
 /// 最贵的不是失败本身，而是不知道失败发生在链路、命令生命周期、数据面、窗口边界还是状态问诊。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tang9kBringupSuiteTrace {
+    pub device_info: UartTang9kExchangeTrace,
     pub ping: UartTang9kExchangeTrace,
     pub matmul: UartTang9kExchangeTrace,
     pub scratch_write: UartTang9kExchangeTrace,
@@ -330,6 +335,103 @@ pub fn probe_tang9k_ping_with_trace(
 /// 地址只是协议层面的设备侧偏移，当前 responder 不会真正访问这些位置。把构造逻辑单独拆出来，
 /// 是为了让 CLI、测试和未来批量 bring-up 工具使用同一条命令样本，避免“host 发的不是我们以为的
 /// MatMul 帧”这种很难看的硬件调试分叉。
+
+/// 先查询 responder 自我描述，再决定后续 bring-up 是否继续。
+///
+/// 这条 probe 的目的不是“多发一条命令玩玩”，而是把板端 bitstream 的身份、
+/// 协议版本和能力位先钉死。这样后续的 Ping、MatMul、scratch、result-window
+/// 探针即便失败，host 也知道自己是在和哪一版固件对话。
+pub fn probe_tang9k_device_info_with_trace(
+    port_name: &str,
+    baud_rate: u32,
+    timeout: Duration,
+) -> Result<UartTang9kExchangeTrace, UartTang9kExchangeError> {
+    let transport = UartTang9kTransport::new(port_name, baud_rate, timeout);
+    let command = DeviceInfoReadCommand.into_frame(11);
+    let trace = transport.exchange_with_trace(&command)?;
+    let info = match validate_device_info_response(&command, &trace.response) {
+        Ok(info) => info,
+        Err(error) => {
+            return Err(UartTang9kExchangeError::new(
+                error,
+                trace.request_bytes.clone(),
+                trace.raw_response_bytes.clone(),
+            ));
+        }
+    };
+    validate_expected_tang9k_device_info(&info).map_err(|error| {
+        UartTang9kExchangeError::new(error, trace.request_bytes.clone(), trace.raw_response_bytes.clone())
+    })?;
+    Ok(trace)
+}
+
+fn validate_expected_tang9k_device_info(info: &DeviceInfoPayload) -> Result<(), SerialProtocolError> {
+    if info.protocol_version != sptorch_hal::serial::SERIAL_VERSION {
+        return Err(SerialProtocolError::DeviceInfoMismatch {
+            reason: format!(
+                "device-info protocol_version expected {}, got {}",
+                sptorch_hal::serial::SERIAL_VERSION,
+                info.protocol_version
+            ),
+        });
+    }
+    if info.device_kind != TANG9K_DEVICE_KIND_UART_RESPONDER {
+        return Err(SerialProtocolError::DeviceInfoMismatch {
+            reason: format!(
+                "device_kind expected {}, got {}",
+                TANG9K_DEVICE_KIND_UART_RESPONDER, info.device_kind
+            ),
+        });
+    }
+    for capability in [
+        TANG9K_CAP_MATMUL32X32,
+        TANG9K_CAP_SCRATCH32,
+        TANG9K_CAP_RESULT_WINDOW,
+        TANG9K_CAP_RESULT_WINDOW_STATUS,
+    ] {
+        if !info.has_capability(capability) {
+            return Err(SerialProtocolError::DeviceInfoMismatch {
+                reason: format!("device-info missing capability 0x{capability:08x}"),
+            });
+        }
+    }
+    if info.clk_hz != TANG9K_UART_RESPONDER_CLK_HZ {
+        return Err(SerialProtocolError::DeviceInfoMismatch {
+            reason: format!("clk_hz expected {}, got {}", TANG9K_UART_RESPONDER_CLK_HZ, info.clk_hz),
+        });
+    }
+    if info.baud != TANG9K_UART_RESPONDER_BAUD {
+        return Err(SerialProtocolError::DeviceInfoMismatch {
+            reason: format!("baud expected {}, got {}", TANG9K_UART_RESPONDER_BAUD, info.baud),
+        });
+    }
+    if info.result_window_words as usize != TANG9K_RESULT_WINDOW_SMOKE_WORDS {
+        return Err(SerialProtocolError::DeviceInfoMismatch {
+            reason: format!(
+                "result_window_words expected {}, got {}",
+                TANG9K_RESULT_WINDOW_SMOKE_WORDS, info.result_window_words
+            ),
+        });
+    }
+    if u32::from(info.result_window_stride_bytes) != TANG9K_RESULT_WINDOW_WORD_STRIDE_BYTES {
+        return Err(SerialProtocolError::DeviceInfoMismatch {
+            reason: format!(
+                "result_window_stride_bytes expected {}, got {}",
+                TANG9K_RESULT_WINDOW_WORD_STRIDE_BYTES, info.result_window_stride_bytes
+            ),
+        });
+    }
+    if info.build_id != TANG9K_UART_RESPONDER_BUILD_ID {
+        return Err(SerialProtocolError::DeviceInfoMismatch {
+            reason: format!(
+                "build_id expected 0x{:08x}, got 0x{:08x}",
+                TANG9K_UART_RESPONDER_BUILD_ID, info.build_id
+            ),
+        });
+    }
+    Ok(())
+}
+
 pub fn tang9k_matmul_smoke_frame(sequence: u32) -> SerialFrame {
     Matmul32x32Command {
         tile_id: 0,
@@ -434,6 +536,7 @@ pub fn probe_tang9k_bringup_suite_with_trace(
     baud_rate: u32,
     timeout: Duration,
 ) -> Result<Tang9kBringupSuiteTrace, UartTang9kExchangeError> {
+    let device_info = probe_tang9k_device_info_with_trace(port_name, baud_rate, timeout)?;
     let ping = probe_tang9k_ping_with_trace(port_name, baud_rate, timeout)?;
     let matmul = probe_tang9k_matmul_smoke_with_trace(port_name, baud_rate, timeout)?;
     let (scratch_write, scratch_read) = probe_tang9k_scratch_smoke_with_trace(port_name, baud_rate, timeout)?;
@@ -444,6 +547,7 @@ pub fn probe_tang9k_bringup_suite_with_trace(
         probe_tang9k_result_oob_smoke_with_trace(port_name, baud_rate, timeout)?;
 
     Ok(Tang9kBringupSuiteTrace {
+        device_info,
         ping,
         matmul,
         scratch_write,

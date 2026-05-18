@@ -1,8 +1,8 @@
 use sptorch_hal::serial::{
-    Matmul32x32Command, ResultRead32Command, ResultValue32Payload, ResultWindowStatusPayload,
-    ResultWindowStatusReadCommand, ScratchRead32Command, ScratchValue32Payload, ScratchWrite32Command, SerialFrame,
-    SerialOpcode, SerialStatusCode, SerialStatusPayload, SerialStreamDecoder, MATMUL32X32_FLAG_CLEAR_OUTPUT,
-    MATMUL32X32_FLAG_LAST_K_TILE,
+    DeviceInfoPayload, DeviceInfoReadCommand, Matmul32x32Command, ResultRead32Command, ResultValue32Payload,
+    ResultWindowStatusPayload, ResultWindowStatusReadCommand, ScratchRead32Command, ScratchValue32Payload,
+    ScratchWrite32Command, SerialFrame, SerialOpcode, SerialStatusCode, SerialStatusPayload, SerialStreamDecoder,
+    MATMUL32X32_FLAG_CLEAR_OUTPUT, MATMUL32X32_FLAG_LAST_K_TILE,
 };
 
 const PING_FRAME_GOLDEN: &[u8] = &[
@@ -15,6 +15,20 @@ const STATUS_BUSY_DETAIL_GOLDEN: &[u8] = &[0x04, 0x00, 0x00, 0x00, 0x44, 0x33, 0
 const ACK_BUSY_FRAME_GOLDEN: &[u8] = &[
     0x53, 0x50, 0x01, 0x7e, 0x07, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00,
     0x00, 0x44, 0x33, 0x22, 0x11, 0x6e, 0xe6, 0xdc, 0x44, 0x00, 0x00, 0x00, 0x00,
+];
+
+const DEVICE_INFO_READ_FRAME_GOLDEN: &[u8] = &[
+    0x53, 0x50, 0x01, 0x03, 0x0b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x19, 0xa8, 0x15,
+    0xb6, 0x00, 0x00, 0x00, 0x00,
+];
+const DEVICE_INFO_PAYLOAD_GOLDEN: &[u8] = &[
+    0x01, 0x01, 0x01, 0x00, 0x0f, 0x00, 0x00, 0x00, 0xc0, 0xfc, 0x9b, 0x01, 0x00, 0xc2, 0x01, 0x00, 0x04, 0x04, 0x00,
+    0x00, 0x18, 0x05, 0x26, 0x20,
+];
+const DEVICE_INFO_FRAME_GOLDEN: &[u8] = &[
+    0x53, 0x50, 0x01, 0x04, 0x0b, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01,
+    0x00, 0x0f, 0x00, 0x00, 0x00, 0xc0, 0xfc, 0x9b, 0x01, 0x00, 0xc2, 0x01, 0x00, 0x04, 0x04, 0x00, 0x00, 0x18, 0x05,
+    0x26, 0x20, 0xf2, 0x2b, 0x98, 0x83, 0x00, 0x00, 0x00, 0x00,
 ];
 
 const MATMUL32_PAYLOAD_GOLDEN: &[u8] = &[
@@ -92,6 +106,26 @@ fn status_payload_and_ack_frame_match_wire_golden_vector() {
     assert_eq!(
         SerialStatusPayload::decode(&SerialFrame::decode(ACK_BUSY_FRAME_GOLDEN).unwrap().payload).unwrap(),
         payload
+    );
+}
+
+#[test]
+fn device_info_commands_and_frames_match_wire_golden_vectors() {
+    let read_frame = DeviceInfoReadCommand.into_frame(11);
+    assert_eq!(read_frame.encode().unwrap(), DEVICE_INFO_READ_FRAME_GOLDEN);
+    assert_eq!(
+        DeviceInfoReadCommand::decode_payload(&SerialFrame::decode(DEVICE_INFO_READ_FRAME_GOLDEN).unwrap().payload)
+            .unwrap(),
+        DeviceInfoReadCommand
+    );
+
+    let info_payload = DeviceInfoPayload::tang9k_uart_responder();
+    assert_eq!(info_payload.encode_payload(), DEVICE_INFO_PAYLOAD_GOLDEN);
+    let info_frame = info_payload.into_frame(11);
+    assert_eq!(info_frame.encode().unwrap(), DEVICE_INFO_FRAME_GOLDEN);
+    assert_eq!(
+        DeviceInfoPayload::decode_payload(&SerialFrame::decode(DEVICE_INFO_FRAME_GOLDEN).unwrap().payload).unwrap(),
+        info_payload
     );
 }
 
@@ -204,6 +238,8 @@ fn stream_decoder_accepts_golden_vectors_with_chunk_boundaries() {
     let mut stream = vec![0x00, 0xff];
     stream.extend_from_slice(PING_FRAME_GOLDEN);
     stream.extend_from_slice(ACK_BUSY_FRAME_GOLDEN);
+    stream.extend_from_slice(DEVICE_INFO_READ_FRAME_GOLDEN);
+    stream.extend_from_slice(DEVICE_INFO_FRAME_GOLDEN);
     stream.extend_from_slice(MATMUL32_FRAME_GOLDEN);
     stream.extend_from_slice(SCRATCH_WRITE32_FRAME_GOLDEN);
     stream.extend_from_slice(SCRATCH_ACK_FRAME_GOLDEN);
@@ -218,16 +254,18 @@ fn stream_decoder_accepts_golden_vectors_with_chunk_boundaries() {
     assert!(decoder.push_bytes(&stream[..3]).unwrap().is_empty());
     let frames = decoder.push_bytes(&stream[3..]).unwrap();
 
-    assert_eq!(frames.len(), 11);
+    assert_eq!(frames.len(), 13);
     assert_eq!(frames[0].opcode, SerialOpcode::Ping);
     assert_eq!(frames[1].opcode, SerialOpcode::Ack);
-    assert_eq!(frames[2].opcode, SerialOpcode::Matmul32x32);
-    assert_eq!(frames[3].opcode, SerialOpcode::ScratchWrite32);
-    assert_eq!(frames[4].opcode, SerialOpcode::Ack);
-    assert_eq!(frames[5].opcode, SerialOpcode::ScratchRead32);
-    assert_eq!(frames[6].opcode, SerialOpcode::ScratchValue32);
-    assert_eq!(frames[7].opcode, SerialOpcode::ResultRead32);
-    assert_eq!(frames[8].opcode, SerialOpcode::ResultValue32);
-    assert_eq!(frames[9].opcode, SerialOpcode::ResultWindowStatusRead);
-    assert_eq!(frames[10].opcode, SerialOpcode::ResultWindowStatus);
+    assert_eq!(frames[2].opcode, SerialOpcode::DeviceInfoRead);
+    assert_eq!(frames[3].opcode, SerialOpcode::DeviceInfo);
+    assert_eq!(frames[4].opcode, SerialOpcode::Matmul32x32);
+    assert_eq!(frames[5].opcode, SerialOpcode::ScratchWrite32);
+    assert_eq!(frames[6].opcode, SerialOpcode::Ack);
+    assert_eq!(frames[7].opcode, SerialOpcode::ScratchRead32);
+    assert_eq!(frames[8].opcode, SerialOpcode::ScratchValue32);
+    assert_eq!(frames[9].opcode, SerialOpcode::ResultRead32);
+    assert_eq!(frames[10].opcode, SerialOpcode::ResultValue32);
+    assert_eq!(frames[11].opcode, SerialOpcode::ResultWindowStatusRead);
+    assert_eq!(frames[12].opcode, SerialOpcode::ResultWindowStatus);
 }

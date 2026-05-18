@@ -1,6 +1,6 @@
 ﻿# Tang9k UART Responder Bring-Up
 
-这个工程是 SPTorch HAL 串行协议的第一块真实板卡烟测固件。它不进入训练路径，先把控制面练稳：通过 Tang Nano 9K / Tang9k 的 USB-UART 收到 SPTorch serial v1 `Ping` 后回传 checksum 正确、sequence 相同的 `Pong`；收到最小 `Matmul32x32` 控制帧后回传 `Ack/Ok`；收到 `ScratchWrite32` 后保存一个 32-bit 槽位，并在 `ScratchRead32` 时用 `ScratchValue32` 读回；收到 MatMul 后还会写入一个确定性的 4-word 结果窗口，供 `ResultRead32 -> ResultValue32` 烟测读取，并通过 `ResultWindowStatusRead -> ResultWindowStatus` 暴露窗口 valid/base/stride/last-sequence 元信息。真正 PE 阵列、DMA 和完整矩阵结果缓冲区会在下一层接入。
+这个工程是 SPTorch HAL 串行协议的第一块真实板卡烟测固件。它不进入训练路径，先把控制面练稳：通过 Tang Nano 9K / Tang9k 的 USB-UART 收到 SPTorch serial v1 `DeviceInfoRead` 后回传 responder 协议版本、能力位和 build id；收到 `Ping` 后回传 checksum 正确、sequence 相同的 `Pong`；收到最小 `Matmul32x32` 控制帧后回传 `Ack/Ok`；收到 `ScratchWrite32` 后保存一个 32-bit 槽位，并在 `ScratchRead32` 时用 `ScratchValue32` 读回；收到 MatMul 后还会写入一个确定性的 4-word 结果窗口，供 `ResultRead32 -> ResultValue32` 烟测读取，并通过 `ResultWindowStatusRead -> ResultWindowStatus` 暴露窗口 valid/base/stride/last-sequence 元信息。真正 PE 阵列、DMA 和完整矩阵结果缓冲区会在下一层接入。
 
 ## 目标板与链路
 
@@ -42,6 +42,7 @@ $fs = (Resolve-Path hardware\tang9k\uart_responder\impl\pnr\tang9k_uart_responde
 
 ```powershell
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --baud 115200 --timeout-ms 1000
+cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --device-info --baud 115200 --timeout-ms 1000 --dump-raw
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --bringup-suite --baud 115200 --timeout-ms 1000
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --matmul-smoke --baud 115200 --timeout-ms 1000
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --matmul-smoke --baud 115200 --timeout-ms 1000 --dump-raw
@@ -58,15 +59,24 @@ cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --scratch-smoke -
 OK: response opcode=Pong, sequence=0, payload_len=0
 ```
 
-`BringupSuite` 期望输出会把 `Ping`、`MatmulSmoke`、`ScratchSmoke`、`ResultWindowStatusSmoke`、`ResultWindowSmoke` 和 `ResultOobSmoke` 顺序串起来，每一步都保留自己的 `OK:` 行和 raw bytes。这个命令适合每次重新烧录后第一时间跑一遍，确认板卡已经回到可用状态。
+`DeviceInfo` 期望输出类似：
 
-当前实测的 `BringupSuite` 总结行：
+```text
+OK: device info opcode=DeviceInfo, sequence=11, protocol=1, kind=1, responder_version=1, capabilities=0x0000000f, clk_hz=27000000, baud=115200, result_words=4, result_stride=4, build_id=0x20260518
+```
+
+`BringupSuite` 期望输出会把 `DeviceInfo`、`Ping`、`MatmulSmoke`、`ScratchSmoke`、`ResultWindowStatusSmoke`、`ResultWindowSmoke` 和 `ResultOobSmoke` 顺序串起来，每一步都保留自己的 `OK:` 行和 raw bytes。这个命令适合每次重新烧录后第一时间跑一遍，确认板卡已经回到可用状态。
+
+新版 `BringupSuite` 期望总结行：
 
 ```text
 OK: bringup suite completed sequentially
+OK: suite device info opcode=DeviceInfo, sequence=11, protocol=1, kind=1, responder_version=1, capabilities=0x0000000f, clk_hz=27000000, baud=115200, result_words=4, result_stride=4, build_id=0x20260518
 OK: suite status opcode=ResultWindowStatus, sequence=10, valid=true, words=4, stride=4, base=0x00002000, last_sequence=4
 OK: suite oob rejected read opcode=Error, sequence=9, status=HardwareFault, detail=0x00002010
 ```
+
+说明：`DeviceInfo` 已经接入 host、协议 golden vector 和 RTL responder，但还需要重新 Gowin build、SRAM 烧录、COM3 实测后，才能把上面的 device-info 行标记为当前实测结果。
 
 `MatmulSmoke` 期望输出类似：
 
@@ -115,6 +125,12 @@ OK: result oob rejected read opcode=Error, sequence=9, status=HardwareFault, det
 
 ```text
 53 50 01 7e 01 00 00 00 08 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 b8 59 20 24 00 00 00 00
+```
+
+`DeviceInfo` raw response 应该稳定为：
+
+```text
+53 50 01 04 0b 00 00 00 18 00 00 00 00 00 00 00 01 01 01 00 0f 00 00 00 c0 fc 9b 01 00 c2 01 00 04 04 00 00 18 05 26 20 f2 2b 98 83 00 00 00 00
 ```
 
 当前实测的 `ResultSmoke` result raw response：

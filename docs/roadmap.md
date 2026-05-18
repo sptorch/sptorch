@@ -207,7 +207,7 @@ External ecosystem repositories (not part of framework workspace):
 **周验收里程碑（执行口径）**：
 1. **Week 1（协议与最小链路）**
    - 交付：串口帧协议 v1（帧头/长度/校验/错误码）与最小 Rust 收发 demo
-   - 进度：`sptorch-hal::serial` 已落地固定 16 字节帧头、payload 长度、FNV-1a checksum、8 字节对齐 padding、loopback 传输器、ACK/Error 状态载荷、host submit queue、stream framing decoder、golden vectors 和 32×32 MatMul tile 指令 payload；线协议标准见 `docs/tang9k-serial-protocol-v1.md`
+   - 进度：`sptorch-hal::serial` 已落地固定 16 字节帧头、payload 长度、FNV-1a checksum、8 字节对齐 padding、loopback 传输器、ACK/Error 状态载荷、DeviceInfoRead/DeviceInfo 身份查询、host submit queue、stream framing decoder、golden vectors 和 32×32 MatMul tile 指令 payload；线协议标准见 `docs/tang9k-serial-protocol-v1.md`
    - 验收：主机↔Tang 9k 往返回环测试稳定通过，连续 10k 帧零崩溃
 2. **Week 2（算子指令映射）**
    - 交付：`matmul` 指令编码与 32×32 tile 切片/回收逻辑
@@ -215,7 +215,7 @@ External ecosystem repositories (not part of framework workspace):
    - 验收：CPU 参考结果对齐（容差阈值固定），错误可定位到 tile 级
 3. **Week 3（hal-ffi 接入）**
    - 交付：`serial_backend` 注册到 `BACKEND_REGISTRY`，`dispatch_matmul` 可路由到硬件
-   - 进度：`sptorch-hal-ffi::serial_backend` 已提供 Tang9k serial dry-run backend，可注册到 `core-tensor` dispatch 表，`core-ops::matmul` 能生成 serial tile frames，并通过 `SerialSubmitQueue` 校验 ACK/OK、Busy 背压、sequence 和队列深度；`Tang9kSerialTransport` 已抽象发送/接收边界，`UartTang9kTransport` 与 `tang9k_probe` 已提供真实串口列举、单帧 Ping、`Matmul32x32 -> Ack/Ok` 命令生命周期探测、`ScratchWrite32/ScratchRead32` 数据面回环、`ResultRead32/ResultValue32` 结果窗口摘要读回和 `--dump-raw` 字节级诊断入口，真实 DMA/完整矩阵结果缓冲区待实现
+   - 进度：`sptorch-hal-ffi::serial_backend` 已提供 Tang9k serial dry-run backend，可注册到 `core-tensor` dispatch 表，`core-ops::matmul` 能生成 serial tile frames，并通过 `SerialSubmitQueue` 校验 ACK/OK、Busy 背压、sequence 和队列深度；`Tang9kSerialTransport` 已抽象发送/接收边界，`UartTang9kTransport` 与 `tang9k_probe` 已提供真实串口列举、`DeviceInfoRead` 身份查询、单帧 Ping、`Matmul32x32 -> Ack/Ok` 命令生命周期探测、`ScratchWrite32/ScratchRead32` 数据面回环、`ResultRead32/ResultValue32` 结果窗口摘要读回和 `--dump-raw` 字节级诊断入口，真实 DMA/完整矩阵结果缓冲区待实现
    - 验收：不改上层 API 即可切换 CPU/serial backend，核心回归测试通过
 4. **Week 4（端到端点亮）**
    - 交付：`sptorch -> serial_backend -> Tang 9k -> result` 全链路打通
@@ -914,12 +914,13 @@ bdf6661 GPU Attention模型: 单头attention+手动backward, loss 3.13→2.38
 - [x] Tang9k serial protocol standard: `docs/tang9k-serial-protocol-v1.md` documents frame layout, opcode/status tables, ACK/Error payloads, MatMul command format, scratch data-plane smoke frames, result-window smoke/status frames, and compatibility rules.
 - [x] Tang9k stream framing: `SerialStreamDecoder` turns arbitrary UART/USB-CDC byte chunks into strict `SerialFrame` values with noise recovery and partial-frame buffering.
 - [x] Tang9k host submit lifecycle: `SerialSubmitQueue` owns sequence allocation, ACK/OK validation, Busy rejection, queue-depth drain, and high-watermark telemetry for dry-run and future UART/DMA transports.
-- [x] Tang9k golden vectors: `crates/hal/tests/tang9k_serial_golden.rs` locks byte-for-byte Ping, Ack, MatMul, scratch read/write/value, result read/value, result-window status read/status, and stream framing conformance cases.
+- [x] Tang9k golden vectors: `crates/hal/tests/tang9k_serial_golden.rs` locks byte-for-byte DeviceInfoRead/DeviceInfo, Ping, Ack, MatMul, scratch read/write/value, result read/value, result-window status read/status, and stream framing conformance cases.
 - [x] Tang9k MatMul tile command planner: `plan_matmul32x32_commands` maps row-major board memory layouts into deterministic 32x32 tile command streams with clear/accumulate/last-k flags.
 - [x] Tang9k serial backend dry-run: `sptorch-hal-ffi::serial_backend` registers into core dispatch and lets `core-ops::matmul` exercise serial tile frames before real UART/DMA is connected.
 - [x] Tang9k transport boundary: `Tang9kSerialTransport` isolates the send/receive layer so loopback, UART, or DMA transports can share the same MatMul dispatch path.
-- [x] Tang9k UART probe: `tang9k_probe --list` safely lists host serial ports and `--port COMx` sends one protocol Ping for real-board bring-up; `--scratch-smoke` now verifies a write/readback data-plane loop.
+- [x] Tang9k UART probe: `tang9k_probe --list` safely lists host serial ports, `--device-info` queries responder identity before longer runs, and `--port COMx` sends one protocol Ping for real-board bring-up; `--scratch-smoke` now verifies a write/readback data-plane loop.
 - [x] Tang9k real-board UART smoke test: `hardware/tang9k/uart_responder` builds a minimal Gowin `GW1NR-9C` bitstream; SRAM Program via `USB Debugger A` succeeded with status `0x0003F020`, and `COM3 @ 115200` returned `OK: response opcode=Pong, sequence=0, payload_len=0`.
+- [ ] Tang9k device-info smoke test: host `tang9k_probe --device-info --dump-raw` and responder RTL are wired for protocol version, device kind, capability bits, and build id validation; the next Gowin reflash and COM3 run should confirm `DeviceInfo` with `protocol=1`, `kind=1`, `responder_version=1`, `capabilities=0x0000000f`, `clk_hz=27000000`, `baud=115200`, `result_words=4`, `result_stride=4`, and `build_id=0x20260518`.
 - [x] Tang9k command-lifecycle smoke test: host `tang9k_probe --matmul-smoke --dump-raw` and responder RTL validate `Matmul32x32 -> Ack/Ok` on real hardware; SRAM Program via `USB Debugger A` returned status `0x0003F020`, and `COM3 @ 115200` returned `OK: response opcode=Ack, sequence=1, payload_len=8` with ACK checksum bytes `b8 59 20 24`.
 - [x] Tang9k scratch smoke test: `tang9k_probe --scratch-smoke --dump-raw` and responder RTL validate `ScratchWrite32 -> Ack/Ok -> ScratchRead32 -> ScratchValue32` on real hardware; SRAM Program via `USB Debugger A` returned status `0x0003F020`, and `COM3 @ 115200` returned `OK: scratch write opcode=Ack, sequence=2, payload_len=8` plus `OK: scratch read opcode=ScratchValue32, sequence=3, offset=0x00000044, value=0x11223344`.
 - [x] Tang9k result-window smoke path: `hal::serial` now defines `ResultRead32/ResultValue32`, golden vectors cover the wire bytes, `hal-ffi::serial_backend` exposes `tang9k_probe --result-smoke`, `--result-window-smoke`, and `--result-oob-smoke`, and the responder RTL records a deterministic 4-word MatMul summary window. Real-board SRAM reflash via `USB Debugger A` passed on `COM3 @ 115200`, returning `0x00003005, 0x9e3749bc, 0x3c6ec377, 0xdaa65d2e`; the first OOB offset `0x00002010` is rejected with `Error/HardwareFault`. The status query path is now wired in host/RTL/tests and is ready for the next COM3 reflash acceptance run.

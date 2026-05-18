@@ -1,11 +1,12 @@
 use sptorch_hal::serial::{
-    ResultValue32Payload, ResultWindowStatusPayload, ScratchValue32Payload, SerialOpcode, SerialStatusPayload,
+    DeviceInfoPayload, ResultValue32Payload, ResultWindowStatusPayload, ScratchValue32Payload, SerialOpcode,
+    SerialStatusPayload,
 };
 use sptorch_hal_ffi::serial_backend::{
-    list_tang9k_serial_ports, probe_tang9k_bringup_suite_with_trace, probe_tang9k_matmul_smoke_with_trace,
-    probe_tang9k_ping_with_trace, probe_tang9k_result_oob_smoke_with_trace, probe_tang9k_result_smoke_with_trace,
-    probe_tang9k_result_window_smoke_with_trace, probe_tang9k_result_window_status_smoke_with_trace,
-    probe_tang9k_scratch_smoke_with_trace,
+    list_tang9k_serial_ports, probe_tang9k_bringup_suite_with_trace, probe_tang9k_device_info_with_trace,
+    probe_tang9k_matmul_smoke_with_trace, probe_tang9k_ping_with_trace, probe_tang9k_result_oob_smoke_with_trace,
+    probe_tang9k_result_smoke_with_trace, probe_tang9k_result_window_smoke_with_trace,
+    probe_tang9k_result_window_status_smoke_with_trace, probe_tang9k_scratch_smoke_with_trace,
 };
 use std::time::Duration;
 
@@ -21,6 +22,7 @@ struct Args {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProbeCommand {
     Ping,
+    DeviceInfo,
     BringupSuite,
     MatmulSmoke,
     ResultSmoke,
@@ -69,12 +71,28 @@ fn main() {
                     }
                 }
             }
+            ProbeCommand::DeviceInfo => {
+                let result =
+                    probe_tang9k_device_info_with_trace(&port, args.baud, Duration::from_millis(args.timeout_ms));
+                match result {
+                    Ok(trace) => {
+                        print_trace_summary("device info", &trace);
+                        if args.dump_raw {
+                            print_raw_exchange("device info", &trace.request_bytes, &trace.raw_response_bytes);
+                        }
+                    }
+                    Err(err) => {
+                        print_probe_error(args.dump_raw, err);
+                    }
+                }
+            }
             ProbeCommand::BringupSuite => {
                 let result =
                     probe_tang9k_bringup_suite_with_trace(&port, args.baud, Duration::from_millis(args.timeout_ms));
                 match result {
                     Ok(suite) => {
                         println!("OK: bringup suite completed sequentially");
+                        print_trace_summary("suite device info", &suite.device_info);
                         print_trace_summary("suite ping", &suite.ping);
                         print_trace_summary("suite matmul", &suite.matmul);
                         print_trace_summary("suite scratch write", &suite.scratch_write);
@@ -100,6 +118,11 @@ fn main() {
                         print_trace_summary("suite oob rejected read", &suite.result_oob_rejected_read);
 
                         if args.dump_raw {
+                            print_raw_exchange(
+                                "suite device info",
+                                &suite.device_info.request_bytes,
+                                &suite.device_info.raw_response_bytes,
+                            );
                             print_raw_exchange("suite ping", &suite.ping.request_bytes, &suite.ping.raw_response_bytes);
                             print_raw_exchange(
                                 "suite matmul",
@@ -360,6 +383,10 @@ fn parse_args(raw: Vec<String>) -> Result<Args, String> {
                 args.command = ProbeCommand::MatmulSmoke;
                 idx += 1;
             }
+            "--device-info" => {
+                args.command = ProbeCommand::DeviceInfo;
+                idx += 1;
+            }
             "--bringup-suite" => {
                 args.command = ProbeCommand::BringupSuite;
                 idx += 1;
@@ -451,6 +478,32 @@ fn print_trace_summary(label: &str, trace: &sptorch_hal_ffi::serial_backend::Uar
                 );
             }
         },
+        SerialOpcode::DeviceInfo => match DeviceInfoPayload::decode_payload(&trace.response.payload) {
+            Ok(payload) => {
+                println!(
+                    "OK: {label} opcode={:?}, sequence={}, protocol={}, kind={}, responder_version={}, capabilities=0x{:08x}, clk_hz={}, baud={}, result_words={}, result_stride={}, build_id=0x{:08x}",
+                    trace.response.opcode,
+                    trace.response.sequence,
+                    payload.protocol_version,
+                    payload.device_kind,
+                    payload.responder_version,
+                    payload.capabilities,
+                    payload.clk_hz,
+                    payload.baud,
+                    payload.result_window_words,
+                    payload.result_window_stride_bytes,
+                    payload.build_id
+                );
+            }
+            Err(_) => {
+                println!(
+                    "OK: {label} opcode={:?}, sequence={}, payload_len={}",
+                    trace.response.opcode,
+                    trace.response.sequence,
+                    trace.response.payload.len()
+                );
+            }
+        },
         SerialOpcode::Ack | SerialOpcode::Error => match SerialStatusPayload::decode(&trace.response.payload) {
             Ok(payload) => {
                 println!(
@@ -509,6 +562,9 @@ fn print_usage() {
     println!("Usage:");
     println!("  cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --list");
     println!("  cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --baud 115200 --timeout-ms 1000");
+    println!(
+        "  cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --device-info --baud 115200 --timeout-ms 1000"
+    );
     println!(
         "  cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --bringup-suite --baud 115200 --timeout-ms 1000"
     );
@@ -587,6 +643,14 @@ mod tests {
 
         assert_eq!(args.port.as_deref(), Some("COM3"));
         assert_eq!(args.command, ProbeCommand::BringupSuite);
+    }
+
+    #[test]
+    fn parse_device_info_arguments() {
+        let args = parse_args(vec!["--port".into(), "COM3".into(), "--device-info".into()]).unwrap();
+
+        assert_eq!(args.port.as_deref(), Some("COM3"));
+        assert_eq!(args.command, ProbeCommand::DeviceInfo);
     }
 
     #[test]
