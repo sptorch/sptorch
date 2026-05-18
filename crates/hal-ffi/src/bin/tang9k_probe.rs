@@ -1,7 +1,9 @@
-use serde::Serialize;
 use sptorch_hal::serial::{
     DeviceInfoPayload, ResultValue32Payload, ResultWindowStatusPayload, ScratchValue32Payload, SerialOpcode,
     SerialStatusPayload,
+};
+use sptorch_hal_ffi::probe_record::{
+    format_probe_bytes_hex, suite_trace_records, ProbeRecord, ProbeRecordMetadata, TraceRecord,
 };
 use sptorch_hal_ffi::serial_backend::{
     list_tang9k_serial_ports, probe_tang9k_bringup_suite_with_trace, probe_tang9k_device_info_with_trace,
@@ -10,7 +12,7 @@ use sptorch_hal_ffi::serial_backend::{
     probe_tang9k_result_window_status_smoke_with_trace, probe_tang9k_scratch_smoke_with_trace,
 };
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 #[derive(Debug)]
 struct Args {
@@ -22,7 +24,7 @@ struct Args {
     record_json: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProbeCommand {
     Ping,
     DeviceInfo,
@@ -45,6 +47,12 @@ impl Default for Args {
             dump_raw: false,
             record_json: None,
         }
+    }
+}
+
+impl std::fmt::Display for ProbeCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
     }
 }
 
@@ -179,7 +187,7 @@ fn main() {
                                 &suite.result_oob_rejected_read.raw_response_bytes,
                             );
                         }
-                        let records = suite_records(&suite);
+                        let records = suite_trace_records(&suite);
                         write_suite_record_if_requested(&args, &port, records);
                     }
                     Err(err) => {
@@ -476,197 +484,14 @@ fn parse_args(raw: Vec<String>) -> Result<Args, String> {
     Ok(args)
 }
 
-#[derive(Debug, Serialize)]
-struct ProbeRecord {
-    schema: &'static str,
-    timestamp_unix_ms: u128,
-    command: ProbeCommand,
-    port: String,
-    baud: u32,
-    timeout_ms: u64,
-    status: &'static str,
-    traces: Vec<TraceRecord>,
-    error: Option<ErrorRecord>,
-}
-
-#[derive(Debug, Serialize)]
-struct TraceRecord {
-    label: String,
-    opcode: String,
-    sequence: u32,
-    payload_len: usize,
-    request_raw_len: usize,
-    request_raw_hex: String,
-    response_raw_len: usize,
-    response_raw_hex: String,
-    decoded: TraceDecodedRecord,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "record_type")]
-enum TraceDecodedRecord {
-    Generic {
-        payload_hex: String,
-    },
-    Status {
-        status: String,
-        detail: u32,
-    },
-    ScratchValue32 {
-        offset: u32,
-        value: u32,
-    },
-    ResultValue32 {
-        offset: u32,
-        value: u32,
-    },
-    ResultWindowStatus {
-        valid: bool,
-        words: u8,
-        stride: u16,
-        base: u32,
-        last_sequence: u32,
-    },
-    DeviceInfo {
-        protocol: u8,
-        kind: u8,
-        responder_version: u16,
-        capabilities: u32,
-        clk_hz: u32,
-        baud: u32,
-        result_words: u8,
-        result_stride: u8,
-        build_id: u32,
-    },
-}
-
-#[derive(Debug, Serialize)]
-struct ErrorRecord {
-    message: String,
-    request_raw_len: usize,
-    request_raw_hex: String,
-    response_raw_len: usize,
-    response_raw_hex: String,
-}
-
-impl TraceRecord {
-    fn from_trace(label: &str, trace: &sptorch_hal_ffi::serial_backend::UartTang9kExchangeTrace) -> Self {
-        Self {
-            label: label.to_string(),
-            opcode: format!("{:?}", trace.response.opcode),
-            sequence: trace.response.sequence,
-            payload_len: trace.response.payload.len(),
-            request_raw_len: trace.request_bytes.len(),
-            request_raw_hex: format_hex(&trace.request_bytes),
-            response_raw_len: trace.raw_response_bytes.len(),
-            response_raw_hex: format_hex(&trace.raw_response_bytes),
-            decoded: decode_trace_payload(trace),
-        }
-    }
-}
-
-fn decode_trace_payload(trace: &sptorch_hal_ffi::serial_backend::UartTang9kExchangeTrace) -> TraceDecodedRecord {
-    match trace.response.opcode {
-        SerialOpcode::ScratchValue32 => ScratchValue32Payload::decode_payload(&trace.response.payload)
-            .map(|payload| TraceDecodedRecord::ScratchValue32 {
-                offset: payload.offset,
-                value: payload.value,
-            })
-            .unwrap_or_else(|_| generic_decoded_payload(&trace.response.payload)),
-        SerialOpcode::ResultValue32 => ResultValue32Payload::decode_payload(&trace.response.payload)
-            .map(|payload| TraceDecodedRecord::ResultValue32 {
-                offset: payload.offset,
-                value: payload.value,
-            })
-            .unwrap_or_else(|_| generic_decoded_payload(&trace.response.payload)),
-        SerialOpcode::ResultWindowStatus => ResultWindowStatusPayload::decode_payload(&trace.response.payload)
-            .map(|payload| TraceDecodedRecord::ResultWindowStatus {
-                valid: payload.valid(),
-                words: payload.word_count,
-                stride: payload.stride_bytes,
-                base: payload.base_offset,
-                last_sequence: payload.last_sequence,
-            })
-            .unwrap_or_else(|_| generic_decoded_payload(&trace.response.payload)),
-        SerialOpcode::DeviceInfo => DeviceInfoPayload::decode_payload(&trace.response.payload)
-            .map(|payload| TraceDecodedRecord::DeviceInfo {
-                protocol: payload.protocol_version,
-                kind: payload.device_kind,
-                responder_version: payload.responder_version,
-                capabilities: payload.capabilities,
-                clk_hz: payload.clk_hz,
-                baud: payload.baud,
-                result_words: payload.result_window_words,
-                result_stride: payload.result_window_stride_bytes,
-                build_id: payload.build_id,
-            })
-            .unwrap_or_else(|_| generic_decoded_payload(&trace.response.payload)),
-        SerialOpcode::Ack | SerialOpcode::Error => SerialStatusPayload::decode(&trace.response.payload)
-            .map(|payload| TraceDecodedRecord::Status {
-                status: format!("{:?}", payload.code),
-                detail: payload.detail,
-            })
-            .unwrap_or_else(|_| generic_decoded_payload(&trace.response.payload)),
-        _ => generic_decoded_payload(&trace.response.payload),
-    }
-}
-
-fn generic_decoded_payload(payload: &[u8]) -> TraceDecodedRecord {
-    TraceDecodedRecord::Generic {
-        payload_hex: format_hex(payload),
-    }
-}
-
-fn suite_records(suite: &sptorch_hal_ffi::serial_backend::Tang9kBringupSuiteTrace) -> Vec<TraceRecord> {
-    let mut records = vec![
-        TraceRecord::from_trace("suite device info", &suite.device_info),
-        TraceRecord::from_trace("suite ping", &suite.ping),
-        TraceRecord::from_trace("suite matmul", &suite.matmul),
-        TraceRecord::from_trace("suite scratch write", &suite.scratch_write),
-        TraceRecord::from_trace("suite scratch read", &suite.scratch_read),
-        TraceRecord::from_trace("suite status matmul", &suite.result_window_status_matmul),
-        TraceRecord::from_trace("suite status", &suite.result_window_status),
-    ];
-    for (idx, trace) in suite.result_window.iter().enumerate() {
-        let label = if idx == 0 {
-            "suite result window matmul".to_string()
-        } else {
-            format!("suite result window read {}", idx - 1)
-        };
-        records.push(TraceRecord::from_trace(&label, trace));
-    }
-    for (idx, trace) in suite.result_oob_setup.iter().enumerate() {
-        let label = if idx == 0 {
-            "suite oob matmul".to_string()
-        } else {
-            format!("suite oob setup read {}", idx - 1)
-        };
-        records.push(TraceRecord::from_trace(&label, trace));
-    }
-    records.push(TraceRecord::from_trace(
-        "suite oob rejected read",
-        &suite.result_oob_rejected_read,
-    ));
-    records
-}
-
 fn write_single_record_if_requested(args: &Args, port: &str, trace: TraceRecord) {
     write_suite_record_if_requested(args, port, vec![trace]);
 }
 
 fn write_suite_record_if_requested(args: &Args, port: &str, traces: Vec<TraceRecord>) {
     if let Some(path) = &args.record_json {
-        let record = ProbeRecord {
-            schema: "sptorch.tang9k.probe.v1",
-            timestamp_unix_ms: timestamp_unix_ms(),
-            command: args.command,
-            port: port.to_string(),
-            baud: args.baud,
-            timeout_ms: args.timeout_ms,
-            status: "ok",
-            traces,
-            error: None,
-        };
+        let metadata = ProbeRecordMetadata::new(args.command.to_string(), port, args.baud, args.timeout_ms);
+        let record = ProbeRecord::ok(&metadata, traces);
         write_record_json_or_exit(path, &record);
         println!("record_json={}", path.display());
     }
@@ -678,52 +503,18 @@ fn write_error_record_if_requested(
     err: &sptorch_hal_ffi::serial_backend::UartTang9kExchangeError,
 ) {
     if let Some(path) = &args.record_json {
-        let record = ProbeRecord {
-            schema: "sptorch.tang9k.probe.v1",
-            timestamp_unix_ms: timestamp_unix_ms(),
-            command: args.command,
-            port: port.to_string(),
-            baud: args.baud,
-            timeout_ms: args.timeout_ms,
-            status: "error",
-            traces: Vec::new(),
-            error: Some(ErrorRecord {
-                message: err.to_string(),
-                request_raw_len: err.request_bytes.len(),
-                request_raw_hex: format_hex(&err.request_bytes),
-                response_raw_len: err.raw_response_bytes.len(),
-                response_raw_hex: format_hex(&err.raw_response_bytes),
-            }),
-        };
+        let metadata = ProbeRecordMetadata::new(args.command.to_string(), port, args.baud, args.timeout_ms);
+        let record = ProbeRecord::error(&metadata, err);
         write_record_json_or_exit(path, &record);
         eprintln!("record_json={}", path.display());
     }
 }
 
 fn write_record_json_or_exit(path: &PathBuf, record: &ProbeRecord) {
-    let json = serde_json::to_string_pretty(record).unwrap_or_else(|err| {
-        eprintln!("failed to encode probe record JSON: {err}");
-        std::process::exit(1);
-    });
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).unwrap_or_else(|err| {
-                eprintln!("failed to create record directory {}: {err}", parent.display());
-                std::process::exit(1);
-            });
-        }
-    }
-    std::fs::write(path, json).unwrap_or_else(|err| {
+    record.write_pretty_json(path).unwrap_or_else(|err| {
         eprintln!("failed to write probe record {}: {err}", path.display());
         std::process::exit(1);
     });
-}
-
-fn timestamp_unix_ms() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
 }
 
 fn print_trace_summary(label: &str, trace: &sptorch_hal_ffi::serial_backend::UartTang9kExchangeTrace) {
@@ -851,15 +642,7 @@ fn print_raw_exchange(label: &str, request_bytes: &[u8], response_bytes: &[u8]) 
 }
 
 fn format_hex(bytes: &[u8]) -> String {
-    if bytes.is_empty() {
-        return "<empty>".into();
-    }
-
-    bytes
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<Vec<_>>()
-        .join(" ")
+    format_probe_bytes_hex(bytes)
 }
 
 fn print_usage() {
@@ -894,7 +677,6 @@ fn print_usage() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sptorch_hal::serial::{SerialFrame, TANG9K_UART_RESPONDER_BUILD_ID};
 
     #[test]
     fn parse_defaults_to_list_mode() {
@@ -961,47 +743,6 @@ mod tests {
             args.record_json.as_deref(),
             Some(std::path::Path::new("target/tang9k/device-info.json"))
         );
-    }
-
-    #[test]
-    fn writes_probe_record_json_for_single_trace() {
-        let output = std::env::temp_dir().join(format!(
-            "sptorch-tang9k-probe-record-{}-{}.json",
-            std::process::id(),
-            timestamp_unix_ms()
-        ));
-        let args = Args {
-            port: Some("COM3".into()),
-            baud: 115_200,
-            timeout_ms: 1_000,
-            command: ProbeCommand::DeviceInfo,
-            dump_raw: false,
-            record_json: Some(output.clone()),
-        };
-        let payload = DeviceInfoPayload::tang9k_uart_responder();
-        let frame = payload.into_frame(11);
-        let trace = sptorch_hal_ffi::serial_backend::UartTang9kExchangeTrace {
-            request_bytes: SerialFrame::new(SerialOpcode::DeviceInfoRead, 11, Vec::new())
-                .encode()
-                .unwrap(),
-            raw_response_bytes: frame.encode().unwrap(),
-            response: frame,
-        };
-
-        write_single_record_if_requested(&args, "COM3", TraceRecord::from_trace("device info", &trace));
-
-        let json = std::fs::read_to_string(&output).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(value["schema"], "sptorch.tang9k.probe.v1");
-        assert_eq!(value["status"], "ok");
-        assert_eq!(value["command"], "DeviceInfo");
-        assert_eq!(value["traces"][0]["decoded"]["record_type"], "DeviceInfo");
-        assert_eq!(
-            value["traces"][0]["decoded"]["build_id"],
-            TANG9K_UART_RESPONDER_BUILD_ID
-        );
-
-        let _ = std::fs::remove_file(output);
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! PCIe/串口后端可以在不侵入 core-ops 的情况下接入框架。C ABI 以
 //! `include/sptorch_hal.h` 为准。
 
+pub mod probe_record;
 pub mod serial_backend;
 
 use libloading::{Library, Symbol};
