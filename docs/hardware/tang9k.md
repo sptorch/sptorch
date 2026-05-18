@@ -4,6 +4,28 @@
 
 外部板卡资料仍以 Sipeed 官方 Tang Nano 9K Wiki 为准：<https://wiki.sipeed.com/hardware/zh/tang/Tang-Nano-9K/Nano-9K.html>。本页只记录 SPTorch 项目内已经验证或正在推进的约定。
 
+- 硬件文档总入口：[SPTorch Hardware Wiki](README.md)
+- 线协议标准：[Tang9k Serial Protocol v1](../tang9k-serial-protocol-v1.md)
+- responder 工程页：[Tang9k UART Responder README](../../hardware/tang9k/uart_responder/README.md)
+
+## 页面导航
+
+- [当前定位](#当前定位)
+- [板卡速览](#板卡速览)
+- [当前验收状态](#当前验收状态)
+- [连接与数据流](#连接与数据流)
+- [仓库地图](#仓库地图)
+- [命令速查](#命令速查)
+- [工具准备](#工具准备)
+- [构建 bitstream](#构建-bitstream)
+- [SRAM 烧录](#sram-烧录)
+- [Host 验收阶梯](#host-验收阶梯)
+- [当前真实板卡记录](#当前真实板卡记录)
+- [LED 观测](#led-观测)
+- [故障排查](#故障排查)
+- [协议演进规范](#协议演进规范)
+- [后续路线](#后续路线)
+
 ## 当前定位
 
 Tang9k 是 SPTorch HAL 的第一块真实 FPGA 控制面验证板。它现在不承担完整训练加速，不承诺矩阵结果已经来自真实 PE 阵列；当前阶段先把下面几件事练扎实：
@@ -32,6 +54,48 @@ Tang9k 是 SPTorch HAL 的第一块真实 FPGA 控制面验证板。它现在不
 
 官方 wiki 还列出了 HDMI、RGB/SPI 屏幕接口、SPI Flash、PSRAM、用户按键、LED、TF 卡座和扩展排针等板级资源。SPTorch 当前只依赖 USB-JTAG、USB-UART、27 MHz 时钟和 LED 观测；其他资源先不纳入核心假设，避免硬件 bring-up 阶段过早扩张。
 
+## 当前验收状态
+
+| 能力 | Host / 测试 | RTL | COM3 真板 | 说明 |
+| --- | --- | --- | --- | --- |
+| `Ping -> Pong` | 已接入 | 已接入 | 已通过 | 最小 UART 闭环 |
+| `Matmul32x32 -> Ack/Ok` | 已接入 | 已接入 | 已通过 | 当前仍是控制面 smoke，不是真实矩阵计算 |
+| `ScratchWrite32/ScratchRead32` | 已接入 | 已接入 | 已通过 | 第一条非 ACK 数据面回环 |
+| `ResultRead32/ResultValue32` | 已接入 | 已接入 | 已通过 | 读取确定性摘要窗口 |
+| `ResultWindowStatus` | 已接入 | 已接入 | 已通过 | 暴露 valid/base/stride/last-sequence |
+| OOB 拒绝 | 已接入 | 已接入 | 已通过 | 越界读返回 `HardwareFault` |
+| `DeviceInfo` | 已接入 | 已接入 | 待复测 | 最新 RTL 还需重新 build、烧录、COM3 验收 |
+
+## 连接与数据流
+
+```text
+Windows host
+  |
+  |  USB
+  v
+Tang Nano 9K 板载 BL702
+  | \
+  |  \__ USB-JTAG  -> Gowin Programmer / USB Debugger A
+  |
+  \_____ USB-UART  -> COM3 @ 115200 8N1
+                  -> SPTorch tang9k_probe
+                  -> serial v1 frames
+                  -> FPGA UART responder RTL
+```
+
+从软件栈角度看，当前闭环是：
+
+```text
+tang9k_probe
+  -> UartTang9kTransport
+  -> SerialFrame / SerialSubmitQueue
+  -> USB-UART / COM3
+  -> tang9k_uart_responder.v
+  -> DeviceInfo / Pong / Ack / ScratchValue32 / ResultValue32
+```
+
+这张图里最值得守住的边界，是 `SerialFrame`。只要 host 和 FPGA 对这一层字节语义保持一致，后面的 UART、DMA 甚至多板 transport 才能逐步替换，而不会把每层都重写一遍。
+
 ## 仓库地图
 
 | 路径 | 作用 |
@@ -47,6 +111,20 @@ Tang9k 是 SPTorch HAL 的第一块真实 FPGA 控制面验证板。它现在不
 | `crates/hal/tests/tang9k_serial_golden.rs` | 协议字节级黄金样例 |
 
 原则很简单：RTL、host parser、golden vector、协议文档必须一起前进。只改一边很容易制造“看起来能跑，实际已经漂移”的硬件幽灵。
+
+## 命令速查
+
+| 目标 | 命令 |
+| --- | --- |
+| 只列出串口 | `cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --list` |
+| 查询 responder 身份 | `cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --device-info --baud 115200 --timeout-ms 1000 --dump-raw` |
+| 最小 UART 闭环 | `cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --baud 115200 --timeout-ms 1000` |
+| 命令生命周期 smoke | `cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --matmul-smoke --baud 115200 --timeout-ms 1000 --dump-raw` |
+| scratch 数据面 | `cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --scratch-smoke --baud 115200 --timeout-ms 1000 --dump-raw` |
+| 结果窗口状态 | `cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-window-status-smoke --baud 115200 --timeout-ms 1000 --dump-raw` |
+| 结果窗口 4-word 读回 | `cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-window-smoke --baud 115200 --timeout-ms 1000 --dump-raw` |
+| 结果窗口越界拒绝 | `cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-oob-smoke --baud 115200 --timeout-ms 1000 --dump-raw` |
+| 完整 bring-up suite | `cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --bringup-suite --baud 115200 --timeout-ms 1000 --dump-raw` |
 
 ## 工具准备
 
@@ -278,4 +356,3 @@ DeviceInfo expected response: protocol=1, kind=1, responder_version=1, capabilit
 - 在 result window 之后推进真实矩阵结果缓冲区，而不是只返回确定性摘要。
 - 设计最小 DMA/streaming data-plane，让 host 能上传 tile 数据、触发计算、读回结果。
 - 把单板协议稳定后，再接入多 Tang9k board 的拓扑验证、ring allreduce dry-run 和 matmul shard plan。
-

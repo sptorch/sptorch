@@ -58,7 +58,7 @@ External ecosystem repositories:
 - `UartTang9kTransport` and `tang9k_probe` provide the first real serial bring-up path: list visible COM ports first, then query `DeviceInfo`, send protocol `Ping`, `Matmul32x32`, scratch write/read, single result, 4-word result-window, OOB, or result-window status probes after confirming the Tang9k port.
 - `hardware/tang9k/uart_responder` contains the first minimal Gowin bitstream project for real Tang9k smoke testing: it receives serial-v1 `DeviceInfoRead` and returns protocol/build/capability metadata; it receives `Ping` over USB-UART and returns a checksum-valid `Pong`; it accepts `Matmul32x32` and returns checksum-valid `Ack/Ok`; it stores/reads back one 32-bit scratch value; it also records a deterministic 4-word MatMul summary window and exposes its validity/base/stride/last-sequence status for result readback.
 - `sptorch-hal::serial::SerialStreamDecoder` standardizes byte-stream framing for UART/USB-CDC transports before strict frame decoding.
-- Tang9k board bring-up has a repo-owned wiki-style entry page: [docs/hardware/tang9k.md](docs/hardware/tang9k.md).
+- Hardware bring-up now has a repo-owned wiki entry point at [docs/hardware/README.md](docs/hardware/README.md), with the Tang9k board page at [docs/hardware/tang9k.md](docs/hardware/tang9k.md).
 - Tang9k serial v1 is now documented as a strict wire contract: [docs/tang9k-serial-protocol-v1.md](docs/tang9k-serial-protocol-v1.md).
 - Tang9k protocol conformance is guarded by byte-level golden vectors in `crates/hal/tests/tang9k_serial_golden.rs`.
 - `sptorch-distributed::hardware_parallel` turns a hardware topology into dry-run validation plans for multi-board matmul + allreduce before real serial/PCIe DMA is wired in.
