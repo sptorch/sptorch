@@ -2,6 +2,8 @@
 
 这个工程是 SPTorch HAL 串行协议的第一块真实板卡烟测固件。它不进入训练路径，先把控制面练稳：通过 Tang Nano 9K / Tang9k 的 USB-UART 收到 SPTorch serial v1 `DeviceInfoRead` 后回传 responder 协议版本、能力位和 build id；收到 `Ping` 后回传 checksum 正确、sequence 相同的 `Pong`；收到最小 `Matmul32x32` 控制帧后回传 `Ack/Ok`；收到 `ScratchWrite32` 后保存一个 32-bit 槽位，并在 `ScratchRead32` 时用 `ScratchValue32` 读回；收到 MatMul 后还会写入一个确定性的 4-word 结果窗口，供 `ResultRead32 -> ResultValue32` 烟测读取，并通过 `ResultWindowStatusRead -> ResultWindowStatus` 暴露窗口 valid/base/stride/last-sequence 元信息。真正 PE 阵列、DMA 和完整矩阵结果缓冲区会在下一层接入。
 
+板卡级资料、烧录链路、COM3 验收阶梯和故障排查统一维护在 [SPTorch Tang9k Wiki](../../../docs/hardware/tang9k.md)。本 README 只保留 responder 工程自身的构建、烧录和验收细节。
+
 ## 目标板与链路
 
 - FPGA：Gowin `GW1NR-9C` / Tang Nano 9K 常见板型。
