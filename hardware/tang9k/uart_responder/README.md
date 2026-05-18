@@ -42,6 +42,7 @@ $fs = (Resolve-Path hardware\tang9k\uart_responder\impl\pnr\tang9k_uart_responde
 
 ```powershell
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --baud 115200 --timeout-ms 1000
+cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --bringup-suite --baud 115200 --timeout-ms 1000
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --matmul-smoke --baud 115200 --timeout-ms 1000
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --matmul-smoke --baud 115200 --timeout-ms 1000 --dump-raw
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-smoke --baud 115200 --timeout-ms 1000 --dump-raw
@@ -55,6 +56,16 @@ cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --scratch-smoke -
 
 ```text
 OK: response opcode=Pong, sequence=0, payload_len=0
+```
+
+`BringupSuite` 期望输出会把 `Ping`、`MatmulSmoke`、`ScratchSmoke`、`ResultWindowStatusSmoke`、`ResultWindowSmoke` 和 `ResultOobSmoke` 顺序串起来，每一步都保留自己的 `OK:` 行和 raw bytes。这个命令适合每次重新烧录后第一时间跑一遍，确认板卡已经回到可用状态。
+
+当前实测的 `BringupSuite` 总结行：
+
+```text
+OK: bringup suite completed sequentially
+OK: suite status opcode=ResultWindowStatus, sequence=10, valid=true, words=4, stride=4, base=0x00002000, last_sequence=4
+OK: suite oob rejected read opcode=Error, sequence=9, status=HardwareFault, detail=0x00002010
 ```
 
 `MatmulSmoke` 期望输出类似：

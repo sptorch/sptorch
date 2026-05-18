@@ -256,6 +256,8 @@ $fs = (Resolve-Path hardware\tang9k\uart_responder\impl\pnr\tang9k_uart_responde
 & 'C:\Gowin\Gowin_V1.9.12.02_SP2_x64\Programmer\bin\programmer_cli.exe' --device GW1NR-9C --operation_index 2 --fsFile $fs --cable "USB Debugger A" --frequency 2.5MHz
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --list
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --baud 115200 --timeout-ms 1000
+cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --bringup-suite --baud 115200 --timeout-ms 1000
+cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --bringup-suite --baud 115200 --timeout-ms 1000 --dump-raw
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --matmul-smoke --baud 115200 --timeout-ms 1000
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --matmul-smoke --baud 115200 --timeout-ms 1000 --dump-raw
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --result-smoke --baud 115200 --timeout-ms 1000
@@ -274,6 +276,7 @@ Rules:
 
 - `--list` must be used first because it does not write to any device.
 - `--port` sends exactly one `Ping` frame with sequence `0` and payload `sptorch-ping`.
+- `--bringup-suite` runs the current acceptance probes sequentially on one COM port: `Ping`, `Matmul32x32`, scratch write/read, result-window status, four result-window reads, and the OOB rejection check.
 - `--matmul-smoke` sends exactly one `Matmul32x32` command frame with sequence `1`.
 - `--result-smoke` sends one `Matmul32x32` command frame with sequence `4`, then one `ResultRead32` frame with sequence `5`, and checks the returned `ResultValue32`.
 - `--result-window-smoke` sends one `Matmul32x32` command frame with sequence `4`, then four `ResultRead32` frames with sequences `5..8`, and checks all four returned `ResultValue32` words.
@@ -292,6 +295,7 @@ Real-board acceptance recorded on 2026-05-18:
 - SRAM Program status: `0x0003F020`.
 - UART port: `COM3`, `115200 8N1`.
 - Ping host result: `OK: response opcode=Pong, sequence=0, payload_len=0`.
+- Bring-up suite host result: `OK: bringup suite completed sequentially`.
 - Matmul smoke host result: `OK: response opcode=Ack, sequence=1, payload_len=8`.
 - Matmul smoke ACK response bytes:
 

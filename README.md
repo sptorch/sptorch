@@ -66,6 +66,9 @@ External ecosystem repositories:
 # Safe: lists serial ports without writing to the board.
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --list
 
+# Runs the full Tang9k bring-up suite in sequence after you have confirmed the COM port.
+cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --bringup-suite --baud 115200 --timeout-ms 1000
+
 # Sends one Tang9k protocol Ping after you have confirmed the COM port.
 cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --baud 115200 --timeout-ms 1000
 
@@ -102,6 +105,7 @@ Host result window: COM3 @ 115200 -> OK: ResultValue32 offset=0x00002000, value=
 Host result window 4-word smoke: COM3 @ 115200 -> [0x00003005, 0x9e3749bc, 0x3c6ec377, 0xdaa65d2e]
 Host result window status: COM3 @ 115200 -> OK: ResultWindowStatus valid=true, words=4, stride=4, base=0x00002000, last_sequence=4
 Host result window OOB: COM3 @ 115200 -> Error HardwareFault detail=0x00002010
+Host bring-up suite: COM3 @ 115200 -> OK: bringup suite completed sequentially
 Ack raw response: 53 50 01 7e 01 00 00 00 08 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 b8 59 20 24 00 00 00 00
 ResultWindowStatus raw response: 53 50 01 33 0a 00 00 00 10 00 00 00 00 00 00 00 01 04 04 00 00 20 00 00 04 00 00 00 00 00 00 00 75 00 79 ea 00 00 00 00
 ```

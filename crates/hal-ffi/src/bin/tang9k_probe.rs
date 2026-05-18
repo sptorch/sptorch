@@ -2,8 +2,8 @@ use sptorch_hal::serial::{
     ResultValue32Payload, ResultWindowStatusPayload, ScratchValue32Payload, SerialOpcode, SerialStatusPayload,
 };
 use sptorch_hal_ffi::serial_backend::{
-    list_tang9k_serial_ports, probe_tang9k_matmul_smoke_with_trace, probe_tang9k_ping_with_trace,
-    probe_tang9k_result_oob_smoke_with_trace, probe_tang9k_result_smoke_with_trace,
+    list_tang9k_serial_ports, probe_tang9k_bringup_suite_with_trace, probe_tang9k_matmul_smoke_with_trace,
+    probe_tang9k_ping_with_trace, probe_tang9k_result_oob_smoke_with_trace, probe_tang9k_result_smoke_with_trace,
     probe_tang9k_result_window_smoke_with_trace, probe_tang9k_result_window_status_smoke_with_trace,
     probe_tang9k_scratch_smoke_with_trace,
 };
@@ -21,6 +21,7 @@ struct Args {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProbeCommand {
     Ping,
+    BringupSuite,
     MatmulSmoke,
     ResultSmoke,
     ResultWindowSmoke,
@@ -61,6 +62,91 @@ fn main() {
                         print_trace_summary("response", &trace);
                         if args.dump_raw {
                             print_raw_exchange("response", &trace.request_bytes, &trace.raw_response_bytes);
+                        }
+                    }
+                    Err(err) => {
+                        print_probe_error(args.dump_raw, err);
+                    }
+                }
+            }
+            ProbeCommand::BringupSuite => {
+                let result =
+                    probe_tang9k_bringup_suite_with_trace(&port, args.baud, Duration::from_millis(args.timeout_ms));
+                match result {
+                    Ok(suite) => {
+                        println!("OK: bringup suite completed sequentially");
+                        print_trace_summary("suite ping", &suite.ping);
+                        print_trace_summary("suite matmul", &suite.matmul);
+                        print_trace_summary("suite scratch write", &suite.scratch_write);
+                        print_trace_summary("suite scratch read", &suite.scratch_read);
+                        print_trace_summary("suite status matmul", &suite.result_window_status_matmul);
+                        print_trace_summary("suite status", &suite.result_window_status);
+                        for (idx, trace) in suite.result_window.iter().enumerate() {
+                            let label = if idx == 0 {
+                                "suite result window matmul".to_string()
+                            } else {
+                                format!("suite result window read {}", idx - 1)
+                            };
+                            print_trace_summary(&label, trace);
+                        }
+                        for (idx, trace) in suite.result_oob_setup.iter().enumerate() {
+                            let label = if idx == 0 {
+                                "suite oob matmul".to_string()
+                            } else {
+                                format!("suite oob setup read {}", idx - 1)
+                            };
+                            print_trace_summary(&label, trace);
+                        }
+                        print_trace_summary("suite oob rejected read", &suite.result_oob_rejected_read);
+
+                        if args.dump_raw {
+                            print_raw_exchange("suite ping", &suite.ping.request_bytes, &suite.ping.raw_response_bytes);
+                            print_raw_exchange(
+                                "suite matmul",
+                                &suite.matmul.request_bytes,
+                                &suite.matmul.raw_response_bytes,
+                            );
+                            print_raw_exchange(
+                                "suite scratch write",
+                                &suite.scratch_write.request_bytes,
+                                &suite.scratch_write.raw_response_bytes,
+                            );
+                            print_raw_exchange(
+                                "suite scratch read",
+                                &suite.scratch_read.request_bytes,
+                                &suite.scratch_read.raw_response_bytes,
+                            );
+                            print_raw_exchange(
+                                "suite status matmul",
+                                &suite.result_window_status_matmul.request_bytes,
+                                &suite.result_window_status_matmul.raw_response_bytes,
+                            );
+                            print_raw_exchange(
+                                "suite status",
+                                &suite.result_window_status.request_bytes,
+                                &suite.result_window_status.raw_response_bytes,
+                            );
+                            for (idx, trace) in suite.result_window.iter().enumerate() {
+                                let label = if idx == 0 {
+                                    "suite result window matmul".to_string()
+                                } else {
+                                    format!("suite result window read {}", idx - 1)
+                                };
+                                print_raw_exchange(&label, &trace.request_bytes, &trace.raw_response_bytes);
+                            }
+                            for (idx, trace) in suite.result_oob_setup.iter().enumerate() {
+                                let label = if idx == 0 {
+                                    "suite oob matmul".to_string()
+                                } else {
+                                    format!("suite oob setup read {}", idx - 1)
+                                };
+                                print_raw_exchange(&label, &trace.request_bytes, &trace.raw_response_bytes);
+                            }
+                            print_raw_exchange(
+                                "suite oob rejected read",
+                                &suite.result_oob_rejected_read.request_bytes,
+                                &suite.result_oob_rejected_read.raw_response_bytes,
+                            );
                         }
                     }
                     Err(err) => {
@@ -274,6 +360,10 @@ fn parse_args(raw: Vec<String>) -> Result<Args, String> {
                 args.command = ProbeCommand::MatmulSmoke;
                 idx += 1;
             }
+            "--bringup-suite" => {
+                args.command = ProbeCommand::BringupSuite;
+                idx += 1;
+            }
             "--result-smoke" => {
                 args.command = ProbeCommand::ResultSmoke;
                 idx += 1;
@@ -420,6 +510,9 @@ fn print_usage() {
     println!("  cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --list");
     println!("  cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --baud 115200 --timeout-ms 1000");
     println!(
+        "  cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --bringup-suite --baud 115200 --timeout-ms 1000"
+    );
+    println!(
         "  cargo run -p sptorch-hal-ffi --bin tang9k_probe -- --port COM3 --matmul-smoke --baud 115200 --timeout-ms 1000"
     );
     println!(
@@ -486,6 +579,14 @@ mod tests {
         assert_eq!(args.timeout_ms, 250);
         assert_eq!(args.command, ProbeCommand::MatmulSmoke);
         assert!(args.dump_raw);
+    }
+
+    #[test]
+    fn parse_bringup_suite_arguments() {
+        let args = parse_args(vec!["--port".into(), "COM3".into(), "--bringup-suite".into()]).unwrap();
+
+        assert_eq!(args.port.as_deref(), Some("COM3"));
+        assert_eq!(args.command, ProbeCommand::BringupSuite);
     }
 
     #[test]

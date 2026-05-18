@@ -90,6 +90,24 @@ impl fmt::Display for UartTang9kExchangeError {
 
 impl std::error::Error for UartTang9kExchangeError {}
 
+/// Tang9k 真实板卡最小验收套件的完整 trace。
+///
+/// 单条 probe 适合定位某个协议点；bring-up suite 则用于“烧录后先跑一遍”的标准动作。
+/// 它故意保存每个阶段的原始 trace，而不是只给一个 passed/failed 标志：硬件 bring-up 失败时，
+/// 最贵的不是失败本身，而是不知道失败发生在链路、命令生命周期、数据面、窗口边界还是状态问诊。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tang9kBringupSuiteTrace {
+    pub ping: UartTang9kExchangeTrace,
+    pub matmul: UartTang9kExchangeTrace,
+    pub scratch_write: UartTang9kExchangeTrace,
+    pub scratch_read: UartTang9kExchangeTrace,
+    pub result_window_status_matmul: UartTang9kExchangeTrace,
+    pub result_window_status: UartTang9kExchangeTrace,
+    pub result_window: Vec<UartTang9kExchangeTrace>,
+    pub result_oob_setup: Vec<UartTang9kExchangeTrace>,
+    pub result_oob_rejected_read: UartTang9kExchangeTrace,
+}
+
 /// Windows/Linux/macOS 串口传输层。
 ///
 /// 这个实现只负责字节流 I/O：写入一帧、持续读取，直到 `SerialStreamDecoder`
@@ -404,6 +422,38 @@ pub fn probe_tang9k_scratch_smoke_with_trace(
     }
 
     Ok((write_trace, read_trace))
+}
+
+/// 串起 Tang9k 最小验收路径：Ping -> MatMul -> Scratch -> ResultWindowStatus -> ResultWindow -> OOB。
+///
+/// 这条路径的目标不是压测吞吐，而是把“烧录后先跑哪些命令”固定下来。它能快速给出一份
+/// 可读的硬件健康报告，并且把每一步的原始请求/响应都留下来，方便在串口日志、Gowin bitstream
+/// 或 RTL 边界之间定位问题。
+pub fn probe_tang9k_bringup_suite_with_trace(
+    port_name: &str,
+    baud_rate: u32,
+    timeout: Duration,
+) -> Result<Tang9kBringupSuiteTrace, UartTang9kExchangeError> {
+    let ping = probe_tang9k_ping_with_trace(port_name, baud_rate, timeout)?;
+    let matmul = probe_tang9k_matmul_smoke_with_trace(port_name, baud_rate, timeout)?;
+    let (scratch_write, scratch_read) = probe_tang9k_scratch_smoke_with_trace(port_name, baud_rate, timeout)?;
+    let (result_window_status_matmul, result_window_status) =
+        probe_tang9k_result_window_status_smoke_with_trace(port_name, baud_rate, timeout)?;
+    let result_window = probe_tang9k_result_window_smoke_with_trace(port_name, baud_rate, timeout)?;
+    let (result_oob_setup, result_oob_rejected_read) =
+        probe_tang9k_result_oob_smoke_with_trace(port_name, baud_rate, timeout)?;
+
+    Ok(Tang9kBringupSuiteTrace {
+        ping,
+        matmul,
+        scratch_write,
+        scratch_read,
+        result_window_status_matmul,
+        result_window_status,
+        result_window,
+        result_oob_setup,
+        result_oob_rejected_read,
+    })
 }
 
 /// 发送一条最小 MatMul 控制帧，再从结果窗口读回一个 32-bit 摘要值。
