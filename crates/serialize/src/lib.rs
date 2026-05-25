@@ -6,6 +6,10 @@ use std::path::Path;
 
 use sptorch_versioning::{CheckpointManifest, CHECKPOINT_MANIFEST_FORMAT_VERSION, CHECKPOINT_MANIFEST_SCHEMA};
 
+/// safetensors 读取与参数回写支持。
+///
+/// 这个模块面向 Candle/HuggingFace 生态的权重互操作。它不承担模型结构推断，
+/// 只负责把外部文件中的张量数据转换成 SPTorch 参数可以消费的形态。
 pub mod safetensors;
 
 const MAGIC: u32 = 0x5350_5443; // "SPTC"
@@ -18,9 +22,14 @@ pub const STATE_DICT_SCHEMA: &str = "sptorch.state_dict.v1";
 /// 当前 JSON state_dict 文件格式版本。
 pub const STATE_DICT_FORMAT_VERSION: u32 = 1;
 
-/// Save model parameters to a binary checkpoint file.
-/// Format: `[magic:u32][version:u32][num_params:u32]`
-///         for each param: `[ndim:u32][shape...:u32][data...:f32]`
+/// 保存按顺序排列的二进制 checkpoint。
+///
+/// 文件格式为：
+/// `[magic:u32][version:u32][num_params:u32]`，随后每个参数写入
+/// `[ndim:u32][shape...:u32][data...:f32]`。
+///
+/// 这个格式体积小、实现简单，但它依赖参数顺序完全一致。新代码如果已经能拿到
+/// 稳定参数名，优先使用 [`save_state_dict`] 或 [`save_state_dict_bundle`]。
 pub fn save_checkpoint<P: AsRef<Path>>(path: P, params: &[Tensor]) -> io::Result<()> {
     let f = File::create(path)?;
     let mut w = BufWriter::new(f);
@@ -46,8 +55,11 @@ pub fn save_checkpoint<P: AsRef<Path>>(path: P, params: &[Tensor]) -> io::Result
     Ok(())
 }
 
-/// Load checkpoint data into existing parameter tensors.
-/// The number and shapes of params must match the checkpoint.
+/// 从二进制 checkpoint 回写参数。
+///
+/// 加载时会检查 magic、版本、参数数量和每个参数 shape。它不会检查参数名称，
+/// 因为旧二进制格式本身不保存名称；因此调用方必须保证传入参数顺序与保存时
+/// 完全一致。
 pub fn load_checkpoint<P: AsRef<Path>>(path: P, params: &[Tensor]) -> io::Result<()> {
     let f = File::open(path)?;
     let mut r = BufReader::new(f);
@@ -121,27 +133,37 @@ pub fn load_checkpoint<P: AsRef<Path>>(path: P, params: &[Tensor]) -> io::Result
 /// 按参数名导出的稳定权重快照条目。
 #[derive(Debug, Clone)]
 pub struct StateDictEntry {
+    /// 参数稳定名称，例如 `blocks.0.attn.wq.weight`。
     pub name: String,
+    /// 参数 shape。
     pub shape: Vec<usize>,
+    /// 参数 dtype。
     pub dtype: DType,
+    /// row-major 连续布局下的 F32 数据。
     pub data: Vec<f32>,
 }
 
 /// 一个模型级别的命名参数快照。
 #[derive(Debug, Clone)]
 pub struct NamedStateDict {
+    /// 按文件顺序保存的命名参数条目。
     pub entries: Vec<StateDictEntry>,
 }
 
 impl NamedStateDict {
-    /// 用命名参数对构造快照。
+    /// 从一组命名参数构造内存快照。
+    ///
+    /// 该方法不会落盘，只读取当前参数数据并形成 [`StateDictEntry`] 列表。
     pub fn from_named_params(params: &[(&str, Tensor)]) -> Self {
         Self {
             entries: export_state_dict(params),
         }
     }
 
-    /// 把快照回写到命名参数集合。
+    /// 把内存快照回写到命名参数集合。
+    ///
+    /// 回写时会复用 [`load_state_dict`] 的严格校验：名称、数量、shape、dtype 和
+    /// 数据长度都必须匹配。
     pub fn load_into(&self, params: &[(&str, Tensor)]) -> io::Result<()> {
         load_state_dict(params, &self.entries)
     }
@@ -183,11 +205,16 @@ pub fn export_state_dict(params: &[(&str, Tensor)]) -> Vec<StateDictEntry> {
 }
 
 /// 保存命名参数快照到 JSON state_dict 文件。
+///
+/// 这是 [`save_state_dict`] 的语义别名，保留它是为了让调用方代码更贴近
+/// “named state dict” 的训练术语。
 pub fn save_named_state_dict<P: AsRef<Path>>(path: P, params: &[(&str, Tensor)]) -> io::Result<()> {
     save_state_dict(path, params)
 }
 
 /// 从 JSON state_dict 文件读取命名参数快照，并回写到模型。
+///
+/// 返回值保留已加载的条目，便于调用方在加载后做额外审计或日志输出。
 pub fn load_named_state_dict<P: AsRef<Path>>(path: P, params: &[(&str, Tensor)]) -> io::Result<NamedStateDict> {
     let entries = load_state_dict_file(path, params)?;
     Ok(NamedStateDict { entries })
@@ -204,6 +231,9 @@ fn manifest_path_for<P: AsRef<Path>>(weights_path: P) -> std::path::PathBuf {
 ///
 /// 这个接口会严格检查名称、shape 和 dtype。只要其中任一项不匹配，就会
 /// 返回错误，避免把错误权重静默灌入模型。
+///
+/// 该函数只处理内存中的 [`StateDictEntry`]；如果要从文件读取，请使用
+/// [`load_state_dict_file`] 或 [`load_state_dict_bundle`]。
 pub fn load_state_dict(params: &[(&str, Tensor)], entries: &[StateDictEntry]) -> io::Result<()> {
     if entries.len() != params.len() {
         return Err(io::Error::new(
@@ -276,6 +306,9 @@ pub fn load_state_dict(params: &[(&str, Tensor)], entries: &[StateDictEntry]) ->
 /// 这个格式优先服务调试、训练闭环测试和轻量产品集成；生产级大权重可以继续走
 /// 二进制 checkpoint 或 safetensors。文件中包含 schema 与版本号，便于未来做
 /// 向后兼容迁移。
+///
+/// JSON state_dict 会保存参数名、shape、dtype 和连续 F32 数据。它比旧二进制
+/// checkpoint 更可读，也不依赖参数顺序来判断“这个权重属于谁”。
 pub fn save_state_dict<P: AsRef<Path>>(path: P, params: &[(&str, Tensor)]) -> io::Result<()> {
     let file = SerializableStateDictFile {
         schema: STATE_DICT_SCHEMA.into(),
@@ -300,6 +333,10 @@ pub fn save_state_dict<P: AsRef<Path>>(path: P, params: &[(&str, Tensor)]) -> io
 /// 这是一条更完整的训练存档路径：权重文件保存数值本体，manifest 保存模型名、
 /// 参数名、参数数量、格式版本和权重文件名。这样训练恢复时不需要猜测“这份
 /// state_dict 属于谁”，而是可以按清单精确回放。
+///
+/// `manifest` 中的 schema、版本、权重文件名、参数数量、参数名和
+/// `state_dict_schema` 会被当前参数集合重写为一致值；调用方可以把
+/// `model_name`、`created_at_ms` 和 `note` 作为业务上下文传入。
 pub fn save_state_dict_bundle<P: AsRef<Path>>(
     weights_path: P,
     manifest: &CheckpointManifest,
@@ -326,6 +363,11 @@ pub fn save_state_dict_bundle<P: AsRef<Path>>(
 }
 
 /// 读取 checkpoint manifest，并验证权重文件仍符合其中声明的命名参数结构。
+///
+/// 加载顺序是：先读 manifest，检查 manifest schema 和权重文件名；再读取
+/// state_dict 文件并把参数写回模型；最后确认 manifest 中的参数名与实际
+/// state_dict 条目完全一致。任何一步失败都会返回错误，避免半加载状态被误认为
+/// 成功恢复。
 pub fn load_state_dict_bundle<P: AsRef<Path>>(
     weights_path: P,
     params: &[(&str, Tensor)],
@@ -402,6 +444,9 @@ pub fn load_state_dict_bundle<P: AsRef<Path>>(
 }
 
 /// 从 JSON state_dict 文件加载命名参数。
+///
+/// 该函数会在读取文件后立即调用 [`load_state_dict`] 回写参数，因此成功返回时
+/// 模型已经被更新。返回的条目可用于日志、manifest 校验或测试断言。
 pub fn load_state_dict_file<P: AsRef<Path>>(path: P, params: &[(&str, Tensor)]) -> io::Result<Vec<StateDictEntry>> {
     let f = File::open(path)?;
     let file: SerializableStateDictFile =

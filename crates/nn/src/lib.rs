@@ -1,9 +1,15 @@
-//! Neural network modules for sptorch.
+//! SPTorch 的神经网络模块层。
 //!
-//! - `Module` trait, `Linear`, `LoRALinear` (low-rank adaptation)
-//! - `Embedding`, `LayerNorm`, `MultiHeadAttention`, `TransformerBlock`, `GPT`
-//! - `TokenTrie` + `TokenConstraint` for constrained decoding
-//! - `generate_greedy`, `generate_with_sampling`, `generate_constrained`
+//! 这一层把 `core-tensor` 和 `core-ops` 组合成更接近“模型搭建”的 API。
+//! 它不追求复刻大型模型仓，而是优先提供训练闭环最常用、最稳定、最容易
+//! 组合的小模型构件。
+//!
+//! 主要内容：
+//! - [`Module`] 及常见实现：[`Linear`]、[`LoRALinear`]。
+//! - 嵌入、归一化、注意力和 Transformer 块。
+//! - [`GPT`] 级别的小型自回归语言模型骨架。
+//! - 受约束解码相关的 [`TokenTrie`] 与 [`TokenConstraint`]。
+//! - 贪心、采样和约束生成接口。
 
 use rand::Rng;
 use sptorch_core_ops::*;
@@ -12,16 +18,28 @@ use sptorch_core_tensor::Tensor;
 // ============ Module Trait ============
 
 pub trait Module: Send + Sync {
-    // 前向计算接口：接收输入张量并返回输出张量。
+    /// 执行前向计算。
+    ///
+    /// 这是模块层的最小行为契约：给定输入张量，返回输出张量。具体实现
+    /// 可以在内部组合多个可微分算子，调用方只需要关心张量形状和训练语义。
     fn forward(&self, input: &Tensor) -> Tensor;
-    // 返回当前模块需要优化或保存的参数张量列表。
+
+    /// 返回当前模块需要参与优化或保存的参数。
+    ///
+    /// 该列表用于优化器更新、checkpoint 保存和测试检查。默认只包含模型参数，
+    /// 不包含临时缓存或推理中间态。
     fn parameters(&self) -> Vec<Tensor>;
 }
 
 /// 带稳定名称的参数条目。
+///
+/// 这是 `state_dict` 保存/加载的基础单元：名称负责稳定定位，Tensor 负责
+/// 携带数值本体。只要模型结构没有语义变化，参数名就应尽量保持稳定。
 #[derive(Debug, Clone)]
 pub struct NamedParameter {
+    /// 参数在模型中的稳定路径名。
     pub name: String,
+    /// 参数张量本体。
     pub tensor: Tensor,
 }
 
@@ -34,6 +52,9 @@ fn named_parameter(prefix: &str, suffix: &str, tensor: Tensor) -> NamedParameter
 
 // ============ Initialization ============
 /// 使用 Xavier Uniform 初始化权重张量。
+///
+/// 适合线性层等近似对称的前向路径，能让初始激活和梯度在层间维持较稳定
+/// 的尺度。返回值默认开启梯度追踪，可直接作为可训练参数。
 pub fn xavier_uniform(rows: usize, cols: usize) -> Tensor {
     let mut rng = rand::thread_rng();
     let limit = (6.0 / (rows + cols) as f32).sqrt();
@@ -41,6 +62,9 @@ pub fn xavier_uniform(rows: usize, cols: usize) -> Tensor {
     Tensor::with_grad(data, vec![rows, cols], true)
 }
 /// 使用 Kaiming Normal 初始化权重张量。
+///
+/// 适合 ReLU / GELU 风格的非线性路径。当前实现使用 Box-Muller 采样，目标是
+/// 提供稳定训练初始化，而不是复现某个外部框架的随机数序列。
 pub fn kaiming_normal(rows: usize, cols: usize) -> Tensor {
     let mut rng = rand::thread_rng();
     let std = (2.0 / rows as f32).sqrt();
@@ -63,12 +87,17 @@ fn zeros_grad(size: usize) -> Tensor {
 // ============ Linear ============
 
 pub struct Linear {
-    pub weight: Tensor,       // [out_features, in_features]
+    /// 权重矩阵，形状为 `[out_features, in_features]`。
+    pub weight: Tensor, // [out_features, in_features]
+    /// 可选偏置，形状为 `[out_features]`。
     pub bias: Option<Tensor>, // [out_features]
 }
 
 impl Linear {
-    /// 创建线性层并初始化权重/偏置。
+    /// 创建线性层并初始化权重和偏置。
+    ///
+    /// 权重采用 Xavier Uniform，偏置默认置零。前向语义为
+    /// `input @ weight^T + bias`，输入最后一维必须等于 `in_features`。
     pub fn new(in_features: usize, out_features: usize, use_bias: bool) -> Self {
         let weight = xavier_uniform(out_features, in_features);
         let bias = if use_bias { Some(zeros_grad(out_features)) } else { None };
@@ -76,6 +105,9 @@ impl Linear {
     }
 
     /// 返回线性层的命名参数。
+    ///
+    /// 名称使用 `prefix.weight` / `prefix.bias` 的形式，便于和更大模型的
+    /// 层级路径拼接。
     pub fn named_parameters(&self, prefix: &str) -> Vec<NamedParameter> {
         let mut params = vec![named_parameter(prefix, "weight", self.weight.clone())];
         if let Some(ref bias) = self.bias {
@@ -114,16 +146,24 @@ impl Module for Linear {
 // ============ Dropout ============
 
 pub struct Dropout {
+    /// 丢弃概率。
     pub rate: f32,
+    /// 是否处于训练模式。
     pub training: bool,
 }
 
 impl Dropout {
     /// 创建 Dropout 层并设置丢弃率。
+    ///
+    /// 默认处于训练模式。若用于评估、采样或权重导出，请显式调用
+    /// [`Dropout::eval`]。
     pub fn new(rate: f32) -> Self {
         Dropout { rate, training: true }
     }
-    /// 执行 Dropout 前向：训练期随机置零并缩放，评估期直通。
+    /// 执行 Dropout 前向。
+    ///
+    /// 训练期会随机置零并使用 inverted dropout 缩放；评估期则直接透传输入。
+    /// 这种语义适合大多数训练回路，能避免推理阶段再额外做缩放修正。
     pub fn forward(&self, input: &Tensor) -> Tensor {
         if !self.training || self.rate == 0.0 {
             return input.clone();
@@ -139,11 +179,11 @@ impl Dropout {
         let mask = Tensor::new(mask_data, input.shape());
         mul(input, &mask)
     }
-    /// 切换到评估模式（禁用随机丢弃）。
+    /// 切换到评估模式，禁用随机丢弃。
     pub fn eval(&mut self) {
         self.training = false;
     }
-    /// 切换到训练模式（启用随机丢弃）。
+    /// 切换到训练模式，启用随机丢弃。
     pub fn train(&mut self) {
         self.training = true;
     }
@@ -151,9 +191,11 @@ impl Dropout {
 
 // ============ LoRA Linear ============
 
-/// LoRA adapter wrapping a frozen Linear layer.
-/// Forward: output = x @ W^T + x @ (B @ A)^T * (alpha / rank)
-/// Only A and B are trainable; W is frozen.
+/// LoRA 适配器线性层。
+///
+/// 它在冻结的基座线性层上叠加低秩增量，前向公式为：
+/// `x @ W^T + x @ (B @ A)^T * (alpha / rank)`。
+/// 其中 `W` 是冻结基座，`A` 和 `B` 是可训练参数。
 pub struct LoRALinear {
     pub base: Linear,
     pub lora_a: Tensor, // [rank, in_features]
@@ -163,7 +205,10 @@ pub struct LoRALinear {
 }
 
 impl LoRALinear {
-    /// 基于已有线性层创建 LoRA 适配器并冻结基座参数。
+    /// 基于已有线性层创建 LoRA 适配器，并冻结基座参数。
+    ///
+    /// 这是轻量微调最常见的入口：保留原始模型的表达能力，再用低秩参数注入
+    /// 任务特化增量。
     pub fn new(base: Linear, rank: usize, alpha: f32) -> Self {
         let in_features = base.weight.shape()[1];
         let out_features = base.weight.shape()[0];
@@ -187,6 +232,8 @@ impl LoRALinear {
         }
     }
     /// 按维度直接构造 LoRA 线性层。
+    ///
+    /// 适合在没有现成基座层的情况下快速搭建实验模型。
     pub fn from_dims(in_features: usize, out_features: usize, use_bias: bool, rank: usize, alpha: f32) -> Self {
         let base = Linear::new(in_features, out_features, use_bias);
         Self::new(base, rank, alpha)
@@ -219,6 +266,8 @@ impl Module for LoRALinear {
 
 impl LoRALinear {
     /// 返回包含基座参数与 LoRA 参数的完整参数列表。
+    ///
+    /// 适合做完整保存、恢复或权重折叠前的审计。
     pub fn all_parameters(&self) -> Vec<Tensor> {
         let mut p = self.base.parameters();
         p.push(self.lora_a.clone());
@@ -227,6 +276,9 @@ impl LoRALinear {
     }
 
     /// 返回包含基座参数与 LoRA 适配器参数的稳定命名参数。
+    ///
+    /// 命名路径采用 `prefix.base.*` 与 `prefix.lora_*`，便于 bundle 保存时区分
+    /// 冻结基座和适配器参数。
     ///
     /// `parameters()` 只暴露可训练的 LoRA A/B；保存完整模型时还需要冻结的
     /// base 权重和 bias，否则加载后只能恢复适配器而无法还原完整前向。
@@ -238,6 +290,8 @@ impl LoRALinear {
     }
 
     /// 将 LoRA 增量权重合并进基座权重。
+    ///
+    /// 这个操作会原地更新基座权重，适合训练完成后折叠适配器做部署或推理。
     pub fn merge(&self) {
         let a_data = self.lora_a.contiguous_data();
         let b_data = self.lora_b.contiguous_data();
@@ -270,11 +324,14 @@ impl LoRALinear {
 // ============ Embedding ============
 
 pub struct Embedding {
+    /// 嵌入表权重，形状为 `[num_embeddings, embedding_dim]`。
     pub weight: Tensor, // [num_embeddings, embedding_dim]
 }
 
 impl Embedding {
     /// 创建 Embedding 层。
+    ///
+    /// 权重以均匀随机值初始化，适合 token / position embedding 的训练起点。
     pub fn new(num_embeddings: usize, embedding_dim: usize) -> Self {
         let mut rng = rand::thread_rng();
         let data: Vec<f32> = (0..num_embeddings * embedding_dim)
@@ -285,6 +342,8 @@ impl Embedding {
         }
     }
     /// 按 token 索引查表并返回 embedding。
+    ///
+    /// 输入是 token ID 切片，输出是对应行向量按顺序堆叠的张量。
     pub fn forward_indices(&self, indices: &[usize]) -> Tensor {
         embedding_lookup(&self.weight, indices)
     }
@@ -302,14 +361,20 @@ impl Embedding {
 // ============ LayerNorm ============
 
 pub struct LayerNorm {
+    /// 归一化缩放参数，形状为 `[normalized_shape]`。
     pub gamma: Tensor, // [normalized_shape]
-    pub beta: Tensor,  // [normalized_shape]
+    /// 归一化平移参数，形状为 `[normalized_shape]`。
+    pub beta: Tensor, // [normalized_shape]
+    /// 数值稳定项。
     pub eps: f32,
+    /// 被归一化的最后一维长度。
     pub normalized_shape: usize,
 }
 
 impl LayerNorm {
     /// 创建 LayerNorm 层。
+    ///
+    /// `gamma` 初始化为 1，`beta` 初始化为 0。这是训练中最常见的 LayerNorm 起点。
     pub fn new(normalized_shape: usize) -> Self {
         LayerNorm {
             gamma: Tensor::with_grad(vec![1.0; normalized_shape], vec![normalized_shape], true),
@@ -443,17 +508,26 @@ impl sptorch_core_tensor::Op for LayerNormOp {
 // ============ MultiHeadAttention ============
 
 pub struct MultiHeadAttention {
+    /// 注意力头数。
     pub n_head: usize,
+    /// 模型维度。
     pub d_model: usize,
+    /// 每个 head 的维度。
     pub head_dim: usize,
+    /// query 投影。
     pub wq: Linear,
+    /// key 投影。
     pub wk: Linear,
+    /// value 投影。
     pub wv: Linear,
+    /// 输出投影。
     pub wo: Linear,
 }
 
 impl MultiHeadAttention {
     /// 创建多头自注意力层，要求 `d_model % n_head == 0`。
+    ///
+    /// 这里默认不带 bias，便于把注意力路径和 FFN 路径的参数语义保持清楚。
     pub fn new(d_model: usize, n_head: usize) -> Self {
         assert_eq!(d_model % n_head, 0);
         let head_dim = d_model / n_head;
@@ -468,6 +542,8 @@ impl MultiHeadAttention {
         }
     }
     /// 执行带因果掩码的自注意力前向。
+    ///
+    /// 适合自回归语言模型，不适合双向编码器语义。
     pub fn forward_causal(&self, input: &Tensor) -> Tensor {
         let shape = input.shape();
         let seq_len = shape[0];
@@ -708,17 +784,27 @@ impl sptorch_core_tensor::Op for BatchTransposeOp {
 // ============ TransformerBlock ============
 
 pub struct TransformerBlock {
+    /// 注意力前 LayerNorm。
     pub ln1: LayerNorm,
+    /// 因果自注意力模块。
     pub attn: MultiHeadAttention,
+    /// FFN 前 LayerNorm。
     pub ln2: LayerNorm,
+    /// FFN 上投影。
     pub ffn_up: Linear,
+    /// FFN 下投影。
     pub ffn_down: Linear,
+    /// 注意力残差分支 dropout。
     pub attn_dropout: Dropout,
+    /// FFN 残差分支 dropout。
     pub ffn_dropout: Dropout,
 }
 
 impl TransformerBlock {
-    /// 创建 TransformerBlock（注意力 + FFN + LayerNorm）。
+    /// 创建 TransformerBlock。
+    ///
+    /// 结构为 `LayerNorm -> causal attention -> residual -> LayerNorm -> FFN -> residual`。
+    /// 这是小型 GPT 模型里最常见的基础块。
     pub fn new(d_model: usize, n_head: usize, d_ff: usize) -> Self {
         TransformerBlock {
             ln1: LayerNorm::new(d_model),
@@ -730,7 +816,10 @@ impl TransformerBlock {
             ffn_dropout: Dropout::new(0.1),
         }
     }
-    /// 执行 TransformerBlock 前向（含残差连接）。
+    /// 执行 TransformerBlock 前向，包含两条残差连接。
+    ///
+    /// 输入和输出 shape 都应为 `[seq_len, d_model]`。如果 dropout 处于训练模式，
+    /// 该函数会引入随机性；评估和 checkpoint 验证时应切到 eval。
     pub fn forward_seq(&self, input: &Tensor) -> Tensor {
         let normed = self.ln1.forward(input);
         let attn_out = self.attn.forward_causal(&normed);
@@ -764,6 +853,8 @@ impl TransformerBlock {
     }
 
     /// 返回 TransformerBlock 的命名参数。
+    ///
+    /// 参数名会继续沿用传入的 `prefix`，例如 `blocks.0.attn.wq.weight`。
     pub fn named_parameters(&self, prefix: &str) -> Vec<NamedParameter> {
         let mut params = Vec::new();
         params.extend(self.ln1.named_parameters(&format!("{prefix}.ln1")));
@@ -778,16 +869,25 @@ impl TransformerBlock {
 // ============ GPT Model ============
 
 pub struct GPT {
+    /// token embedding。
     pub token_emb: Embedding,
+    /// position embedding。
     pub pos_emb: Embedding,
+    /// Transformer block 堆叠。
     pub blocks: Vec<TransformerBlock>,
+    /// 输出前最终 LayerNorm。
     pub ln_f: LayerNorm,
+    /// 语言模型输出头。
     pub lm_head: Linear,
+    /// 最大上下文长度。
     pub seq_len: usize,
 }
 
 impl GPT {
     /// 创建 GPT 模型。
+    ///
+    /// 这是面向训练语义的小型自回归语言模型骨架。它强调参数名稳定、
+    /// forward/backward 清晰和 checkpoint 可回放，而不是追求大模型完整特性。
     pub fn new(vocab_size: usize, d_model: usize, n_head: usize, n_layer: usize, d_ff: usize, seq_len: usize) -> Self {
         let blocks = (0..n_layer)
             .map(|_| TransformerBlock::new(d_model, n_head, d_ff))
@@ -802,6 +902,9 @@ impl GPT {
         }
     }
     /// 将 token 序列前向为 logits。
+    ///
+    /// 输入是 token ID 序列，长度不能超过 `seq_len`；输出 shape 为
+    /// `[input_len, vocab_size]`，可直接用于 next-token cross entropy。
     pub fn forward_ids(&self, token_ids: &[usize]) -> Tensor {
         let slen = token_ids.len();
         assert!(slen <= self.seq_len);
@@ -832,6 +935,9 @@ impl GPT {
     }
 
     /// 返回 GPT 的稳定命名参数。
+    ///
+    /// 名字采用层级路径格式，例如 `blocks.0.attn.wq.weight`。这使得保存、
+    /// 恢复和局部调试都可以按名字定位，而不是依赖参数顺序。
     pub fn named_parameters(&self) -> Vec<NamedParameter> {
         let mut params = Vec::new();
         params.extend(self.token_emb.named_parameters("token_emb"));
@@ -846,9 +952,8 @@ impl GPT {
 
     /// 统一切换 GPT 内部块的训练/评估状态。
     ///
-    /// 当前真正持有随机行为的是每个 `TransformerBlock` 里的 dropout；把这个
-    /// 开关放到模型层，调用者就不用手动逐层遍历，训练和推理模式也更不容易
-    /// 在测试里被误配。
+    /// 当前真正受影响的是各层 dropout。把开关放到模型级别，可以避免调用方
+    /// 手动遍历 block，减少训练/评估模式混淆。
     pub fn set_training(&mut self, training: bool) {
         for block in &mut self.blocks {
             block.set_training(training);
@@ -858,6 +963,9 @@ impl GPT {
 
 // ============ Text Generation ============
 /// 贪心解码生成 token 序列。
+///
+/// 每一步选择最后一个位置上 logits 最大的 token。该方法确定性强、便于测试，
+/// 但缺乏采样多样性。
 pub fn generate_greedy(model: &GPT, prompt: &[usize], max_new_tokens: usize, vocab_size: usize) -> Vec<usize> {
     let mut ids = prompt.to_vec();
     for _ in 0..max_new_tokens {
@@ -880,6 +988,9 @@ pub fn generate_greedy(model: &GPT, prompt: &[usize], max_new_tokens: usize, voc
     ids
 }
 /// 按 temperature 与 top-k 采样生成序列。
+///
+/// `temperature` 越低越接近贪心，越高越随机；`top_k` 限制候选 token 数量。
+/// 调用方需要确保 `vocab_size` 与模型输出头一致。
 pub fn generate_with_sampling(
     model: &GPT,
     prompt: &[usize],
@@ -935,9 +1046,10 @@ pub fn generate_with_sampling(
 
 // ============ Constrained Decoding ============
 
-/// Prefix trie for constraining token generation.
-/// Each node maps token_id -> child node. A node with `is_terminal = true`
-/// marks the end of a valid sequence.
+/// 用于约束 token 生成的前缀 Trie。
+///
+/// 每个节点保存“当前前缀下允许的下一 token”。它适合表达有限集合、语法片段
+/// 或 schema 引导的候选路径。
 #[derive(Debug, Clone)]
 pub struct TokenTrie {
     children: std::collections::HashMap<usize, TokenTrie>,
@@ -960,6 +1072,8 @@ impl TokenTrie {
         }
     }
     /// 向 Trie 插入一条合法 token 路径。
+    ///
+    /// 插入后，生成器可以沿着该路径逐步约束下一 token。
     pub fn insert(&mut self, tokens: &[usize]) {
         let mut node = self;
         for &t in tokens {
@@ -968,6 +1082,8 @@ impl TokenTrie {
         node.is_terminal = true;
     }
     /// 查询给定前缀下允许的下一 token 集合。
+    ///
+    /// 返回 `None` 表示没有继续约束，通常代表已到达终止节点或前缀不存在。
     pub fn allowed_tokens(&self, prefix: &[usize]) -> Option<Vec<usize>> {
         let mut node = self;
         for &t in prefix {
@@ -988,7 +1104,9 @@ impl TokenTrie {
 /// 可用于接入 SQL 语法、正则或 schema 约束。
 pub trait TokenConstraint: Send + Sync {
     /// 根据当前已生成序列，返回下一步允许的 token ID 集合。
-    /// 返回 `None` 表示放开约束，允许全部 token。
+    ///
+    /// 返回 `None` 表示放开约束，允许全部 token。实现者需要保证返回的 token
+    /// ID 与模型 vocabulary 对齐。
     fn allowed_next(&self, generated: &[usize]) -> Option<Vec<usize>>;
 }
 
@@ -999,6 +1117,9 @@ impl TokenConstraint for TokenTrie {
     }
 }
 /// 在约束条件下执行采样生成。
+///
+/// 该函数先应用外部约束，再执行 temperature 与 top-k 采样。若约束导致当前步
+/// 没有任何合法 token，生成会提前结束。
 pub fn generate_constrained(
     model: &GPT,
     prompt: &[usize],
