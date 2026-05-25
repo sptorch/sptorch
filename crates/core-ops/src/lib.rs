@@ -2021,6 +2021,27 @@ mod tests {
     }
 
     #[test]
+    fn test_backward_with_grad_supports_non_scalar_seed() {
+        let a = Tensor::with_grad(vec![1.0, 2.0], vec![2], true);
+        let b = Tensor::with_grad(vec![3.0, 4.0], vec![2], true);
+        let c = add(&a, &b);
+        let seed = Tensor::new(vec![7.0, 11.0], vec![2]);
+
+        c.backward_with_grad(&seed);
+
+        assert_eq!(a.grad().unwrap(), vec![7.0, 11.0]);
+        assert_eq!(b.grad().unwrap(), vec![7.0, 11.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "backward() requires a scalar tensor")]
+    fn test_backward_rejects_non_scalar_output() {
+        let a = Tensor::with_grad(vec![1.0, 2.0], vec![2], true);
+        let b = Tensor::with_grad(vec![3.0, 4.0], vec![2], true);
+        add(&a, &b).backward();
+    }
+
+    #[test]
     fn test_mul_backward() {
         let x = Tensor::with_grad(vec![3.0], vec![1], true);
         let y = Tensor::with_grad(vec![4.0], vec![1], true);

@@ -101,4 +101,18 @@ mod tests {
         assert_eq!(x.grad().unwrap(), vec![2.0]);
         assert_eq!(y.grad().unwrap(), vec![1.0]);
     }
+
+    // 非标量输出必须显式给出上游梯度；这里验证外部算子 crate 也能复用
+    // `Tensor::backward_with_grad` 的 VJP 入口。
+    #[test]
+    fn test_backward_with_explicit_seed() {
+        let x = Tensor::with_grad(vec![1.0, 2.0], vec![2], true);
+        let y = Tensor::with_grad(vec![3.0, 4.0], vec![2], true);
+        let z = add(&x, &y);
+
+        z.backward_with_grad(&Tensor::new(vec![0.5, 2.0], vec![2]));
+
+        assert_eq!(x.grad().unwrap(), vec![0.5, 2.0]);
+        assert_eq!(y.grad().unwrap(), vec![0.5, 2.0]);
+    }
 }

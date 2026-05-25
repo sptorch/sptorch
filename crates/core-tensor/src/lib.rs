@@ -662,6 +662,14 @@ impl Tensor {
             return;
         }
 
+        let expected_shape = inner.shape.clone();
+        let incoming_shape = grad_tensor.shape();
+        assert_eq!(
+            incoming_shape, expected_shape,
+            "grad shape mismatch: expected {:?}, got {:?}",
+            expected_shape, incoming_shape
+        );
+
         let incoming_data = grad_tensor.contiguous_data();
 
         if let Some(existing_grad) = &inner.grad {
@@ -684,19 +692,37 @@ impl Tensor {
 
     /// 从当前张量出发执行反向传播。
     ///
-    /// 这里使用显式队列而非递归，避免深计算图导致栈溢出。每个节点先根据
-    /// 局部 [`Op`] 生成输入梯度，再把有 creator 的输入继续入队。当前实现
-    /// 适合教学和小图验证；未来若引入复杂 DAG，需要补拓扑排序和重复节点
-    /// 依赖计数。
+    /// 这是 `backward_with_grad` 的便捷形式，只允许标量输出。它会为当前输出
+    /// 构造一个全 1 的上游梯度，因此适合 loss 这类单值张量；如果输出不是
+    /// 标量，调用者应显式使用 [`Tensor::backward_with_grad`] 提供 seed。
     pub fn backward(&self) {
+        assert!(
+            self.is_scalar(),
+            "backward() requires a scalar tensor; use backward_with_grad() for non-scalar outputs"
+        );
         let shape = self.shape();
         let size: usize = shape.iter().product();
         let seed = Tensor::new(vec![1.0; size], shape);
+        self.backward_with_grad(&seed);
+    }
 
-        self.accum_grad(&seed);
+    /// 从当前张量出发执行反向传播，并显式给出上游梯度 seed。
+    ///
+    /// 这相当于 PyTorch 中对非标量输出传入 `grad_tensors`。seed 的 shape 必须
+    /// 与当前输出完全一致，否则反向传播将失去明确的 VJP 语义。
+    pub fn backward_with_grad(&self, grad_output: &Tensor) {
+        let expected_shape = self.shape();
+        let incoming_shape = grad_output.shape();
+        assert_eq!(
+            incoming_shape, expected_shape,
+            "backward seed shape mismatch: expected {:?}, got {:?}",
+            expected_shape, incoming_shape
+        );
+
+        self.accum_grad(grad_output);
 
         let mut queue: VecDeque<(Tensor, Tensor)> = VecDeque::new();
-        queue.push_back((self.clone(), seed));
+        queue.push_back((self.clone(), grad_output.clone()));
 
         while let Some((tensor, grad_output)) = queue.pop_front() {
             let creator = {
@@ -832,6 +858,29 @@ impl fmt::Debug for Tensor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct PassThroughOp;
+
+    impl Op for PassThroughOp {
+        fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
+            vec![Some(grad_output.clone())]
+        }
+    }
+
+    fn passthrough(input: &Tensor) -> Tensor {
+        let out = Tensor::new(input.contiguous_data(), input.shape());
+        if input.requires_grad() {
+            let mut inner = out.0.write().unwrap();
+            inner.requires_grad = true;
+            inner.creator = Some(Arc::new(Node {
+                op: Box::new(PassThroughOp),
+                inputs: vec![input.clone()],
+            }));
+        }
+        out
+    }
 
     // F16 往返需要在典型范围内保持可接受误差，避免 dtype 模拟完全失真。
     #[test]
@@ -946,6 +995,30 @@ mod tests {
         assert_eq!(detached.shape(), vec![2]);
         assert!(!detached.requires_grad());
         assert!(detached.grad().is_none());
+    }
+
+    #[test]
+    fn test_backward_with_grad_supports_non_scalar_output() {
+        let t = Tensor::with_grad(vec![1.0, 2.0], vec![2], true);
+        let out = passthrough(&t);
+
+        out.backward_with_grad(&Tensor::new(vec![10.0, 20.0], vec![2]));
+
+        assert_eq!(t.grad().unwrap(), vec![10.0, 20.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "backward() requires a scalar tensor")]
+    fn test_backward_rejects_non_scalar_output() {
+        let t = Tensor::with_grad(vec![1.0, 2.0], vec![2], true);
+        passthrough(&t).backward();
+    }
+
+    #[test]
+    #[should_panic(expected = "backward seed shape mismatch")]
+    fn test_backward_with_grad_rejects_seed_shape_mismatch() {
+        let t = Tensor::with_grad(vec![1.0, 2.0], vec![2], true);
+        passthrough(&t).backward_with_grad(&Tensor::new(vec![1.0], vec![1]));
     }
 
     #[test]
