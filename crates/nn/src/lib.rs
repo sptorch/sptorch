@@ -761,6 +761,17 @@ impl GPT {
         p.extend(self.lm_head.parameters());
         p
     }
+
+    /// 统一切换 GPT 内部块的训练/评估状态。
+    ///
+    /// 当前真正持有随机行为的是每个 `TransformerBlock` 里的 dropout；把这个
+    /// 开关放到模型层，调用者就不用手动逐层遍历，训练和推理模式也更不容易
+    /// 在测试里被误配。
+    pub fn set_training(&mut self, training: bool) {
+        for block in &mut self.blocks {
+            block.set_training(training);
+        }
+    }
 }
 
 // ============ Text Generation ============
