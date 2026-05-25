@@ -305,7 +305,7 @@ impl Module for LayerNorm {
 
         let res = Tensor::new(out, shape.clone());
 
-        if input.requires_grad() || self.gamma.requires_grad() {
+        if input.requires_grad() || self.gamma.requires_grad() || self.beta.requires_grad() {
             let mut inner = res.0.write().unwrap();
             inner.requires_grad = true;
             inner.creator = Some(std::sync::Arc::new(sptorch_core_tensor::Node {
@@ -1044,6 +1044,24 @@ mod tests {
         let mean1: f32 = d[4..8].iter().sum::<f32>() / 4.0;
         assert!(mean0.abs() < 1e-5);
         assert!(mean1.abs() < 1e-5);
+    }
+
+    // LayerNorm 的参数图不应因为输入本身不追踪梯度而断掉。
+    #[test]
+    fn test_layer_norm_tracks_beta_even_if_gamma_frozen() {
+        let ln = LayerNorm::new(4);
+        ln.gamma.set_requires_grad(false);
+        let input = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![4]);
+
+        let out = ln.forward(&input);
+        assert!(out.requires_grad());
+
+        let loss = sum(&out);
+        loss.backward();
+
+        assert!(ln.gamma.grad().is_none());
+        assert!(ln.beta.grad().is_some());
+        assert_eq!(ln.beta.grad().unwrap().len(), 4);
     }
 
     // 验证 Xavier Uniform 采样值位于理论区间。
