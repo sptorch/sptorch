@@ -14,6 +14,22 @@ pub const EVENT_VERSION_COMMIT: &str = "studio://version-commit";
 pub const EVENT_FENCE: &str = "studio://fence";
 /// 后端在线状态和队列深度事件名。
 pub const EVENT_HARDWARE_STATE: &str = "studio://hardware-state";
+/// 训练闭环里常见的 state_dict / checkpoint 清单契约。
+///
+/// 这一层只记录“文件是什么、来自哪个模型、里面装了什么语义”，不直接
+/// 依赖 Tensor。这样 versioning crate 可以继续作为纯协议层，被 Studio、训练器
+/// 和未来产品仓复用，而不会反向绑住底层数值实现。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointManifest {
+    pub schema: String,
+    pub format_version: u32,
+    pub model_name: String,
+    pub save_kind: String,
+    pub parameter_count: usize,
+    pub state_dict_schema: String,
+    pub created_at_ms: u64,
+    pub note: String,
+}
 
 /// 层参数更新策略。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -189,5 +205,23 @@ mod tests {
         let json = serde_json::to_string(&m).expect("serialize metrics");
         let out: EvolutionMetrics = serde_json::from_str(&json).expect("deserialize metrics");
         assert_eq!(out, m);
+    }
+
+    #[test]
+    fn test_checkpoint_manifest_json_roundtrip() {
+        let manifest = CheckpointManifest {
+            schema: "sptorch.checkpoint_manifest.v1".into(),
+            format_version: 1,
+            model_name: "tiny-gpt".into(),
+            save_kind: "state_dict".into(),
+            parameter_count: 17,
+            state_dict_schema: "sptorch.state_dict.v1".into(),
+            created_at_ms: 1711000300,
+            note: "keep model weights and metadata aligned".into(),
+        };
+
+        let json = serde_json::to_string(&manifest).expect("serialize manifest");
+        let out: CheckpointManifest = serde_json::from_str(&json).expect("deserialize manifest");
+        assert_eq!(out, manifest);
     }
 }

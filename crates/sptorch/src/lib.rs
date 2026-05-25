@@ -33,7 +33,8 @@ pub mod v1 {
     pub mod checkpoint {
         pub use sptorch_serialize::safetensors::SafeTensorsFile;
         pub use sptorch_serialize::{
-            export_state_dict, load_checkpoint, load_state_dict, save_checkpoint, StateDictEntry,
+            export_state_dict, load_checkpoint, load_named_state_dict, load_state_dict, load_state_dict_file,
+            save_checkpoint, save_named_state_dict, save_state_dict, NamedStateDict, StateDictEntry,
         };
     }
 
@@ -42,10 +43,20 @@ pub mod v1 {
         pub use sptorch_hal::{FenceState, QueueState};
     }
 
+    /// Stable versioning and telemetry protocol surface.
+    pub mod versioning {
+        pub use sptorch_versioning::{
+            BufferPointers, CheckpointManifest, EvolutionMetrics, FencePhase, FenceState, HardwareState, LayerPolicy,
+            TensorLayoutSnapshot, UpdatePolicy, VersionNode, VersionedStorage, EVENT_FENCE, EVENT_HARDWARE_STATE,
+            EVENT_METRICS, EVENT_VERSION_COMMIT,
+        };
+    }
+
     /// Convenience prelude for product-side imports.
     pub mod prelude {
         pub use super::checkpoint::{
-            export_state_dict, load_checkpoint, load_state_dict, save_checkpoint, SafeTensorsFile, StateDictEntry,
+            export_state_dict, load_checkpoint, load_named_state_dict, load_state_dict, load_state_dict_file,
+            save_checkpoint, save_named_state_dict, save_state_dict, NamedStateDict, SafeTensorsFile, StateDictEntry,
         };
         pub use super::core::{
             broadcast_shape, can_broadcast, is_grad_enabled, no_grad, set_grad_enabled, DType, Device, Tensor,
@@ -57,5 +68,10 @@ pub mod v1 {
             softmax, sub, sum, sum_dim, swiglu, transpose,
         };
         pub use super::optim::{clip_grad_norm, scale_gradients, zero_grad, AdamW, Optimizer, SGD};
+        pub use super::versioning::{
+            BufferPointers, CheckpointManifest, EvolutionMetrics, FencePhase, HardwareState, LayerPolicy,
+            TensorLayoutSnapshot, UpdatePolicy, VersionNode, VersionedStorage, EVENT_FENCE, EVENT_HARDWARE_STATE,
+            EVENT_METRICS, EVENT_VERSION_COMMIT,
+        };
     }
 }

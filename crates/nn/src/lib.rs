@@ -18,6 +18,20 @@ pub trait Module: Send + Sync {
     fn parameters(&self) -> Vec<Tensor>;
 }
 
+/// 带稳定名称的参数条目。
+#[derive(Debug, Clone)]
+pub struct NamedParameter {
+    pub name: String,
+    pub tensor: Tensor,
+}
+
+fn named_parameter(prefix: &str, suffix: &str, tensor: Tensor) -> NamedParameter {
+    NamedParameter {
+        name: format!("{prefix}.{suffix}"),
+        tensor,
+    }
+}
+
 // ============ Initialization ============
 /// 使用 Xavier Uniform 初始化权重张量。
 pub fn xavier_uniform(rows: usize, cols: usize) -> Tensor {
@@ -59,6 +73,15 @@ impl Linear {
         let weight = xavier_uniform(out_features, in_features);
         let bias = if use_bias { Some(zeros_grad(out_features)) } else { None };
         Linear { weight, bias }
+    }
+
+    /// 返回线性层的命名参数。
+    pub fn named_parameters(&self, prefix: &str) -> Vec<NamedParameter> {
+        let mut params = vec![named_parameter(prefix, "weight", self.weight.clone())];
+        if let Some(ref bias) = self.bias {
+            params.push(named_parameter(prefix, "bias", bias.clone()));
+        }
+        params
     }
 }
 
@@ -202,6 +225,18 @@ impl LoRALinear {
         p.push(self.lora_b.clone());
         p
     }
+
+    /// 返回包含基座参数与 LoRA 适配器参数的稳定命名参数。
+    ///
+    /// `parameters()` 只暴露可训练的 LoRA A/B；保存完整模型时还需要冻结的
+    /// base 权重和 bias，否则加载后只能恢复适配器而无法还原完整前向。
+    pub fn named_parameters(&self, prefix: &str) -> Vec<NamedParameter> {
+        let mut params = self.base.named_parameters(&format!("{prefix}.base"));
+        params.push(named_parameter(prefix, "lora_a", self.lora_a.clone()));
+        params.push(named_parameter(prefix, "lora_b", self.lora_b.clone()));
+        params
+    }
+
     /// 将 LoRA 增量权重合并进基座权重。
     pub fn merge(&self) {
         let a_data = self.lora_a.contiguous_data();
@@ -257,6 +292,11 @@ impl Embedding {
     pub fn parameters(&self) -> Vec<Tensor> {
         vec![self.weight.clone()]
     }
+
+    /// 返回 Embedding 的命名参数。
+    pub fn named_parameters(&self, prefix: &str) -> Vec<NamedParameter> {
+        vec![named_parameter(prefix, "weight", self.weight.clone())]
+    }
 }
 
 // ============ LayerNorm ============
@@ -277,6 +317,14 @@ impl LayerNorm {
             eps: 1e-5,
             normalized_shape,
         }
+    }
+
+    /// 返回 LayerNorm 的命名参数。
+    pub fn named_parameters(&self, prefix: &str) -> Vec<NamedParameter> {
+        vec![
+            named_parameter(prefix, "gamma", self.gamma.clone()),
+            named_parameter(prefix, "beta", self.beta.clone()),
+        ]
     }
 }
 
@@ -476,6 +524,16 @@ impl MultiHeadAttention {
         p.extend(self.wv.parameters());
         p.extend(self.wo.parameters());
         p
+    }
+
+    /// 返回 MultiHeadAttention 的命名参数。
+    pub fn named_parameters(&self, prefix: &str) -> Vec<NamedParameter> {
+        let mut params = Vec::new();
+        params.extend(self.wq.named_parameters(&format!("{prefix}.wq")));
+        params.extend(self.wk.named_parameters(&format!("{prefix}.wk")));
+        params.extend(self.wv.named_parameters(&format!("{prefix}.wv")));
+        params.extend(self.wo.named_parameters(&format!("{prefix}.wo")));
+        params
     }
 }
 
@@ -704,6 +762,17 @@ impl TransformerBlock {
         p.extend(self.ffn_down.parameters());
         p
     }
+
+    /// 返回 TransformerBlock 的命名参数。
+    pub fn named_parameters(&self, prefix: &str) -> Vec<NamedParameter> {
+        let mut params = Vec::new();
+        params.extend(self.ln1.named_parameters(&format!("{prefix}.ln1")));
+        params.extend(self.attn.named_parameters(&format!("{prefix}.attn")));
+        params.extend(self.ln2.named_parameters(&format!("{prefix}.ln2")));
+        params.extend(self.ffn_up.named_parameters(&format!("{prefix}.ffn_up")));
+        params.extend(self.ffn_down.named_parameters(&format!("{prefix}.ffn_down")));
+        params
+    }
 }
 
 // ============ GPT Model ============
@@ -760,6 +829,19 @@ impl GPT {
         p.extend(self.ln_f.parameters());
         p.extend(self.lm_head.parameters());
         p
+    }
+
+    /// 返回 GPT 的稳定命名参数。
+    pub fn named_parameters(&self) -> Vec<NamedParameter> {
+        let mut params = Vec::new();
+        params.extend(self.token_emb.named_parameters("token_emb"));
+        params.extend(self.pos_emb.named_parameters("pos_emb"));
+        for (idx, block) in self.blocks.iter().enumerate() {
+            params.extend(block.named_parameters(&format!("blocks.{idx}")));
+        }
+        params.extend(self.ln_f.named_parameters("ln_f"));
+        params.extend(self.lm_head.named_parameters("lm_head"));
+        params
     }
 
     /// 统一切换 GPT 内部块的训练/评估状态。

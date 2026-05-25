@@ -10,3 +10,5 @@ rand = "0.8"
 
 [dev-dependencies]
 sptorch-optim = { version = "0.1.0", path = "../optim" }
+sptorch-serialize = { version = "0.1.0", path = "../serialize" }
+sptorch-versioning = { version = "0.1.0", path = "../versioning" }
