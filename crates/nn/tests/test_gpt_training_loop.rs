@@ -2,8 +2,8 @@ use sptorch_core_ops::cross_entropy_loss;
 use sptorch_core_tensor::Tensor;
 use sptorch_nn::GPT;
 use sptorch_optim::{zero_grad, Optimizer, SGD};
-use sptorch_serialize::{load_state_dict_file, save_state_dict};
-use sptorch_versioning::CheckpointManifest;
+use sptorch_serialize::{load_state_dict_bundle, save_state_dict_bundle, STATE_DICT_SCHEMA};
+use sptorch_versioning::{CheckpointManifest, CHECKPOINT_MANIFEST_FORMAT_VERSION, CHECKPOINT_MANIFEST_SCHEMA};
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -129,12 +129,14 @@ fn test_tiny_gpt_state_dict_roundtrip_and_resume_training() {
     let named_params = named_gpt_params(&model);
     let named_param_refs = named_refs(&named_params);
     let manifest = CheckpointManifest {
-        schema: "sptorch.checkpoint_manifest.v1".into(),
-        format_version: 1,
+        schema: CHECKPOINT_MANIFEST_SCHEMA.into(),
+        format_version: CHECKPOINT_MANIFEST_FORMAT_VERSION,
         model_name: "tiny-gpt".into(),
         save_kind: "state_dict".into(),
+        weights_file: String::new(),
         parameter_count: named_param_refs.len(),
-        state_dict_schema: "sptorch.state_dict.v1".into(),
+        parameter_names: Vec::new(),
+        state_dict_schema: STATE_DICT_SCHEMA.into(),
         created_at_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock before unix epoch")
@@ -143,7 +145,7 @@ fn test_tiny_gpt_state_dict_roundtrip_and_resume_training() {
     };
     assert_eq!(manifest.parameter_count, named_param_refs.len());
 
-    save_state_dict(&checkpoint_path, &named_param_refs).unwrap();
+    save_state_dict_bundle(&checkpoint_path, &manifest, &named_param_refs).unwrap();
     let checkpoint_loss = average_sequence_loss(&model, &sequences);
     let saved_weights = model.lm_head.weight.data();
 
@@ -152,9 +154,18 @@ fn test_tiny_gpt_state_dict_roundtrip_and_resume_training() {
         loaded_model.set_training(false);
         let loaded_named_params = named_gpt_params(&loaded_model);
         let loaded_param_refs = named_refs(&loaded_named_params);
-        let loaded_entries = load_state_dict_file(&checkpoint_path, &loaded_param_refs).unwrap();
+        let (loaded_manifest, loaded_entries) = load_state_dict_bundle(&checkpoint_path, &loaded_param_refs).unwrap();
 
+        assert_eq!(loaded_manifest.model_name, "tiny-gpt");
         assert_eq!(loaded_entries.len(), named_param_refs.len());
+        assert_eq!(loaded_manifest.parameter_count, named_param_refs.len());
+        assert_eq!(
+            loaded_manifest.parameter_names,
+            named_param_refs
+                .iter()
+                .map(|(name, _)| (*name).to_string())
+                .collect::<Vec<_>>()
+        );
         assert_eq!(loaded_model.lm_head.weight.data(), saved_weights);
         let restored_loss = average_sequence_loss(&loaded_model, &sequences);
         assert!(
@@ -191,5 +202,6 @@ fn test_tiny_gpt_state_dict_roundtrip_and_resume_training() {
         );
     }
 
-    fs::remove_file(checkpoint_path).ok();
+    fs::remove_file(&checkpoint_path).ok();
+    fs::remove_file(format!("{}.manifest.json", checkpoint_path.display())).ok();
 }

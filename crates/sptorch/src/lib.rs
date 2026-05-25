@@ -33,8 +33,9 @@ pub mod v1 {
     pub mod checkpoint {
         pub use sptorch_serialize::safetensors::SafeTensorsFile;
         pub use sptorch_serialize::{
-            export_state_dict, load_checkpoint, load_named_state_dict, load_state_dict, load_state_dict_file,
-            save_checkpoint, save_named_state_dict, save_state_dict, NamedStateDict, StateDictEntry,
+            export_state_dict, load_checkpoint, load_named_state_dict, load_state_dict, load_state_dict_bundle,
+            load_state_dict_file, save_checkpoint, save_named_state_dict, save_state_dict, save_state_dict_bundle,
+            NamedStateDict, StateDictEntry,
         };
     }
 
@@ -55,8 +56,9 @@ pub mod v1 {
     /// Convenience prelude for product-side imports.
     pub mod prelude {
         pub use super::checkpoint::{
-            export_state_dict, load_checkpoint, load_named_state_dict, load_state_dict, load_state_dict_file,
-            save_checkpoint, save_named_state_dict, save_state_dict, NamedStateDict, SafeTensorsFile, StateDictEntry,
+            export_state_dict, load_checkpoint, load_named_state_dict, load_state_dict, load_state_dict_bundle,
+            load_state_dict_file, save_checkpoint, save_named_state_dict, save_state_dict, save_state_dict_bundle,
+            NamedStateDict, SafeTensorsFile, StateDictEntry,
         };
         pub use super::core::{
             broadcast_shape, can_broadcast, is_grad_enabled, no_grad, set_grad_enabled, DType, Device, Tensor,

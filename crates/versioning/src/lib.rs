@@ -14,6 +14,10 @@ pub const EVENT_VERSION_COMMIT: &str = "studio://version-commit";
 pub const EVENT_FENCE: &str = "studio://fence";
 /// 后端在线状态和队列深度事件名。
 pub const EVENT_HARDWARE_STATE: &str = "studio://hardware-state";
+/// 双文件 checkpoint 清单的 schema 名称。
+pub const CHECKPOINT_MANIFEST_SCHEMA: &str = "sptorch.checkpoint_manifest.v1";
+/// 双文件 checkpoint 清单的格式版本。
+pub const CHECKPOINT_MANIFEST_FORMAT_VERSION: u32 = 1;
 /// 训练闭环里常见的 state_dict / checkpoint 清单契约。
 ///
 /// 这一层只记录“文件是什么、来自哪个模型、里面装了什么语义”，不直接
@@ -25,7 +29,9 @@ pub struct CheckpointManifest {
     pub format_version: u32,
     pub model_name: String,
     pub save_kind: String,
+    pub weights_file: String,
     pub parameter_count: usize,
+    pub parameter_names: Vec<String>,
     pub state_dict_schema: String,
     pub created_at_ms: u64,
     pub note: String,
@@ -210,11 +216,13 @@ mod tests {
     #[test]
     fn test_checkpoint_manifest_json_roundtrip() {
         let manifest = CheckpointManifest {
-            schema: "sptorch.checkpoint_manifest.v1".into(),
-            format_version: 1,
+            schema: CHECKPOINT_MANIFEST_SCHEMA.into(),
+            format_version: CHECKPOINT_MANIFEST_FORMAT_VERSION,
             model_name: "tiny-gpt".into(),
             save_kind: "state_dict".into(),
+            weights_file: "tiny-gpt.weights.json".into(),
             parameter_count: 17,
+            parameter_names: vec!["token_emb.weight".into(), "lm_head.weight".into()],
             state_dict_schema: "sptorch.state_dict.v1".into(),
             created_at_ms: 1711000300,
             note: "keep model weights and metadata aligned".into(),

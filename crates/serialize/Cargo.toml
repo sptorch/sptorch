@@ -5,5 +5,6 @@ edition = "2021"
 
 [dependencies]
 sptorch-core-tensor = { version = "0.1.0", path = "../core-tensor" }
+sptorch-versioning = { version = "0.1.0", path = "../versioning" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

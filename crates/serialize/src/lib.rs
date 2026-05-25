@@ -4,6 +4,8 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
+use sptorch_versioning::{CheckpointManifest, CHECKPOINT_MANIFEST_FORMAT_VERSION, CHECKPOINT_MANIFEST_SCHEMA};
+
 pub mod safetensors;
 
 const MAGIC: u32 = 0x5350_5443; // "SPTC"
@@ -191,6 +193,13 @@ pub fn load_named_state_dict<P: AsRef<Path>>(path: P, params: &[(&str, Tensor)])
     Ok(NamedStateDict { entries })
 }
 
+fn manifest_path_for<P: AsRef<Path>>(weights_path: P) -> std::path::PathBuf {
+    let path = weights_path.as_ref();
+    let mut manifest = path.as_os_str().to_owned();
+    manifest.push(".manifest.json");
+    std::path::PathBuf::from(manifest)
+}
+
 /// 按名称回写参数快照到模型张量。
 ///
 /// 这个接口会严格检查名称、shape 和 dtype。只要其中任一项不匹配，就会
@@ -284,6 +293,112 @@ pub fn save_state_dict<P: AsRef<Path>>(path: P, params: &[(&str, Tensor)]) -> io
     let f = File::create(path)?;
     serde_json::to_writer_pretty(BufWriter::new(f), &file)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
+/// 保存 JSON state_dict 以及与之配套的 manifest。
+///
+/// 这是一条更完整的训练存档路径：权重文件保存数值本体，manifest 保存模型名、
+/// 参数名、参数数量、格式版本和权重文件名。这样训练恢复时不需要猜测“这份
+/// state_dict 属于谁”，而是可以按清单精确回放。
+pub fn save_state_dict_bundle<P: AsRef<Path>>(
+    weights_path: P,
+    manifest: &CheckpointManifest,
+    params: &[(&str, Tensor)],
+) -> io::Result<()> {
+    let weights_path = weights_path.as_ref();
+    let mut resolved_manifest = manifest.clone();
+    resolved_manifest.schema = CHECKPOINT_MANIFEST_SCHEMA.into();
+    resolved_manifest.format_version = CHECKPOINT_MANIFEST_FORMAT_VERSION;
+    resolved_manifest.weights_file = weights_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_string();
+    resolved_manifest.parameter_count = params.len();
+    resolved_manifest.parameter_names = params.iter().map(|(name, _)| (*name).to_string()).collect();
+    resolved_manifest.state_dict_schema = STATE_DICT_SCHEMA.into();
+
+    save_state_dict(weights_path, params)?;
+    let manifest_path = manifest_path_for(weights_path);
+    let f = File::create(manifest_path)?;
+    serde_json::to_writer_pretty(BufWriter::new(f), &resolved_manifest)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
+/// 读取 checkpoint manifest，并验证权重文件仍符合其中声明的命名参数结构。
+pub fn load_state_dict_bundle<P: AsRef<Path>>(
+    weights_path: P,
+    params: &[(&str, Tensor)],
+) -> io::Result<(CheckpointManifest, Vec<StateDictEntry>)> {
+    let weights_path = weights_path.as_ref();
+    let manifest_path = manifest_path_for(weights_path);
+    let manifest_file = File::open(manifest_path)?;
+    let manifest: CheckpointManifest = serde_json::from_reader(BufReader::new(manifest_file))
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+
+    if manifest.schema != CHECKPOINT_MANIFEST_SCHEMA {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported checkpoint manifest schema {}", manifest.schema),
+        ));
+    }
+    if manifest.format_version != CHECKPOINT_MANIFEST_FORMAT_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported checkpoint manifest version {}", manifest.format_version),
+        ));
+    }
+    if manifest.state_dict_schema != STATE_DICT_SCHEMA {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "manifest state_dict schema {} does not match expected {}",
+                manifest.state_dict_schema, STATE_DICT_SCHEMA
+            ),
+        ));
+    }
+    if manifest.weights_file != weights_path.file_name().and_then(|s| s.to_str()).unwrap_or_default() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "manifest weights file {} does not match {}",
+                manifest.weights_file,
+                weights_path.display()
+            ),
+        ));
+    }
+    if manifest.parameter_count != params.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "manifest parameter count mismatch: manifest has {}, model has {}",
+                manifest.parameter_count,
+                params.len()
+            ),
+        ));
+    }
+
+    let entries = load_state_dict_file(weights_path, params)?;
+    if manifest.parameter_names.len() != entries.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "manifest parameter name count mismatch: manifest has {}, weights have {}",
+                manifest.parameter_names.len(),
+                entries.len()
+            ),
+        ));
+    }
+
+    let loaded_names: Vec<String> = entries.iter().map(|entry| entry.name.clone()).collect();
+    if manifest.parameter_names != loaded_names {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "manifest parameter names do not match loaded state_dict".to_string(),
+        ));
+    }
+
+    Ok((manifest, entries))
 }
 
 /// 从 JSON state_dict 文件加载命名参数。
@@ -437,5 +552,37 @@ mod tests {
         assert_eq!(new_b.data(), vec![5.0, 6.0]);
 
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_state_dict_bundle_roundtrip() {
+        let w = Tensor::with_grad(vec![1.0, 2.0], vec![2], true);
+        let b = Tensor::with_grad(vec![3.0], vec![1], true);
+        let weights_path = "test_bundle_weights.json";
+        let manifest = CheckpointManifest {
+            schema: CHECKPOINT_MANIFEST_SCHEMA.into(),
+            format_version: CHECKPOINT_MANIFEST_FORMAT_VERSION,
+            model_name: "bundle-model".into(),
+            save_kind: "state_dict".into(),
+            weights_file: String::new(),
+            parameter_count: 0,
+            parameter_names: Vec::new(),
+            state_dict_schema: STATE_DICT_SCHEMA.into(),
+            created_at_ms: 1711000400,
+            note: "bundle roundtrip".into(),
+        };
+
+        save_state_dict_bundle(weights_path, &manifest, &[("w", w.clone()), ("b", b.clone())]).unwrap();
+        let (loaded_manifest, entries) =
+            load_state_dict_bundle(weights_path, &[("w", w.clone()), ("b", b.clone())]).unwrap();
+
+        assert_eq!(loaded_manifest.model_name, "bundle-model");
+        assert_eq!(loaded_manifest.weights_file, "test_bundle_weights.json");
+        assert_eq!(loaded_manifest.parameter_count, 2);
+        assert_eq!(loaded_manifest.parameter_names, vec!["w".to_string(), "b".to_string()]);
+        assert_eq!(entries.len(), 2);
+
+        std::fs::remove_file(weights_path).unwrap();
+        std::fs::remove_file(format!("{weights_path}.manifest.json")).unwrap();
     }
 }
