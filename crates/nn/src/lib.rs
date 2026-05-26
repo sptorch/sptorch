@@ -1276,6 +1276,8 @@ pub struct GenerationConfig {
     pub top_p: f32,
     /// 重复惩罚系数。`1.0` 表示关闭；大于 1 时会压低历史 token 的再次出现概率。
     pub repetition_penalty: f32,
+    /// 可选的结束 token。生成器采到该 token 后会把它写入输出并停止继续解码。
+    pub eos_token_id: Option<usize>,
 }
 
 impl GenerationConfig {
@@ -1291,6 +1293,7 @@ impl GenerationConfig {
             top_k: 0,
             top_p: 1.0,
             repetition_penalty: 1.0,
+            eos_token_id: None,
         }
     }
 
@@ -1524,6 +1527,10 @@ fn generate_with_config_inner<M: AutoregressiveForward>(
     let mut state = InferenceState::new(prompt, model.max_context_len());
     let prompt_len = state.prompt_len();
 
+    if prompt.last().copied() == config.eos_token_id {
+        return state.into_tokens();
+    }
+
     for _ in 0..config.max_new_tokens {
         let logits = model.forward_token_ids(state.context());
         let logits_data = logits.contiguous_data();
@@ -1545,6 +1552,9 @@ fn generate_with_config_inner<M: AutoregressiveForward>(
             break;
         };
         state.push_token(next);
+        if Some(next) == config.eos_token_id {
+            break;
+        }
     }
 
     state.into_tokens()
@@ -2136,6 +2146,38 @@ mod tests {
         let output = generate_qwen_like_with_config(&model, &[0, 1], GenerationConfig::greedy(2, 6));
 
         assert_eq!(output.len(), 4);
+    }
+
+    #[test]
+    fn test_generation_stops_immediately_when_prompt_already_has_eos() {
+        let model = GPT::new(6, 4, 2, 1, 8, 5);
+        let output = generate_with_config(
+            &model,
+            &[1, 2],
+            GenerationConfig {
+                eos_token_id: Some(2),
+                ..GenerationConfig::greedy(3, 6)
+            },
+        );
+
+        assert_eq!(output, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_generation_stops_after_sampling_eos_token() {
+        let mut model = GPT::new(6, 4, 2, 1, 8, 5);
+        model.set_training(false);
+
+        let preview = generate_with_config(&model, &[1], GenerationConfig::greedy(1, 6));
+        let first_generated = preview[1];
+
+        let config = GenerationConfig {
+            eos_token_id: Some(first_generated),
+            ..GenerationConfig::greedy(4, 6)
+        };
+        let output = generate_with_config(&model, &[1], config);
+
+        assert_eq!(output, vec![1, first_generated]);
     }
 
     // --- Dropout tests ---
