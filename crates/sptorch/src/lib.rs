@@ -30,7 +30,8 @@ pub mod v1 {
         pub use sptorch_nn::{
             decode_constrained_next_token, decode_next_token, decode_qwen_like_next_token, generate_constrained,
             generate_qwen_like_with_config, generate_with_config, generate_with_sampling, sampling_candidates,
-            DecodeStep, GenerationConfig, InferenceState, KvCache, QwenLikeGPT, TokenCandidate, TokenTrie, GPT,
+            DecodeStep, DecodeStopReason, GenerationConfig, InferenceState, KvCache, QwenLikeGPT, TokenCandidate,
+            TokenTrie, GPT,
         };
     }
 
@@ -114,7 +115,8 @@ pub mod v1 {
         pub use super::nn::{
             decode_constrained_next_token, decode_next_token, decode_qwen_like_next_token, generate_constrained,
             generate_qwen_like_with_config, generate_with_config, generate_with_sampling, sampling_candidates,
-            DecodeStep, GenerationConfig, InferenceState, KvCache, QwenLikeGPT, TokenCandidate, TokenTrie, GPT,
+            DecodeStep, DecodeStopReason, GenerationConfig, InferenceState, KvCache, QwenLikeGPT, TokenCandidate,
+            TokenTrie, GPT,
         };
         pub use super::ops::{
             add, batch_matmul, broadcast_add, concat, cross_entropy_loss, cross_entropy_loss_ignore_index,

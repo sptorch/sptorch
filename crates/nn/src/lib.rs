@@ -1397,6 +1397,22 @@ pub struct TokenCandidate {
     pub probability: f32,
 }
 
+/// 单步解码停止原因。
+///
+/// `finished = true` 只告诉调用方“不要再继续”，但线上服务还需要知道为什么停止：
+/// EOS 是正常结束，候选为空更像约束或数值问题，已经结束则说明调用方重复 decode。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeStopReason {
+    /// 本步正常生成了 token，仍可继续解码。
+    NotStopped,
+    /// 状态进入解码前已经以 EOS 结束。
+    AlreadyEnded,
+    /// 当前约束或 logits 过滤后没有任何合法候选。
+    NoCandidates,
+    /// 本步生成了 EOS token。
+    EosToken,
+}
+
 /// 单步解码的返回值。
 ///
 /// 在线推理通常需要逐 token 流式返回，而不是一次性等待整段序列生成完成。
@@ -1407,6 +1423,7 @@ pub struct DecodeStep {
     pub token_id: Option<usize>,
     pub candidates: Vec<TokenCandidate>,
     pub finished: bool,
+    pub stop_reason: DecodeStopReason,
 }
 
 trait AutoregressiveForward {
@@ -1541,6 +1558,7 @@ fn decode_next_token_inner<M: AutoregressiveForward>(
             token_id: None,
             candidates: Vec::new(),
             finished: true,
+            stop_reason: DecodeStopReason::AlreadyEnded,
         };
     }
 
@@ -1565,14 +1583,21 @@ fn decode_next_token_inner<M: AutoregressiveForward>(
             token_id: None,
             candidates,
             finished: true,
+            stop_reason: DecodeStopReason::NoCandidates,
         };
     };
 
     state.push_token(next);
+    let stop_reason = if Some(next) == config.eos_token_id {
+        DecodeStopReason::EosToken
+    } else {
+        DecodeStopReason::NotStopped
+    };
     DecodeStep {
         token_id: Some(next),
         candidates,
-        finished: Some(next) == config.eos_token_id,
+        finished: stop_reason != DecodeStopReason::NotStopped,
+        stop_reason,
     }
 }
 
@@ -2267,6 +2292,7 @@ mod tests {
         let step = decode_next_token(&model, &mut state, &config);
 
         assert!(step.token_id.is_some());
+        assert_eq!(step.stop_reason, DecodeStopReason::NotStopped);
         assert!(!step.candidates.is_empty());
         assert_eq!(state.tokens().len(), 2);
         assert_eq!(state.generated_tokens(), &[step.token_id.unwrap()]);
@@ -2283,6 +2309,7 @@ mod tests {
         let step = decode_constrained_next_token(&model, &mut state, &config, &trie);
 
         assert_eq!(step.token_id, Some(2));
+        assert_eq!(step.stop_reason, DecodeStopReason::NotStopped);
         assert_eq!(state.generated_tokens(), &[2]);
     }
 
@@ -2299,8 +2326,25 @@ mod tests {
 
         assert!(step.finished);
         assert_eq!(step.token_id, None);
+        assert_eq!(step.stop_reason, DecodeStopReason::AlreadyEnded);
         assert!(step.candidates.is_empty());
         assert_eq!(state.tokens(), &[1, 2]);
+    }
+
+    #[test]
+    fn test_decode_constrained_next_token_reports_no_candidates() {
+        let model = GPT::new(4, 4, 2, 1, 8, 4);
+        let mut state = InferenceState::new(&[1], model.seq_len);
+        let config = GenerationConfig::greedy(3, 4);
+        let mut trie = TokenTrie::new();
+        trie.insert(&[99]);
+
+        let step = decode_constrained_next_token(&model, &mut state, &config, &trie);
+
+        assert!(step.finished);
+        assert_eq!(step.token_id, None);
+        assert_eq!(step.stop_reason, DecodeStopReason::NoCandidates);
+        assert_eq!(state.tokens(), &[1]);
     }
 
     // --- Dropout tests ---
