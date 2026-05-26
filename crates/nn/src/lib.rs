@@ -1397,6 +1397,18 @@ pub struct TokenCandidate {
     pub probability: f32,
 }
 
+/// 单步解码的返回值。
+///
+/// 在线推理通常需要逐 token 流式返回，而不是一次性等待整段序列生成完成。
+/// 该结构体记录本步是否真的生成了 token、最终候选分布以及生成后是否应该停止，
+/// 方便上层把 token 推送给客户端，同时把候选概率写入调试日志或 Studio 面板。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodeStep {
+    pub token_id: Option<usize>,
+    pub candidates: Vec<TokenCandidate>,
+    pub finished: bool,
+}
+
 trait AutoregressiveForward {
     fn max_context_len(&self) -> usize;
     fn forward_token_ids(&self, token_ids: &[usize]) -> Tensor;
@@ -1515,6 +1527,55 @@ fn sample_from_candidates(candidates: &[TokenCandidate], rng: &mut impl Rng) -> 
     candidates.last().map(|candidate| candidate.token_id)
 }
 
+fn decode_next_token_inner<M: AutoregressiveForward>(
+    model: &M,
+    state: &mut InferenceState,
+    config: &GenerationConfig,
+    constraint: Option<&dyn TokenConstraint>,
+    rng: &mut impl Rng,
+) -> DecodeStep {
+    assert!(config.vocab_size > 0, "vocab_size must be positive");
+
+    if config.eos_token_id.is_some() && state.tokens().last().copied() == config.eos_token_id {
+        return DecodeStep {
+            token_id: None,
+            candidates: Vec::new(),
+            finished: true,
+        };
+    }
+
+    let logits = model.forward_token_ids(state.context());
+    let logits_data = logits.contiguous_data();
+    let last = &logits_data[logits_data.len() - config.vocab_size..];
+    let mut step_logits = last.to_vec();
+
+    if let Some(constraint) = constraint {
+        if let Some(allowed) = constraint.allowed_next(state.generated_tokens()) {
+            for (token_id, logit) in step_logits.iter_mut().enumerate() {
+                if !allowed.contains(&token_id) {
+                    *logit = f32::NEG_INFINITY;
+                }
+            }
+        }
+    }
+
+    let candidates = sampling_candidates(&step_logits, config, state.tokens());
+    let Some(next) = sample_from_candidates(&candidates, rng) else {
+        return DecodeStep {
+            token_id: None,
+            candidates,
+            finished: true,
+        };
+    };
+
+    state.push_token(next);
+    DecodeStep {
+        token_id: Some(next),
+        candidates,
+        finished: Some(next) == config.eos_token_id,
+    }
+}
+
 fn generate_with_config_inner<M: AutoregressiveForward>(
     model: &M,
     prompt: &[usize],
@@ -1525,34 +1586,17 @@ fn generate_with_config_inner<M: AutoregressiveForward>(
 
     let mut rng = rand::thread_rng();
     let mut state = InferenceState::new(prompt, model.max_context_len());
-    let prompt_len = state.prompt_len();
 
-    if prompt.last().copied() == config.eos_token_id {
+    if config.eos_token_id.is_some() && prompt.last().copied() == config.eos_token_id {
         return state.into_tokens();
     }
 
     for _ in 0..config.max_new_tokens {
-        let logits = model.forward_token_ids(state.context());
-        let logits_data = logits.contiguous_data();
-        let last = &logits_data[logits_data.len() - config.vocab_size..];
-        let mut step_logits = last.to_vec();
-
-        if let Some(constraint) = constraint {
-            if let Some(allowed) = constraint.allowed_next(&state.tokens()[prompt_len..]) {
-                for (token_id, logit) in step_logits.iter_mut().enumerate() {
-                    if !allowed.contains(&token_id) {
-                        *logit = f32::NEG_INFINITY;
-                    }
-                }
-            }
-        }
-
-        let candidates = sampling_candidates(&step_logits, &config, state.tokens());
-        let Some(next) = sample_from_candidates(&candidates, &mut rng) else {
+        let step = decode_next_token_inner(model, &mut state, &config, constraint, &mut rng);
+        if step.token_id.is_none() {
             break;
-        };
-        state.push_token(next);
-        if Some(next) == config.eos_token_id {
+        }
+        if step.finished {
             break;
         }
     }
@@ -1601,6 +1645,39 @@ pub fn generate_with_config(model: &GPT, prompt: &[usize], config: GenerationCon
 /// 这条入口让 SFT 训练出来的小型 Qwen-like 模型也能复用同一套在线解码语义。
 pub fn generate_qwen_like_with_config(model: &QwenLikeGPT, prompt: &[usize], config: GenerationConfig) -> Vec<usize> {
     generate_with_config_inner(model, prompt, config, None)
+}
+
+/// 对 GPT 状态执行一步解码。
+///
+/// 调用方负责持有并复用 [`InferenceState`]；函数会在成功采样时把 token 追加到状态中。
+/// 这就是后续流式推理、请求队列和真实 KV cache 共享的最小同步原语。
+pub fn decode_next_token(model: &GPT, state: &mut InferenceState, config: &GenerationConfig) -> DecodeStep {
+    let mut rng = rand::thread_rng();
+    decode_next_token_inner(model, state, config, None, &mut rng)
+}
+
+/// 对 Qwen/Llama 风格模型状态执行一步解码。
+pub fn decode_qwen_like_next_token(
+    model: &QwenLikeGPT,
+    state: &mut InferenceState,
+    config: &GenerationConfig,
+) -> DecodeStep {
+    let mut rng = rand::thread_rng();
+    decode_next_token_inner(model, state, config, None, &mut rng)
+}
+
+/// 对 GPT 状态执行一步带约束解码。
+///
+/// 约束读取的是 prompt 之后已经生成的 token，因此可以自然表达 SQL 前缀树、
+/// schema 候选或语法状态机。
+pub fn decode_constrained_next_token(
+    model: &GPT,
+    state: &mut InferenceState,
+    config: &GenerationConfig,
+    constraint: &dyn TokenConstraint,
+) -> DecodeStep {
+    let mut rng = rand::thread_rng();
+    decode_next_token_inner(model, state, config, Some(constraint), &mut rng)
 }
 
 // ============ Constrained Decoding ============
@@ -2178,6 +2255,52 @@ mod tests {
         let output = generate_with_config(&model, &[1], config);
 
         assert_eq!(output, vec![1, first_generated]);
+    }
+
+    #[test]
+    fn test_decode_next_token_appends_to_state_and_returns_candidates() {
+        let mut model = GPT::new(6, 4, 2, 1, 8, 5);
+        model.set_training(false);
+        let mut state = InferenceState::new(&[1], model.seq_len);
+        let config = GenerationConfig::greedy(4, 6);
+
+        let step = decode_next_token(&model, &mut state, &config);
+
+        assert!(step.token_id.is_some());
+        assert!(!step.candidates.is_empty());
+        assert_eq!(state.tokens().len(), 2);
+        assert_eq!(state.generated_tokens(), &[step.token_id.unwrap()]);
+    }
+
+    #[test]
+    fn test_decode_constrained_next_token_respects_trie_prefix() {
+        let model = GPT::new(4, 4, 2, 1, 8, 4);
+        let mut state = InferenceState::new(&[1], model.seq_len);
+        let config = GenerationConfig::greedy(3, 4);
+        let mut trie = TokenTrie::new();
+        trie.insert(&[2, 3]);
+
+        let step = decode_constrained_next_token(&model, &mut state, &config, &trie);
+
+        assert_eq!(step.token_id, Some(2));
+        assert_eq!(state.generated_tokens(), &[2]);
+    }
+
+    #[test]
+    fn test_decode_next_token_stops_when_state_already_ended() {
+        let model = GPT::new(6, 4, 2, 1, 8, 5);
+        let mut state = InferenceState::new(&[1, 2], model.seq_len);
+        let config = GenerationConfig {
+            eos_token_id: Some(2),
+            ..GenerationConfig::greedy(4, 6)
+        };
+
+        let step = decode_next_token(&model, &mut state, &config);
+
+        assert!(step.finished);
+        assert_eq!(step.token_id, None);
+        assert!(step.candidates.is_empty());
+        assert_eq!(state.tokens(), &[1, 2]);
     }
 
     // --- Dropout tests ---
