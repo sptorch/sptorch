@@ -9,6 +9,7 @@ sptorch-core-ops = { version = "0.1.0", path = "../core-ops" }
 rand = "0.8"
 
 [dev-dependencies]
+sptorch-data = { version = "0.1.0", path = "../data" }
 sptorch-optim = { version = "0.1.0", path = "../optim" }
 sptorch-serialize = { version = "0.1.0", path = "../serialize" }
 sptorch-versioning = { version = "0.1.0", path = "../versioning" }

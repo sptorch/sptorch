@@ -443,6 +443,48 @@ impl Module for LayerNorm {
     }
 }
 
+// ============ RMSNorm ============
+
+/// RMSNorm 模块。
+///
+/// 与 LayerNorm 不同，RMSNorm 不减均值，只按均方根缩放最后一维。这是
+/// Llama/Qwen 风格 decoder block 里更常见的归一化方式，计算路径更短，
+/// 也更贴合后续 fused kernel 的实现边界。
+pub struct RmsNorm {
+    /// 缩放参数，形状为 `[normalized_shape]`。
+    pub weight: Tensor,
+    /// 数值稳定项。
+    pub eps: f32,
+    /// 被归一化的最后一维长度。
+    pub normalized_shape: usize,
+}
+
+impl RmsNorm {
+    /// 创建 RMSNorm，缩放参数初始化为 1。
+    pub fn new(normalized_shape: usize) -> Self {
+        RmsNorm {
+            weight: Tensor::with_grad(vec![1.0; normalized_shape], vec![normalized_shape], true),
+            eps: 1e-6,
+            normalized_shape,
+        }
+    }
+
+    /// 返回 RMSNorm 的命名参数。
+    pub fn named_parameters(&self, prefix: &str) -> Vec<NamedParameter> {
+        vec![named_parameter(prefix, "weight", self.weight.clone())]
+    }
+}
+
+impl Module for RmsNorm {
+    fn forward(&self, input: &Tensor) -> Tensor {
+        rms_norm(input, &self.weight, self.eps)
+    }
+
+    fn parameters(&self) -> Vec<Tensor> {
+        vec![self.weight.clone()]
+    }
+}
+
 #[derive(Debug)]
 struct LayerNormOp {
     normalized: Vec<f32>, // (x - mean) / std for each element
@@ -544,7 +586,7 @@ impl MultiHeadAttention {
     /// 执行带因果掩码的自注意力前向。
     ///
     /// 适合自回归语言模型，不适合双向编码器语义。
-    pub fn forward_causal(&self, input: &Tensor) -> Tensor {
+    fn forward_causal_impl(&self, input: &Tensor, rope_base: Option<f32>) -> Tensor {
         let shape = input.shape();
         let seq_len = shape[0];
         let h = self.n_head;
@@ -556,9 +598,14 @@ impl MultiHeadAttention {
         let v = self.wv.forward(input);
 
         // Reshape to [n_head, seq_len, head_dim]
-        let q3 = reshape_to_heads(&q, seq_len, h, hd);
-        let k3 = reshape_to_heads(&k, seq_len, h, hd);
+        let mut q3 = reshape_to_heads(&q, seq_len, h, hd);
+        let mut k3 = reshape_to_heads(&k, seq_len, h, hd);
         let v3 = reshape_to_heads(&v, seq_len, h, hd);
+
+        if let Some(rope_base) = rope_base {
+            q3 = rotary_position_embedding(&q3, rope_base);
+            k3 = rotary_position_embedding(&k3, rope_base);
+        }
 
         // Attention scores: [n_head, seq_len, seq_len]
         let kt = batch_transpose(&k3, h, seq_len, hd);
@@ -591,6 +638,21 @@ impl MultiHeadAttention {
 
         // Output projection
         self.wo.forward(&out_2d)
+    }
+
+    /// 执行带因果掩码的自注意力前向。
+    ///
+    /// 适合自回归语言模型，不适合双向编码器语义。
+    pub fn forward_causal(&self, input: &Tensor) -> Tensor {
+        self.forward_causal_impl(input, None)
+    }
+
+    /// 执行带 RoPE 的因果自注意力前向。
+    ///
+    /// 这条路径在 Qwen/Llama 风格模型里更常见：位置信息先注入 Q/K，再做因果
+    /// attention。
+    pub fn forward_causal_rope(&self, input: &Tensor, rope_base: f32) -> Tensor {
+        self.forward_causal_impl(input, Some(rope_base))
     }
     /// 返回注意力层全部参数。
     pub fn parameters(&self) -> Vec<Tensor> {
@@ -781,6 +843,81 @@ impl sptorch_core_tensor::Op for BatchTransposeOp {
     }
 }
 
+fn apply_rope_raw(
+    data: &[f32],
+    n_head: usize,
+    seq_len: usize,
+    head_dim: usize,
+    rope_base: f32,
+    inverse: bool,
+) -> Vec<f32> {
+    assert_eq!(head_dim % 2, 0, "rope requires an even head dimension");
+    let half = head_dim / 2;
+    let mut out = vec![0.0f32; data.len()];
+
+    for h in 0..n_head {
+        for pos in 0..seq_len {
+            let off = h * seq_len * head_dim + pos * head_dim;
+            for pair in 0..half {
+                let theta = pos as f32 / rope_base.powf((2 * pair) as f32 / head_dim as f32);
+                let (sin, cos) = theta.sin_cos();
+                let sin = if inverse { -sin } else { sin };
+                let even = data[off + 2 * pair];
+                let odd = data[off + 2 * pair + 1];
+                out[off + 2 * pair] = even * cos - odd * sin;
+                out[off + 2 * pair + 1] = even * sin + odd * cos;
+            }
+        }
+    }
+
+    out
+}
+
+/// 对注意力头张量应用 Rotary Position Embedding。
+///
+/// 输入和输出 shape 都是 `[n_head, seq_len, head_dim]`。这个实现不绑定具体模型，
+/// 只负责把位置信息以旋转方式注入到 query/key 的偶数维与奇数维配对中。
+pub fn rotary_position_embedding(x: &Tensor, rope_base: f32) -> Tensor {
+    let shape = x.shape();
+    assert_eq!(shape.len(), 3, "rope expects [n_head, seq_len, head_dim]");
+    let data = x.contiguous_data();
+    let out = apply_rope_raw(&data, shape[0], shape[1], shape[2], rope_base, false);
+    let res = Tensor::new(out, shape.clone());
+
+    if x.requires_grad() {
+        let mut inner = res.0.write().unwrap();
+        inner.requires_grad = true;
+        inner.creator = Some(std::sync::Arc::new(sptorch_core_tensor::Node {
+            op: Box::new(RotaryEmbeddingOp {
+                n_head: shape[0],
+                seq_len: shape[1],
+                head_dim: shape[2],
+                rope_base,
+            }),
+            inputs: vec![x.clone()],
+        }));
+    }
+
+    res
+}
+
+#[derive(Debug)]
+struct RotaryEmbeddingOp {
+    n_head: usize,
+    seq_len: usize,
+    head_dim: usize,
+    rope_base: f32,
+}
+
+impl sptorch_core_tensor::Op for RotaryEmbeddingOp {
+    // 反向传播时只需要把梯度沿相反角度旋回去即可，因为 RoPE 本身是正交旋转。
+    fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
+        let g = grad_output.contiguous_data();
+        let out = apply_rope_raw(&g, self.n_head, self.seq_len, self.head_dim, self.rope_base, true);
+        vec![Some(Tensor::new(out, vec![self.n_head, self.seq_len, self.head_dim]))]
+    }
+}
+
 // ============ TransformerBlock ============
 
 pub struct TransformerBlock {
@@ -798,6 +935,88 @@ pub struct TransformerBlock {
     pub attn_dropout: Dropout,
     /// FFN 残差分支 dropout。
     pub ffn_dropout: Dropout,
+}
+
+/// 以 RoPE 取代绝对位置 embedding 的 Transformer block。
+///
+/// 这个块更接近 Llama/Qwen 风格：位置语义进入 Q/K 旋转，不再依赖显式 position
+/// embedding。它保留当前框架最稳定的 LayerNorm + causal attention + FFN 结构，
+/// 只是把位置建模方式升级成更适合长上下文与 Text-to-SQL 任务的形式。
+pub struct QwenLikeBlock {
+    pub norm1: RmsNorm,
+    pub attn: MultiHeadAttention,
+    pub norm2: RmsNorm,
+    pub ffn_up: Linear,
+    pub ffn_gate: Linear,
+    pub ffn_down: Linear,
+    pub attn_dropout: Dropout,
+    pub ffn_dropout: Dropout,
+    pub rope_base: f32,
+}
+
+impl QwenLikeBlock {
+    /// 创建一个 RoPE 风格的 Transformer block。
+    pub fn new(d_model: usize, n_head: usize, d_ff: usize) -> Self {
+        QwenLikeBlock {
+            norm1: RmsNorm::new(d_model),
+            attn: MultiHeadAttention::new(d_model, n_head),
+            norm2: RmsNorm::new(d_model),
+            ffn_up: Linear::new(d_model, d_ff, true),
+            ffn_gate: Linear::new(d_model, d_ff, true),
+            ffn_down: Linear::new(d_ff, d_model, true),
+            attn_dropout: Dropout::new(0.1),
+            ffn_dropout: Dropout::new(0.1),
+            rope_base: 10000.0,
+        }
+    }
+
+    /// 前向路径与标准 block 一致，只是注意力内部把 Q/K 改成 RoPE 旋转。
+    pub fn forward_seq(&self, input: &Tensor) -> Tensor {
+        let normed = self.norm1.forward(input);
+        let attn_out = self.attn.forward_causal_rope(&normed, self.rope_base);
+        let attn_out = self.attn_dropout.forward(&attn_out);
+        let x = add(input, &attn_out);
+
+        let normed2 = self.norm2.forward(&x);
+        let ffn_out = swiglu(&self.ffn_up.forward(&normed2), &self.ffn_gate.forward(&normed2));
+        let ffn_out = self.ffn_dropout.forward(&self.ffn_down.forward(&ffn_out));
+        add(&x, &ffn_out)
+    }
+
+    /// 切换训练/评估状态。
+    pub fn set_training(&mut self, training: bool) {
+        if training {
+            self.attn_dropout.train();
+            self.ffn_dropout.train();
+        } else {
+            self.attn_dropout.eval();
+            self.ffn_dropout.eval();
+        }
+    }
+
+    /// 返回块内全部参数。
+    pub fn parameters(&self) -> Vec<Tensor> {
+        let mut p = Vec::new();
+        p.extend(self.norm1.parameters());
+        p.extend(self.attn.parameters());
+        p.extend(self.norm2.parameters());
+        p.extend(self.ffn_up.parameters());
+        p.extend(self.ffn_gate.parameters());
+        p.extend(self.ffn_down.parameters());
+        p
+    }
+
+    /// 返回块内命名参数。
+    pub fn named_parameters(&self, prefix: &str) -> Vec<NamedParameter> {
+        let mut params = Vec::new();
+        params.extend(self.norm1.named_parameters(&format!("{prefix}.norm1")));
+        params.extend(self.attn.named_parameters(&format!("{prefix}.attn")));
+        params.extend(self.norm2.named_parameters(&format!("{prefix}.norm2")));
+        params.extend(self.ffn_up.named_parameters(&format!("{prefix}.ffn_up")));
+        params.extend(self.ffn_gate.named_parameters(&format!("{prefix}.ffn_gate")));
+        params.extend(self.ffn_down.named_parameters(&format!("{prefix}.ffn_down")));
+        params
+    }
 }
 
 impl TransformerBlock {
@@ -883,6 +1102,18 @@ pub struct GPT {
     pub seq_len: usize,
 }
 
+/// 采用 RoPE + SwiGLU 的小型自回归模型骨架。
+///
+/// 这条路径更接近 Qwen/Llama 的训练语义：没有显式 position embedding，而是把
+/// 位置编码直接注入注意力的 Q/K；FFN 侧使用门控激活而不是单一路径激活。
+pub struct QwenLikeGPT {
+    pub token_emb: Embedding,
+    pub blocks: Vec<QwenLikeBlock>,
+    pub norm_f: RmsNorm,
+    pub lm_head: Linear,
+    pub seq_len: usize,
+}
+
 impl GPT {
     /// 创建 GPT 模型。
     ///
@@ -954,6 +1185,68 @@ impl GPT {
     ///
     /// 当前真正受影响的是各层 dropout。把开关放到模型级别，可以避免调用方
     /// 手动遍历 block，减少训练/评估模式混淆。
+    pub fn set_training(&mut self, training: bool) {
+        for block in &mut self.blocks {
+            block.set_training(training);
+        }
+    }
+}
+
+impl QwenLikeGPT {
+    /// 创建 RoPE 风格的 GPT 变体。
+    pub fn new(vocab_size: usize, d_model: usize, n_head: usize, n_layer: usize, d_ff: usize, seq_len: usize) -> Self {
+        let blocks = (0..n_layer)
+            .map(|_| QwenLikeBlock::new(d_model, n_head, d_ff))
+            .collect();
+        QwenLikeGPT {
+            token_emb: Embedding::new(vocab_size, d_model),
+            blocks,
+            norm_f: RmsNorm::new(d_model),
+            lm_head: Linear::new(d_model, vocab_size, false),
+            seq_len,
+        }
+    }
+
+    /// 将 token 序列前向为 logits。
+    pub fn forward_ids(&self, token_ids: &[usize]) -> Tensor {
+        let slen = token_ids.len();
+        assert!(slen <= self.seq_len);
+
+        let tok = self.token_emb.forward_indices(token_ids);
+        let mut x = tok;
+        for block in &self.blocks {
+            x = block.forward_seq(&x);
+        }
+
+        let x = self.norm_f.forward(&x);
+        self.lm_head.forward(&x)
+    }
+
+    /// 返回可训练参数。
+    pub fn parameters(&self) -> Vec<Tensor> {
+        let mut p = Vec::new();
+        p.extend(self.token_emb.parameters());
+        for block in &self.blocks {
+            p.extend(block.parameters());
+        }
+        p.extend(self.norm_f.parameters());
+        p.extend(self.lm_head.parameters());
+        p
+    }
+
+    /// 返回命名参数。
+    pub fn named_parameters(&self) -> Vec<NamedParameter> {
+        let mut params = Vec::new();
+        params.extend(self.token_emb.named_parameters("token_emb"));
+        for (idx, block) in self.blocks.iter().enumerate() {
+            params.extend(block.named_parameters(&format!("blocks.{idx}")));
+        }
+        params.extend(self.norm_f.named_parameters("norm_f"));
+        params.extend(self.lm_head.named_parameters("lm_head"));
+        params
+    }
+
+    /// 切换训练/评估状态。
     pub fn set_training(&mut self, training: bool) {
         for block in &mut self.blocks {
             block.set_training(training);
@@ -1309,6 +1602,24 @@ mod tests {
         assert_eq!(out.shape(), vec![4, 8]);
     }
 
+    #[test]
+    fn test_rope_keeps_position_zero_and_rotates_later_positions() {
+        let input = Tensor::new(
+            vec![
+                1.0, 2.0, 3.0, 4.0, //
+                1.0, 0.0, 0.0, 1.0,
+            ],
+            vec![1, 2, 4],
+        );
+        let out = rotary_position_embedding(&input, 10000.0);
+        let data = out.data();
+        assert_eq!(&data[..4], &[1.0, 2.0, 3.0, 4.0]);
+        assert!(
+            (data[4] - 1.0).abs() > 1e-3 || data[5].abs() > 1e-3,
+            "position 1 should be rotated"
+        );
+    }
+
     // 验证多头注意力参数数量与结构一致。
     #[test]
     fn test_mha_parameters_count() {
@@ -1325,6 +1636,17 @@ mod tests {
         let input = Tensor::new(vec![0.1; 4 * 8], vec![4, 8]);
         let out = block.forward_seq(&input);
         assert_eq!(out.shape(), vec![4, 8]);
+    }
+
+    #[test]
+    fn test_qwen_like_gpt_forward_and_backward() {
+        let mut model = QwenLikeGPT::new(12, 8, 2, 1, 16, 6);
+        model.set_training(false);
+        let logits = model.forward_ids(&[0, 1, 2, 3]);
+        assert_eq!(logits.shape(), vec![4, 12]);
+        let loss = cross_entropy_loss(&logits, &[1, 2, 3, 4]);
+        loss.backward();
+        assert!(model.parameters().iter().any(|param| param.grad().is_some()));
     }
 
     // --- GPT tests ---

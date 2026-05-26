@@ -27,7 +27,15 @@ pub mod v1 {
     /// 解码需要的模块。它尽量保持“能直接搭建模型”的粒度，而不是暴露所有
     /// 内部构件。
     pub mod nn {
-        pub use sptorch_nn::{generate_constrained, TokenTrie, GPT};
+        pub use sptorch_nn::{generate_constrained, QwenLikeGPT, TokenTrie, GPT};
+    }
+
+    /// 数据与 tokenizer 入口。
+    ///
+    /// 这层把框架里最常用的字符级/BPE tokenizer 和 next-token 数据管道集中导出，
+    /// 方便产品仓用更稳定的命名空间组装 SFT 样本。
+    pub mod data {
+        pub use sptorch_data::{BpeTokenizer, CharTokenizer, DataLoader, Dataset, TextDataset, Tokenizer};
     }
 
     /// 优化器与梯度工具入口。
@@ -45,9 +53,9 @@ pub mod v1 {
     /// 内部实现文件。
     pub mod ops {
         pub use sptorch_core_ops::{
-            add, batch_matmul, broadcast_add, concat, cross_entropy_loss, embedding_lookup, exp, gelu, log,
-            log_softmax, masked_fill, masked_softmax, matmul, mean, mean_dim, mul, neg, relu, reshape, rms_norm, scale,
-            softmax, sub, sum, sum_dim, swiglu, transpose,
+            add, batch_matmul, broadcast_add, concat, cross_entropy_loss, cross_entropy_loss_ignore_index,
+            embedding_lookup, exp, gelu, log, log_softmax, masked_fill, masked_softmax, matmul, mean, mean_dim, mul,
+            neg, relu, reshape, rms_norm, scale, softmax, sub, sum, sum_dim, swiglu, transpose,
         };
     }
 
@@ -98,11 +106,12 @@ pub mod v1 {
         pub use super::core::{
             broadcast_shape, can_broadcast, is_grad_enabled, no_grad, set_grad_enabled, DType, Device, Tensor,
         };
-        pub use super::nn::{generate_constrained, TokenTrie, GPT};
+        pub use super::data::{BpeTokenizer, CharTokenizer, DataLoader, Dataset, TextDataset, Tokenizer};
+        pub use super::nn::{generate_constrained, QwenLikeGPT, TokenTrie, GPT};
         pub use super::ops::{
-            add, batch_matmul, broadcast_add, concat, cross_entropy_loss, embedding_lookup, exp, gelu, log,
-            log_softmax, masked_fill, masked_softmax, matmul, mean, mean_dim, mul, neg, relu, reshape, rms_norm, scale,
-            softmax, sub, sum, sum_dim, swiglu, transpose,
+            add, batch_matmul, broadcast_add, concat, cross_entropy_loss, cross_entropy_loss_ignore_index,
+            embedding_lookup, exp, gelu, log, log_softmax, masked_fill, masked_softmax, matmul, mean, mean_dim, mul,
+            neg, relu, reshape, rms_norm, scale, softmax, sub, sum, sum_dim, swiglu, transpose,
         };
         pub use super::optim::{clip_grad_norm, scale_gradients, zero_grad, AdamW, Optimizer, SGD};
         pub use super::versioning::{

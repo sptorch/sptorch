@@ -1020,7 +1020,9 @@ pub fn log_softmax(a: &Tensor) -> Tensor {
 pub struct CrossEntropyLossOp {
     softmax_output: Tensor,
     targets: Vec<usize>,
+    ignore_mask: Vec<bool>,
     batch_size: usize,
+    active_count: usize,
 }
 
 impl Op for CrossEntropyLossOp {
@@ -1034,18 +1036,33 @@ impl Op for CrossEntropyLossOp {
         let n = self.batch_size;
 
         let mut da = s.clone();
+        if self.active_count == 0 {
+            da.fill(0.0);
+            return vec![Some(Tensor::new(da, shape))];
+        }
+
+        let scale = g_val / self.active_count as f32;
         if shape.len() == 1 {
-            // Single sample
-            da[self.targets[0]] -= 1.0;
-            for v in da.iter_mut() {
-                *v *= g_val;
+            if self.ignore_mask[0] {
+                da.fill(0.0);
+            } else {
+                da[self.targets[0]] -= 1.0;
+                for v in da.iter_mut() {
+                    *v *= scale;
+                }
             }
         } else {
             let cols = shape[1];
-            for (r, &t) in self.targets.iter().enumerate() {
-                da[r * cols + t] -= 1.0;
+            for r in 0..n {
+                let off = r * cols;
+                if self.ignore_mask[r] {
+                    for c in 0..cols {
+                        da[off + c] = 0.0;
+                    }
+                } else {
+                    da[off + self.targets[r]] -= 1.0;
+                }
             }
-            let scale = g_val / n as f32;
             for v in da.iter_mut() {
                 *v *= scale;
             }
@@ -1054,25 +1071,40 @@ impl Op for CrossEntropyLossOp {
         vec![Some(Tensor::new(da, shape))]
     }
 }
-/// 计算交叉熵损失（内部基于 log-softmax 与目标索引）。
-pub fn cross_entropy_loss(logits: &Tensor, targets: &[usize]) -> Tensor {
+/// 计算带 `ignore_index` 的交叉熵损失。
+///
+/// 这是训练 SFT 时更实用的入口：调用方可以把 prompt、padding 或其他不参与
+/// 优化的 token 标记成 `ignore_index`，损失只会统计有效位置。`ignore_index`
+/// 与目标值相等时，该位置的 loss 与梯度都会被置零。
+pub fn cross_entropy_loss_ignore_index(logits: &Tensor, targets: &[usize], ignore_index: usize) -> Tensor {
+    cross_entropy_loss_impl(logits, targets, Some(ignore_index))
+}
+
+fn cross_entropy_loss_impl(logits: &Tensor, targets: &[usize], ignore_index: Option<usize>) -> Tensor {
     let data = logits.contiguous_data();
     let shape = logits.shape();
 
     if shape.len() == 1 {
         let num_classes = shape[0];
-        assert!(
-            targets[0] < num_classes,
-            "cross_entropy: target {} out of range {}",
-            targets[0],
-            num_classes
-        );
+        let is_ignored = ignore_index.is_some_and(|idx| targets[0] == idx);
+        if !is_ignored {
+            assert!(
+                targets[0] < num_classes,
+                "cross_entropy: target {} out of range {}",
+                targets[0],
+                num_classes
+            );
+        }
         let max_val = data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let exps: Vec<f32> = data.iter().map(|x| (x - max_val).exp()).collect();
         let sum: f32 = exps.iter().sum();
-        let log_sum = sum.ln();
-        let log_prob = data[targets[0]] - max_val - log_sum;
-        let loss = -log_prob;
+        let loss = if is_ignored {
+            0.0
+        } else {
+            let log_sum = sum.ln();
+            let log_prob = data[targets[0]] - max_val - log_sum;
+            -log_prob
+        };
 
         let sm: Vec<f32> = exps.iter().map(|e| e / sum).collect();
         let sm_tensor = Tensor::new(sm, vec![num_classes]);
@@ -1085,7 +1117,9 @@ pub fn cross_entropy_loss(logits: &Tensor, targets: &[usize]) -> Tensor {
                 op: Box::new(CrossEntropyLossOp {
                     softmax_output: sm_tensor,
                     targets: targets.to_vec(),
+                    ignore_mask: vec![is_ignored],
                     batch_size: 1,
+                    active_count: if is_ignored { 0 } else { 1 },
                 }),
                 inputs: vec![logits.clone()],
             }));
@@ -1096,20 +1130,25 @@ pub fn cross_entropy_loss(logits: &Tensor, targets: &[usize]) -> Tensor {
         // Batched: [batch, num_classes]
         let (batch, num_classes) = (shape[0], shape[1]);
         assert_eq!(targets.len(), batch);
-        for &t in targets {
-            assert!(
-                t < num_classes,
-                "cross_entropy: target {} out of range {}",
-                t,
-                num_classes
-            );
-        }
 
         let mut total_loss = 0.0f32;
         let mut sm = vec![0.0f32; batch * num_classes];
+        let mut ignore_mask = Vec::with_capacity(batch);
+        let mut active_count = 0usize;
 
         for r in 0..batch {
             let off = r * num_classes;
+            let is_ignored = ignore_index.is_some_and(|idx| targets[r] == idx);
+            ignore_mask.push(is_ignored);
+            if is_ignored {
+                continue;
+            }
+            assert!(
+                targets[r] < num_classes,
+                "cross_entropy: target {} out of range {}",
+                targets[r],
+                num_classes
+            );
             let max_val = (0..num_classes)
                 .map(|c| data[off + c])
                 .fold(f32::NEG_INFINITY, f32::max);
@@ -1119,9 +1158,14 @@ pub fn cross_entropy_loss(logits: &Tensor, targets: &[usize]) -> Tensor {
             for c in 0..num_classes {
                 sm[off + c] = (data[off + c] - max_val).exp() / sum;
             }
+            active_count += 1;
         }
 
-        let loss = total_loss / batch as f32;
+        let loss = if active_count == 0 {
+            0.0
+        } else {
+            total_loss / active_count as f32
+        };
         let sm_tensor = Tensor::new(sm, vec![batch, num_classes]);
         let res = Tensor::new(vec![loss], vec![1]);
 
@@ -1132,7 +1176,9 @@ pub fn cross_entropy_loss(logits: &Tensor, targets: &[usize]) -> Tensor {
                 op: Box::new(CrossEntropyLossOp {
                     softmax_output: sm_tensor,
                     targets: targets.to_vec(),
+                    ignore_mask,
                     batch_size: batch,
+                    active_count,
                 }),
                 inputs: vec![logits.clone()],
             }));
@@ -1140,6 +1186,11 @@ pub fn cross_entropy_loss(logits: &Tensor, targets: &[usize]) -> Tensor {
 
         res
     }
+}
+
+/// 计算标准交叉熵损失，不忽略任何位置。
+pub fn cross_entropy_loss(logits: &Tensor, targets: &[usize]) -> Tensor {
+    cross_entropy_loss_impl(logits, targets, None)
 }
 
 // ============ Embedding Lookup ============
@@ -2337,6 +2388,18 @@ mod tests {
         // grad = softmax - one_hot => sum should be ~0
         let sum_g: f32 = g.iter().sum();
         assert!(sum_g.abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_cross_entropy_ignore_index_skips_prompt_tokens() {
+        let a = Tensor::with_grad(vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0], vec![2, 3], true);
+        let loss = cross_entropy_loss_ignore_index(&a, &[usize::MAX, 1], usize::MAX);
+        assert!((loss.data()[0] - (3.0f32).ln()).abs() < 1e-5);
+        loss.backward();
+        let g = a.grad().unwrap();
+        assert!(g[0].abs() < 1e-6 && g[1].abs() < 1e-6 && g[2].abs() < 1e-6);
+        let tail_sum: f32 = g[3..].iter().sum();
+        assert!(tail_sum.abs() < 1e-6);
     }
 
     #[test]
