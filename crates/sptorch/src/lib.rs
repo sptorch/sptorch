@@ -27,7 +27,11 @@ pub mod v1 {
     /// 解码需要的模块。它尽量保持“能直接搭建模型”的粒度，而不是暴露所有
     /// 内部构件。
     pub mod nn {
-        pub use sptorch_nn::{generate_constrained, QwenLikeGPT, TokenTrie, GPT};
+        pub use sptorch_nn::{
+            generate_constrained, generate_qwen_like_with_config, generate_with_config, generate_with_sampling,
+            sampling_candidates, GenerationConfig, InferenceState, KvCache, QwenLikeGPT, TokenCandidate, TokenTrie,
+            GPT,
+        };
     }
 
     /// 数据与 tokenizer 入口。
@@ -107,7 +111,11 @@ pub mod v1 {
             broadcast_shape, can_broadcast, is_grad_enabled, no_grad, set_grad_enabled, DType, Device, Tensor,
         };
         pub use super::data::{BpeTokenizer, CharTokenizer, DataLoader, Dataset, TextDataset, Tokenizer};
-        pub use super::nn::{generate_constrained, QwenLikeGPT, TokenTrie, GPT};
+        pub use super::nn::{
+            generate_constrained, generate_qwen_like_with_config, generate_with_config, generate_with_sampling,
+            sampling_candidates, GenerationConfig, InferenceState, KvCache, QwenLikeGPT, TokenCandidate, TokenTrie,
+            GPT,
+        };
         pub use super::ops::{
             add, batch_matmul, broadcast_add, concat, cross_entropy_loss, cross_entropy_loss_ignore_index,
             embedding_lookup, exp, gelu, log, log_softmax, masked_fill, masked_softmax, matmul, mean, mean_dim, mul,

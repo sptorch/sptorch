@@ -1255,31 +1255,309 @@ impl QwenLikeGPT {
 }
 
 // ============ Text Generation ============
+
+/// 自回归生成的通用解码配置。
+///
+/// 这个结构体只描述“如何从最后一行 logits 选择下一个 token”，不绑定具体模型。
+/// 它覆盖 Text-to-SQL 在线推理最先需要稳定下来的几个控制旋钮：确定性生成、
+/// top-k/top-p 候选截断、temperature 和重复惩罚。后续真实 KV cache、批量调度
+/// 或硬件后端可以继续沿用这组语义，而不必改调用方配置。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GenerationConfig {
+    /// 最多生成多少个新 token，不包含 prompt 本身。
+    pub max_new_tokens: usize,
+    /// 模型输出头对应的词表大小。生成函数会用它截取最后一个位置的 logits。
+    pub vocab_size: usize,
+    /// logits 缩放温度。较低温度更确定，较高温度更发散；会被下限保护到 `1e-8`。
+    pub temperature: f32,
+    /// 只保留 logits 最高的前 k 个候选；为 0 时表示不启用 top-k 截断。
+    pub top_k: usize,
+    /// nucleus sampling 阈值；小于 1 时按概率从高到低保留累计概率达到该值的最小集合。
+    pub top_p: f32,
+    /// 重复惩罚系数。`1.0` 表示关闭；大于 1 时会压低历史 token 的再次出现概率。
+    pub repetition_penalty: f32,
+}
+
+impl GenerationConfig {
+    /// 创建一组偏确定性的默认配置。
+    ///
+    /// 默认不启用 top-k/top-p/repetition penalty，只设置生成长度和词表大小。
+    /// 调用方可以按业务需要再覆盖字段。
+    pub fn new(max_new_tokens: usize, vocab_size: usize) -> Self {
+        Self {
+            max_new_tokens,
+            vocab_size,
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+        }
+    }
+
+    /// 创建完全确定的贪心配置。
+    pub fn greedy(max_new_tokens: usize, vocab_size: usize) -> Self {
+        Self {
+            top_k: 1,
+            ..Self::new(max_new_tokens, vocab_size)
+        }
+    }
+}
+
+/// 解码阶段的轻量状态对象。
+///
+/// 这里故意只保存 token 级状态，而不假装已经有真实的 K/V 张量缓存。它的价值是
+/// 先把 prefill、decode、上下文裁剪和 prompt/generated 边界固定下来；等 HAL/CUDA
+/// 路径具备真实 KV cache 后，可以把每层 Key/Value buffer 挂在这个状态旁边。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InferenceState {
+    tokens: Vec<usize>,
+    prompt_len: usize,
+    max_context: usize,
+}
+
+/// `InferenceState` 的语义别名。
+///
+/// 当前它还不是高性能 K/V 张量缓存，而是 KV cache 接口演进前的状态壳。保留这个
+/// 名字是为了让在线推理代码从第一天就围绕“可缓存的增量解码状态”组织起来。
+pub type KvCache = InferenceState;
+
+impl InferenceState {
+    /// 用 prompt 初始化一次推理状态。
+    ///
+    /// `max_context` 必须大于 0；当累计 token 超过该长度时，[`InferenceState::context`]
+    /// 会返回最后一个窗口，模拟自回归模型的固定上下文限制。
+    pub fn new(prompt: &[usize], max_context: usize) -> Self {
+        assert!(max_context > 0, "max_context must be positive");
+        Self {
+            tokens: prompt.to_vec(),
+            prompt_len: prompt.len(),
+            max_context,
+        }
+    }
+
+    /// 重置为新的 prompt，复用同一个状态对象。
+    pub fn reset(&mut self, prompt: &[usize]) {
+        self.tokens.clear();
+        self.tokens.extend_from_slice(prompt);
+        self.prompt_len = prompt.len();
+    }
+
+    /// 追加一个新生成 token。
+    pub fn push_token(&mut self, token: usize) {
+        self.tokens.push(token);
+    }
+
+    /// 返回当前完整 token 序列，包含 prompt 和已生成部分。
+    pub fn tokens(&self) -> &[usize] {
+        &self.tokens
+    }
+
+    /// 返回 prompt 之后新增的 token。
+    pub fn generated_tokens(&self) -> &[usize] {
+        &self.tokens[self.prompt_len..]
+    }
+
+    /// 返回模型本次 forward 应该看到的上下文窗口。
+    pub fn context(&self) -> &[usize] {
+        if self.tokens.len() > self.max_context {
+            &self.tokens[self.tokens.len() - self.max_context..]
+        } else {
+            &self.tokens
+        }
+    }
+
+    /// prompt 的 token 数量。
+    pub fn prompt_len(&self) -> usize {
+        self.prompt_len
+    }
+
+    /// 已生成的新 token 数量。
+    pub fn generated_len(&self) -> usize {
+        self.tokens.len().saturating_sub(self.prompt_len)
+    }
+
+    /// 消费状态并返回完整 token 序列。
+    pub fn into_tokens(self) -> Vec<usize> {
+        self.tokens
+    }
+}
+
+/// 采样候选项。
+///
+/// `logit` 是经过 temperature、重复惩罚和候选过滤后的值；`probability` 是在最终
+/// 候选集合内重新归一化后的概率。把它暴露出来可以让测试、日志和未来 Studio
+/// 面板看到解码器真实做了哪些裁剪，而不是只看到最终 token。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TokenCandidate {
+    pub token_id: usize,
+    pub logit: f32,
+    pub probability: f32,
+}
+
+trait AutoregressiveForward {
+    fn max_context_len(&self) -> usize;
+    fn forward_token_ids(&self, token_ids: &[usize]) -> Tensor;
+}
+
+impl AutoregressiveForward for GPT {
+    fn max_context_len(&self) -> usize {
+        self.seq_len
+    }
+
+    fn forward_token_ids(&self, token_ids: &[usize]) -> Tensor {
+        self.forward_ids(token_ids)
+    }
+}
+
+impl AutoregressiveForward for QwenLikeGPT {
+    fn max_context_len(&self) -> usize {
+        self.seq_len
+    }
+
+    fn forward_token_ids(&self, token_ids: &[usize]) -> Tensor {
+        self.forward_ids(token_ids)
+    }
+}
+
+fn penalize_repeated_logit(logit: f32, token_id: usize, history: &[usize], repetition_penalty: f32) -> f32 {
+    let penalty = repetition_penalty.max(1.0);
+    if penalty == 1.0 || !history.contains(&token_id) {
+        logit
+    } else if logit.is_sign_negative() {
+        logit * penalty
+    } else {
+        logit / penalty
+    }
+}
+
+fn normalize_candidates(mut candidates: Vec<(usize, f32)>) -> Vec<TokenCandidate> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let max_val = candidates
+        .iter()
+        .map(|(_, logit)| *logit)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let exps: Vec<f32> = candidates.iter().map(|(_, logit)| (logit - max_val).exp()).collect();
+    let sum: f32 = exps.iter().sum();
+    candidates
+        .drain(..)
+        .zip(exps)
+        .map(|((token_id, logit), exp)| TokenCandidate {
+            token_id,
+            logit,
+            probability: exp / sum,
+        })
+        .collect()
+}
+
+/// 根据解码配置把原始 logits 变成最终采样候选。
+///
+/// 该函数不依赖模型，适合单独测试 top-k/top-p/repetition penalty 的边界语义。
+/// 过滤顺序为：重复惩罚与 temperature 缩放、按 logit 排序、top-k、softmax、
+/// top-p、再次归一化。top-p 始终至少保留一个候选，避免高置信场景下空集合。
+pub fn sampling_candidates(logits: &[f32], config: &GenerationConfig, history: &[usize]) -> Vec<TokenCandidate> {
+    assert!(
+        config.vocab_size <= logits.len(),
+        "vocab_size must not exceed logits length"
+    );
+
+    let temperature = config.temperature.max(1e-8);
+    let mut indexed: Vec<(usize, f32)> = logits
+        .iter()
+        .take(config.vocab_size)
+        .enumerate()
+        .map(|(token_id, &logit)| {
+            (
+                token_id,
+                penalize_repeated_logit(logit, token_id, history, config.repetition_penalty) / temperature,
+            )
+        })
+        .filter(|(_, logit)| logit.is_finite())
+        .collect();
+
+    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+    if config.top_k > 0 && indexed.len() > config.top_k {
+        indexed.truncate(config.top_k);
+    }
+
+    let candidates = normalize_candidates(indexed);
+    let top_p = config.top_p.clamp(0.0, 1.0);
+    if top_p >= 1.0 || candidates.len() <= 1 {
+        return candidates;
+    }
+
+    let mut cumulative = 0.0;
+    let mut kept = Vec::new();
+    for candidate in candidates {
+        cumulative += candidate.probability;
+        kept.push((candidate.token_id, candidate.logit));
+        if cumulative >= top_p {
+            break;
+        }
+    }
+    normalize_candidates(kept)
+}
+
+fn sample_from_candidates(candidates: &[TokenCandidate], rng: &mut impl Rng) -> Option<usize> {
+    let mut threshold: f32 = rng.gen();
+    for candidate in candidates {
+        threshold -= candidate.probability;
+        if threshold <= 0.0 {
+            return Some(candidate.token_id);
+        }
+    }
+    candidates.last().map(|candidate| candidate.token_id)
+}
+
+fn generate_with_config_inner<M: AutoregressiveForward>(
+    model: &M,
+    prompt: &[usize],
+    config: GenerationConfig,
+    constraint: Option<&dyn TokenConstraint>,
+) -> Vec<usize> {
+    assert!(config.vocab_size > 0, "vocab_size must be positive");
+
+    let mut rng = rand::thread_rng();
+    let mut state = InferenceState::new(prompt, model.max_context_len());
+    let prompt_len = state.prompt_len();
+
+    for _ in 0..config.max_new_tokens {
+        let logits = model.forward_token_ids(state.context());
+        let logits_data = logits.contiguous_data();
+        let last = &logits_data[logits_data.len() - config.vocab_size..];
+        let mut step_logits = last.to_vec();
+
+        if let Some(constraint) = constraint {
+            if let Some(allowed) = constraint.allowed_next(&state.tokens()[prompt_len..]) {
+                for (token_id, logit) in step_logits.iter_mut().enumerate() {
+                    if !allowed.contains(&token_id) {
+                        *logit = f32::NEG_INFINITY;
+                    }
+                }
+            }
+        }
+
+        let candidates = sampling_candidates(&step_logits, &config, state.tokens());
+        let Some(next) = sample_from_candidates(&candidates, &mut rng) else {
+            break;
+        };
+        state.push_token(next);
+    }
+
+    state.into_tokens()
+}
+
 /// 贪心解码生成 token 序列。
 ///
 /// 每一步选择最后一个位置上 logits 最大的 token。该方法确定性强、便于测试，
 /// 但缺乏采样多样性。
 pub fn generate_greedy(model: &GPT, prompt: &[usize], max_new_tokens: usize, vocab_size: usize) -> Vec<usize> {
-    let mut ids = prompt.to_vec();
-    for _ in 0..max_new_tokens {
-        let ctx = if ids.len() > model.seq_len {
-            &ids[ids.len() - model.seq_len..]
-        } else {
-            &ids
-        };
-        let logits = model.forward_ids(ctx);
-        let logits_data = logits.contiguous_data();
-        let last = &logits_data[logits_data.len() - vocab_size..];
-        let next = last
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-            .map(|(i, _)| i)
-            .unwrap();
-        ids.push(next);
-    }
-    ids
+    generate_with_config(model, prompt, GenerationConfig::greedy(max_new_tokens, vocab_size))
 }
+
 /// 按 temperature 与 top-k 采样生成序列。
 ///
 /// `temperature` 越低越接近贪心，越高越随机；`top_k` 限制候选 token 数量。
@@ -1292,49 +1570,27 @@ pub fn generate_with_sampling(
     temperature: f32,
     top_k: usize,
 ) -> Vec<usize> {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    let mut ids = prompt.to_vec();
+    generate_with_config(
+        model,
+        prompt,
+        GenerationConfig {
+            temperature,
+            top_k,
+            ..GenerationConfig::new(max_new_tokens, vocab_size)
+        },
+    )
+}
 
-    for _ in 0..max_new_tokens {
-        let ctx = if ids.len() > model.seq_len {
-            &ids[ids.len() - model.seq_len..]
-        } else {
-            &ids
-        };
-        let logits = model.forward_ids(ctx);
-        let logits_data = logits.contiguous_data();
-        let last = &logits_data[logits_data.len() - vocab_size..];
+/// 使用完整解码配置生成 GPT 序列。
+pub fn generate_with_config(model: &GPT, prompt: &[usize], config: GenerationConfig) -> Vec<usize> {
+    generate_with_config_inner(model, prompt, config, None)
+}
 
-        // Apply temperature
-        let scaled: Vec<f32> = last.iter().map(|x| x / temperature.max(1e-8)).collect();
-
-        // Top-k filtering
-        let mut indexed: Vec<(usize, f32)> = scaled.iter().enumerate().map(|(i, &v)| (i, v)).collect();
-        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        let k = top_k.min(vocab_size);
-        let top = &indexed[..k];
-
-        // Softmax over top-k
-        let max_val = top[0].1;
-        let exps: Vec<f32> = top.iter().map(|(_, v)| (v - max_val).exp()).collect();
-        let sum: f32 = exps.iter().sum();
-        let probs: Vec<f32> = exps.iter().map(|e| e / sum).collect();
-
-        // Sample
-        let r: f32 = rng.gen();
-        let mut cumsum = 0.0;
-        let mut next = top[0].0;
-        for (i, &p) in probs.iter().enumerate() {
-            cumsum += p;
-            if r < cumsum {
-                next = top[i].0;
-                break;
-            }
-        }
-        ids.push(next);
-    }
-    ids
+/// 使用完整解码配置生成 Qwen/Llama 风格模型序列。
+///
+/// 这条入口让 SFT 训练出来的小型 Qwen-like 模型也能复用同一套在线解码语义。
+pub fn generate_qwen_like_with_config(model: &QwenLikeGPT, prompt: &[usize], config: GenerationConfig) -> Vec<usize> {
+    generate_with_config_inner(model, prompt, config, None)
 }
 
 // ============ Constrained Decoding ============
@@ -1422,71 +1678,16 @@ pub fn generate_constrained(
     top_k: usize,
     constraint: &dyn TokenConstraint,
 ) -> Vec<usize> {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    let mut ids = prompt.to_vec();
-    let prompt_len = prompt.len();
-
-    for _ in 0..max_new_tokens {
-        let ctx = if ids.len() > model.seq_len {
-            &ids[ids.len() - model.seq_len..]
-        } else {
-            &ids
-        };
-        let logits = model.forward_ids(ctx);
-        let logits_data = logits.contiguous_data();
-        let last = &logits_data[logits_data.len() - vocab_size..];
-
-        // Apply constraint mask
-        let generated_so_far = &ids[prompt_len..];
-        let allowed = constraint.allowed_next(generated_so_far);
-
-        let mut masked: Vec<f32> = last.to_vec();
-        if let Some(ref allowed_set) = allowed {
-            for (i, m) in masked.iter_mut().enumerate() {
-                if !allowed_set.contains(&i) {
-                    *m = f32::NEG_INFINITY;
-                }
-            }
-        }
-
-        // Apply temperature
-        let scaled: Vec<f32> = masked.iter().map(|x| x / temperature.max(1e-8)).collect();
-
-        // Top-k filtering
-        let mut indexed: Vec<(usize, f32)> = scaled
-            .iter()
-            .enumerate()
-            .filter(|(_, &v)| v.is_finite())
-            .map(|(i, &v)| (i, v))
-            .collect();
-        if indexed.is_empty() {
-            break; // no valid tokens
-        }
-        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        let k = top_k.min(indexed.len());
-        let top = &indexed[..k];
-
-        // Softmax over top-k
-        let max_val = top[0].1;
-        let exps: Vec<f32> = top.iter().map(|(_, v)| (v - max_val).exp()).collect();
-        let sum: f32 = exps.iter().sum();
-        let probs: Vec<f32> = exps.iter().map(|e| e / sum).collect();
-
-        // Sample
-        let r: f32 = rng.gen();
-        let mut cumsum = 0.0;
-        let mut next = top[0].0;
-        for (i, &p) in probs.iter().enumerate() {
-            cumsum += p;
-            if r < cumsum {
-                next = top[i].0;
-                break;
-            }
-        }
-        ids.push(next);
-    }
-    ids
+    generate_with_config_inner(
+        model,
+        prompt,
+        GenerationConfig {
+            temperature,
+            top_k,
+            ..GenerationConfig::new(max_new_tokens, vocab_size)
+        },
+        Some(constraint),
+    )
 }
 
 #[cfg(test)]
@@ -1882,6 +2083,59 @@ mod tests {
         assert_eq!(result[2], 1, "second generated token should be 1 per trie constraint");
         // Third must be 2
         assert_eq!(result[3], 2, "third generated token should be 2 per trie constraint");
+    }
+
+    #[test]
+    fn test_inference_state_tracks_prompt_generated_and_context_window() {
+        let mut state = InferenceState::new(&[10, 11, 12], 4);
+        state.push_token(13);
+        state.push_token(14);
+
+        assert_eq!(state.prompt_len(), 3);
+        assert_eq!(state.generated_len(), 2);
+        assert_eq!(state.tokens(), &[10, 11, 12, 13, 14]);
+        assert_eq!(state.generated_tokens(), &[13, 14]);
+        assert_eq!(state.context(), &[11, 12, 13, 14]);
+
+        state.reset(&[7, 8]);
+        assert_eq!(state.tokens(), &[7, 8]);
+        assert_eq!(state.generated_tokens(), &[]);
+        assert_eq!(state.context(), &[7, 8]);
+    }
+
+    #[test]
+    fn test_sampling_candidates_apply_top_p_after_probability_sort() {
+        let config = GenerationConfig {
+            top_p: 0.75,
+            ..GenerationConfig::new(1, 4)
+        };
+        let candidates = sampling_candidates(&[3.0, 2.0, 1.0, 0.0], &config, &[]);
+        let ids: Vec<usize> = candidates.iter().map(|candidate| candidate.token_id).collect();
+        let prob_sum: f32 = candidates.iter().map(|candidate| candidate.probability).sum();
+
+        assert_eq!(ids, vec![0, 1]);
+        assert!((prob_sum - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_sampling_candidates_repetition_penalty_can_suppress_seen_token() {
+        let config = GenerationConfig {
+            repetition_penalty: 3.0,
+            top_k: 1,
+            ..GenerationConfig::new(1, 3)
+        };
+        let candidates = sampling_candidates(&[3.0, 2.5, 1.0], &config, &[0]);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].token_id, 1);
+    }
+
+    #[test]
+    fn test_qwen_like_generation_uses_shared_config() {
+        let model = QwenLikeGPT::new(6, 4, 2, 1, 8, 5);
+        let output = generate_qwen_like_with_config(&model, &[0, 1], GenerationConfig::greedy(2, 6));
+
+        assert_eq!(output.len(), 4);
     }
 
     // --- Dropout tests ---
