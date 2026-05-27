@@ -1191,6 +1191,19 @@ impl GPT {
             block.set_training(training);
         }
     }
+
+    /// 返回该模型推理时需要的 KV cache 规格。
+    ///
+    /// GPT 的每个 Transformer block 都有一组自注意力 K/V；这里从第一层读取
+    /// head 结构，避免调用方重复传入容易写错的模型元数据。空 block 模型仍
+    /// 可以作为极简测试模型运行，此时 cache 层数为 0。
+    pub fn kv_cache_spec(&self) -> KvCacheSpec {
+        if let Some(block) = self.blocks.first() {
+            KvCacheSpec::new(self.blocks.len(), self.seq_len, block.attn.n_head, block.attn.head_dim)
+        } else {
+            KvCacheSpec::token_only(self.seq_len)
+        }
+    }
 }
 
 impl QwenLikeGPT {
@@ -1251,6 +1264,15 @@ impl QwenLikeGPT {
     pub fn set_training(&mut self, training: bool) {
         for block in &mut self.blocks {
             block.set_training(training);
+        }
+    }
+
+    /// 返回该 Qwen/Llama 风格模型推理时需要的 KV cache 规格。
+    pub fn kv_cache_spec(&self) -> KvCacheSpec {
+        if let Some(block) = self.blocks.first() {
+            KvCacheSpec::new(self.blocks.len(), self.seq_len, block.attn.n_head, block.attn.head_dim)
+        } else {
+            KvCacheSpec::token_only(self.seq_len)
         }
     }
 }
@@ -1319,11 +1341,283 @@ pub struct InferenceState {
     max_context: usize,
 }
 
-/// `InferenceState` 的语义别名。
+/// KV cache 的结构规格。
 ///
-/// 当前它还不是高性能 K/V 张量缓存，而是 KV cache 接口演进前的状态壳。保留这个
-/// 名字是为了让在线推理代码从第一天就围绕“可缓存的增量解码状态”组织起来。
-pub type KvCache = InferenceState;
+/// 真实在线推理里，K/V cache 的内存布局必须和模型结构绑定：层数决定需要
+/// 多少组缓存，`n_head * head_dim` 决定每个 token 在每层需要保存多少元素，
+/// `max_context` 则决定滑动窗口最多保留多少历史。把这些信息显式建模出来，
+/// 可以先在 CPU 语义层验证 cache 生命周期，后续再替换成 CUDA/HAL 设备缓冲。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvCacheSpec {
+    /// Transformer block 数量；每层各有一份 K/V。
+    pub n_layer: usize,
+    /// cache 滑动窗口长度，超过后丢弃最旧 token。
+    pub max_context: usize,
+    /// 注意力头数。
+    pub n_head: usize,
+    /// 每个注意力头的维度。
+    pub head_dim: usize,
+}
+
+impl KvCacheSpec {
+    /// 创建一份真实模型 cache 规格。
+    pub fn new(n_layer: usize, max_context: usize, n_head: usize, head_dim: usize) -> Self {
+        assert!(max_context > 0, "max_context must be positive");
+        assert!(n_head > 0, "n_head must be positive");
+        assert!(head_dim > 0, "head_dim must be positive");
+        Self {
+            n_layer,
+            max_context,
+            n_head,
+            head_dim,
+        }
+    }
+
+    /// 创建只跟踪 token 状态、不持有任何层缓存的规格。
+    ///
+    /// 这个入口用于兼容旧的 `InferenceSession::new(request, max_context)`，
+    /// 也适合还没有模型结构信息的调度测试。它不是高性能推理形态，只是一个
+    /// 明确的“无层缓存”语义，而不是再把 KV cache 混同成 token 状态。
+    pub fn token_only(max_context: usize) -> Self {
+        Self::new(0, max_context, 1, 1)
+    }
+}
+
+/// 单层 Key/Value 缓存。
+///
+/// `key` 和 `value` 的 shape 统一为 `[n_head, cached_len, head_dim]`。当前实现
+/// 用普通 [`Tensor`] 保存语义数据，重点验证 append、reset 和窗口裁剪是否正确；
+/// 后续 CUDA/HAL 路径可以在保持这个外层契约的前提下把 Tensor 换成设备缓冲。
+#[derive(Debug, Clone)]
+pub struct KvCacheLayer {
+    key: Option<Tensor>,
+    value: Option<Tensor>,
+    cached_len: usize,
+}
+
+impl KvCacheLayer {
+    fn empty() -> Self {
+        Self {
+            key: None,
+            value: None,
+            cached_len: 0,
+        }
+    }
+
+    /// 当前层已经缓存的 token 数。
+    pub fn cached_len(&self) -> usize {
+        self.cached_len
+    }
+
+    /// 判断当前层是否还没有任何 K/V。
+    pub fn is_empty(&self) -> bool {
+        self.cached_len == 0
+    }
+
+    /// 返回当前层缓存的 Key 张量。
+    pub fn key(&self) -> Option<&Tensor> {
+        self.key.as_ref()
+    }
+
+    /// 返回当前层缓存的 Value 张量。
+    pub fn value(&self) -> Option<&Tensor> {
+        self.value.as_ref()
+    }
+}
+
+impl PartialEq for KvCacheLayer {
+    fn eq(&self, other: &Self) -> bool {
+        self.cached_len == other.cached_len
+            && tensor_option_eq(&self.key, &other.key)
+            && tensor_option_eq(&self.value, &other.value)
+    }
+}
+
+fn tensor_option_eq(a: &Option<Tensor>, b: &Option<Tensor>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.shape() == b.shape() && a.contiguous_data() == b.contiguous_data(),
+        _ => false,
+    }
+}
+
+/// 自回归推理的 per-layer K/V cache。
+///
+/// 这个结构只处理 cache 的生命周期和形状不变量：prefill 时写入一段历史，
+/// decode 时追加一个或多个新 token，超过窗口后裁掉最旧 token。它暂时不参与
+/// `forward_ids` 的数学加速，但已经把上层服务和 batch runtime 需要依赖的
+/// cache 语义固定下来。
+#[derive(Debug, Clone, PartialEq)]
+pub struct KvCache {
+    spec: KvCacheSpec,
+    layers: Vec<KvCacheLayer>,
+}
+
+impl KvCache {
+    /// 创建空 KV cache。
+    pub fn new(spec: KvCacheSpec) -> Self {
+        Self {
+            spec,
+            layers: (0..spec.n_layer).map(|_| KvCacheLayer::empty()).collect(),
+        }
+    }
+
+    /// 返回 cache 结构规格。
+    pub fn spec(&self) -> KvCacheSpec {
+        self.spec
+    }
+
+    /// 返回层数。
+    pub fn layer_count(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// 返回最大上下文窗口。
+    pub fn max_context(&self) -> usize {
+        self.spec.max_context
+    }
+
+    /// 返回注意力头数。
+    pub fn n_head(&self) -> usize {
+        self.spec.n_head
+    }
+
+    /// 返回单头维度。
+    pub fn head_dim(&self) -> usize {
+        self.spec.head_dim
+    }
+
+    /// 返回所有层。
+    pub fn layers(&self) -> &[KvCacheLayer] {
+        &self.layers
+    }
+
+    /// 返回指定层。
+    pub fn layer(&self, layer_idx: usize) -> Option<&KvCacheLayer> {
+        self.layers.get(layer_idx)
+    }
+
+    /// 当前 cache 是否完全为空。
+    pub fn is_empty(&self) -> bool {
+        self.layers.iter().all(KvCacheLayer::is_empty)
+    }
+
+    /// 所有层中最长的缓存长度。
+    ///
+    /// 正常推理里每层长度应一致；这里取最大值可以让诊断代码在半更新状态下
+    /// 仍然看到“最坏占用”。测试会覆盖常规同步更新路径。
+    pub fn cached_len(&self) -> usize {
+        self.layers.iter().map(KvCacheLayer::cached_len).max().unwrap_or(0)
+    }
+
+    /// 清空全部层缓存。
+    pub fn reset(&mut self) {
+        for layer in &mut self.layers {
+            *layer = KvCacheLayer::empty();
+        }
+    }
+
+    /// 清空指定层缓存。
+    pub fn reset_layer(&mut self, layer_idx: usize) {
+        let layer = self
+            .layers
+            .get_mut(layer_idx)
+            .unwrap_or_else(|| panic!("kv cache layer {layer_idx} out of range"));
+        *layer = KvCacheLayer::empty();
+    }
+
+    /// 用一段完整 K/V 覆盖指定层，通常对应 prefill。
+    pub fn prefill_layer(&mut self, layer_idx: usize, key: Tensor, value: Tensor) {
+        self.reset_layer(layer_idx);
+        self.append_layer(layer_idx, key, value);
+    }
+
+    /// 向指定层追加新的 K/V。
+    ///
+    /// `key` 和 `value` 必须都是 `[n_head, seq_len, head_dim]`。`seq_len` 可以是
+    /// prompt prefill 的多 token，也可以是 decode 阶段的单 token。追加后如果
+    /// 超过 `max_context`，会保留最新窗口，丢弃最旧 token。
+    pub fn append_layer(&mut self, layer_idx: usize, key: Tensor, value: Tensor) {
+        self.validate_kv_shape(&key, "key");
+        self.validate_kv_shape(&value, "value");
+        assert_eq!(key.shape()[1], value.shape()[1], "key/value seq_len mismatch");
+
+        let layer = self
+            .layers
+            .get_mut(layer_idx)
+            .unwrap_or_else(|| panic!("kv cache layer {layer_idx} out of range"));
+
+        let next_key = append_kv_tensor(
+            layer.key.as_ref(),
+            &key,
+            self.spec.max_context,
+            self.spec.n_head,
+            self.spec.head_dim,
+        );
+        let next_value = append_kv_tensor(
+            layer.value.as_ref(),
+            &value,
+            self.spec.max_context,
+            self.spec.n_head,
+            self.spec.head_dim,
+        );
+        let cached_len = next_key.shape()[1];
+        layer.key = Some(next_key);
+        layer.value = Some(next_value);
+        layer.cached_len = cached_len;
+    }
+
+    fn validate_kv_shape(&self, tensor: &Tensor, name: &str) {
+        let shape = tensor.shape();
+        assert_eq!(
+            shape.len(),
+            3,
+            "{name} cache tensor must have shape [n_head, seq_len, head_dim]"
+        );
+        assert_eq!(shape[0], self.spec.n_head, "{name} n_head mismatch");
+        assert_eq!(shape[2], self.spec.head_dim, "{name} head_dim mismatch");
+    }
+}
+
+fn append_kv_tensor(
+    existing: Option<&Tensor>,
+    incoming: &Tensor,
+    max_context: usize,
+    n_head: usize,
+    head_dim: usize,
+) -> Tensor {
+    let incoming_shape = incoming.shape();
+    let incoming_len = incoming_shape[1];
+    let incoming_data = incoming.contiguous_data();
+
+    let (old_len, old_data) = if let Some(existing) = existing {
+        let shape = existing.shape();
+        assert_eq!(shape, vec![n_head, shape[1], head_dim], "existing cache shape mismatch");
+        (shape[1], existing.contiguous_data())
+    } else {
+        (0, Vec::new())
+    };
+
+    let total_len = old_len + incoming_len;
+    let keep_len = total_len.min(max_context);
+    let skip_len = total_len - keep_len;
+    let mut out = Vec::with_capacity(n_head * keep_len * head_dim);
+
+    for h in 0..n_head {
+        for logical_pos in skip_len..total_len {
+            if logical_pos < old_len {
+                let start = h * old_len * head_dim + logical_pos * head_dim;
+                out.extend_from_slice(&old_data[start..start + head_dim]);
+            } else {
+                let incoming_pos = logical_pos - old_len;
+                let start = h * incoming_len * head_dim + incoming_pos * head_dim;
+                out.extend_from_slice(&incoming_data[start..start + head_dim]);
+            }
+        }
+    }
+
+    Tensor::new(out, vec![n_head, keep_len, head_dim])
+}
 
 impl InferenceState {
     /// 用 prompt 初始化一次推理状态。
@@ -1893,6 +2187,7 @@ impl InferenceScheduler {
 pub struct InferenceSession {
     pub request: InferenceRequest,
     pub state: InferenceState,
+    pub kv_cache: KvCache,
     pub generated_steps: usize,
     pub finished: bool,
     pub stop_reason: DecodeStopReason,
@@ -1901,10 +2196,20 @@ pub struct InferenceSession {
 impl InferenceSession {
     /// 从请求创建运行态。
     pub fn new(request: InferenceRequest, max_context: usize) -> Self {
+        Self::with_kv_cache_spec(request, KvCacheSpec::token_only(max_context))
+    }
+
+    /// 从请求和模型 KV cache 规格创建运行态。
+    ///
+    /// `InferenceState` 负责 token 序列，`KvCache` 负责每层 K/V 的窗口和生命周期。
+    /// 把两者并列放在 session 中，是为了避免后续真实增量推理接入时继续把
+    /// “已经生成了哪些 token”和“硬件侧缓存了哪些 K/V”混在一个对象里。
+    pub fn with_kv_cache_spec(request: InferenceRequest, cache_spec: KvCacheSpec) -> Self {
         let prompt_ended =
             request.config.eos_token_id.is_some() && request.prompt.last().copied() == request.config.eos_token_id;
         Self {
-            state: InferenceState::new(&request.prompt, max_context),
+            state: InferenceState::new(&request.prompt, cache_spec.max_context),
+            kv_cache: KvCache::new(cache_spec),
             request,
             generated_steps: 0,
             finished: prompt_ended,
@@ -1946,11 +2251,16 @@ pub struct InferenceBatchState {
 impl InferenceBatchState {
     /// 把调度计划转成运行态。
     pub fn from_batch(batch: InferenceBatch, max_context: usize) -> Self {
+        Self::from_batch_with_kv_cache_spec(batch, KvCacheSpec::token_only(max_context))
+    }
+
+    /// 用模型 cache 规格把调度计划转成运行态。
+    pub fn from_batch_with_kv_cache_spec(batch: InferenceBatch, cache_spec: KvCacheSpec) -> Self {
         Self {
             sessions: batch
                 .requests
                 .into_iter()
-                .map(|request| InferenceSession::new(request, max_context))
+                .map(|request| InferenceSession::with_kv_cache_spec(request, cache_spec))
                 .collect(),
         }
     }
@@ -1981,12 +2291,12 @@ pub struct InferenceBatchStep {
 
 /// 将一个调度批次激活为 GPT 运行态。
 pub fn activate_inference_batch(model: &GPT, batch: InferenceBatch) -> InferenceBatchState {
-    InferenceBatchState::from_batch(batch, model.seq_len)
+    InferenceBatchState::from_batch_with_kv_cache_spec(batch, model.kv_cache_spec())
 }
 
 /// 将一个调度批次激活为 Qwen/Llama 风格模型运行态。
 pub fn activate_qwen_like_inference_batch(model: &QwenLikeGPT, batch: InferenceBatch) -> InferenceBatchState {
-    InferenceBatchState::from_batch(batch, model.seq_len)
+    InferenceBatchState::from_batch_with_kv_cache_spec(batch, model.kv_cache_spec())
 }
 
 fn decode_session_with<M: AutoregressiveForward>(model: &M, session: &mut InferenceSession) -> DecodeStep {
@@ -2563,6 +2873,85 @@ mod tests {
         assert_eq!(state.tokens(), &[7, 8]);
         assert_eq!(state.generated_tokens(), &[]);
         assert_eq!(state.context(), &[7, 8]);
+    }
+
+    #[test]
+    fn test_kv_cache_appends_and_clips_sliding_window() {
+        let mut cache = KvCache::new(KvCacheSpec::new(2, 3, 2, 2));
+        assert_eq!(cache.layer_count(), 2);
+        assert!(cache.is_empty());
+
+        let key_prefill = Tensor::new(
+            vec![
+                1.0, 1.1, 2.0, 2.1, //
+                3.0, 3.1, 4.0, 4.1,
+            ],
+            vec![2, 2, 2],
+        );
+        let value_prefill = Tensor::new(
+            vec![
+                10.0, 10.1, 20.0, 20.1, //
+                30.0, 30.1, 40.0, 40.1,
+            ],
+            vec![2, 2, 2],
+        );
+        cache.prefill_layer(0, key_prefill, value_prefill);
+        assert_eq!(cache.layer(0).unwrap().cached_len(), 2);
+
+        let key_decode = Tensor::new(
+            vec![
+                5.0, 5.1, 6.0, 6.1, //
+                7.0, 7.1, 8.0, 8.1,
+            ],
+            vec![2, 2, 2],
+        );
+        let value_decode = Tensor::new(
+            vec![
+                50.0, 50.1, 60.0, 60.1, //
+                70.0, 70.1, 80.0, 80.1,
+            ],
+            vec![2, 2, 2],
+        );
+        cache.append_layer(0, key_decode, value_decode);
+
+        let layer = cache.layer(0).unwrap();
+        assert_eq!(layer.cached_len(), 3);
+        assert_eq!(layer.key().unwrap().shape(), vec![2, 3, 2]);
+        assert_eq!(
+            layer.key().unwrap().contiguous_data(),
+            vec![
+                2.0, 2.1, 5.0, 5.1, 6.0, 6.1, //
+                4.0, 4.1, 7.0, 7.1, 8.0, 8.1,
+            ]
+        );
+        assert_eq!(
+            layer.value().unwrap().contiguous_data(),
+            vec![
+                20.0, 20.1, 50.0, 50.1, 60.0, 60.1, //
+                40.0, 40.1, 70.0, 70.1, 80.0, 80.1,
+            ]
+        );
+
+        cache.reset_layer(0);
+        assert!(cache.layer(0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_inference_batch_sessions_keep_model_kv_cache_spec() {
+        let model = QwenLikeGPT::new(8, 6, 3, 2, 12, 5);
+        let config = GenerationConfig::greedy(2, 8);
+        let batch = InferenceBatch {
+            requests: vec![InferenceRequest::new(7, vec![1, 2], config, 0)],
+            total_token_budget: 4,
+        };
+
+        let state = activate_qwen_like_inference_batch(&model, batch);
+        let session = &state.sessions[0];
+
+        assert_eq!(session.kv_cache.spec(), KvCacheSpec::new(2, 5, 3, 2));
+        assert_eq!(session.kv_cache.layer_count(), 2);
+        assert_eq!(session.state.context(), &[1, 2]);
+        assert!(session.kv_cache.is_empty());
     }
 
     #[test]

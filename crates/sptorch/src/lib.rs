@@ -33,8 +33,8 @@ pub mod v1 {
             decode_qwen_like_next_token, generate_constrained, generate_qwen_like_with_config, generate_with_config,
             generate_with_sampling, sampling_candidates, DecodeStep, DecodeStopReason, GenerationConfig,
             InferenceAdmissionError, InferenceBatch, InferenceBatchState, InferenceBatchStep, InferenceRequest,
-            InferenceScheduler, InferenceSchedulerConfig, InferenceSession, InferenceState, KvCache, QwenLikeGPT,
-            TokenCandidate, TokenTrie, GPT,
+            InferenceScheduler, InferenceSchedulerConfig, InferenceSession, InferenceState, KvCache, KvCacheLayer,
+            KvCacheSpec, QwenLikeGPT, TokenCandidate, TokenTrie, GPT,
         };
     }
 
@@ -121,8 +121,8 @@ pub mod v1 {
             decode_qwen_like_next_token, generate_constrained, generate_qwen_like_with_config, generate_with_config,
             generate_with_sampling, sampling_candidates, DecodeStep, DecodeStopReason, GenerationConfig,
             InferenceAdmissionError, InferenceBatch, InferenceBatchState, InferenceBatchStep, InferenceRequest,
-            InferenceScheduler, InferenceSchedulerConfig, InferenceSession, InferenceState, KvCache, QwenLikeGPT,
-            TokenCandidate, TokenTrie, GPT,
+            InferenceScheduler, InferenceSchedulerConfig, InferenceSession, InferenceState, KvCache, KvCacheLayer,
+            KvCacheSpec, QwenLikeGPT, TokenCandidate, TokenTrie, GPT,
         };
         pub use super::ops::{
             add, batch_matmul, broadcast_add, concat, cross_entropy_loss, cross_entropy_loss_ignore_index,
