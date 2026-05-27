@@ -28,11 +28,13 @@ pub mod v1 {
     /// 内部构件。
     pub mod nn {
         pub use sptorch_nn::{
-            decode_constrained_next_token, decode_next_token, decode_qwen_like_next_token, generate_constrained,
-            generate_qwen_like_with_config, generate_with_config, generate_with_sampling, sampling_candidates,
-            DecodeStep, DecodeStopReason, GenerationConfig, InferenceAdmissionError, InferenceBatch, InferenceRequest,
-            InferenceScheduler, InferenceSchedulerConfig, InferenceState, KvCache, QwenLikeGPT, TokenCandidate,
-            TokenTrie, GPT,
+            activate_inference_batch, activate_qwen_like_inference_batch, decode_constrained_next_token,
+            decode_inference_batch_round, decode_next_token, decode_qwen_like_inference_batch_round,
+            decode_qwen_like_next_token, generate_constrained, generate_qwen_like_with_config, generate_with_config,
+            generate_with_sampling, sampling_candidates, DecodeStep, DecodeStopReason, GenerationConfig,
+            InferenceAdmissionError, InferenceBatch, InferenceBatchState, InferenceBatchStep, InferenceRequest,
+            InferenceScheduler, InferenceSchedulerConfig, InferenceSession, InferenceState, KvCache, QwenLikeGPT,
+            TokenCandidate, TokenTrie, GPT,
         };
     }
 
@@ -114,11 +116,13 @@ pub mod v1 {
         };
         pub use super::data::{BpeTokenizer, CharTokenizer, DataLoader, Dataset, TextDataset, Tokenizer};
         pub use super::nn::{
-            decode_constrained_next_token, decode_next_token, decode_qwen_like_next_token, generate_constrained,
-            generate_qwen_like_with_config, generate_with_config, generate_with_sampling, sampling_candidates,
-            DecodeStep, DecodeStopReason, GenerationConfig, InferenceAdmissionError, InferenceBatch, InferenceRequest,
-            InferenceScheduler, InferenceSchedulerConfig, InferenceState, KvCache, QwenLikeGPT, TokenCandidate,
-            TokenTrie, GPT,
+            activate_inference_batch, activate_qwen_like_inference_batch, decode_constrained_next_token,
+            decode_inference_batch_round, decode_next_token, decode_qwen_like_inference_batch_round,
+            decode_qwen_like_next_token, generate_constrained, generate_qwen_like_with_config, generate_with_config,
+            generate_with_sampling, sampling_candidates, DecodeStep, DecodeStopReason, GenerationConfig,
+            InferenceAdmissionError, InferenceBatch, InferenceBatchState, InferenceBatchStep, InferenceRequest,
+            InferenceScheduler, InferenceSchedulerConfig, InferenceSession, InferenceState, KvCache, QwenLikeGPT,
+            TokenCandidate, TokenTrie, GPT,
         };
         pub use super::ops::{
             add, batch_matmul, broadcast_add, concat, cross_entropy_loss, cross_entropy_loss_ignore_index,

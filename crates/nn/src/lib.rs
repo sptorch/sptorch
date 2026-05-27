@@ -1412,6 +1412,8 @@ pub enum DecodeStopReason {
     NoCandidates,
     /// 本步生成了 EOS token。
     EosToken,
+    /// 达到配置允许的最大新 token 数量。
+    MaxNewTokens,
 }
 
 /// 单步解码的返回值。
@@ -1881,6 +1883,176 @@ impl InferenceScheduler {
     pub fn config(&self) -> InferenceSchedulerConfig {
         self.config
     }
+}
+
+/// 单个已激活推理请求的运行态。
+///
+/// 调度器只负责把请求编成批；真正开始生成时，需要把 prompt 转成
+/// [`InferenceState`]，并记录已生成步数、是否结束和最终停止原因。
+#[derive(Debug, Clone, PartialEq)]
+pub struct InferenceSession {
+    pub request: InferenceRequest,
+    pub state: InferenceState,
+    pub generated_steps: usize,
+    pub finished: bool,
+    pub stop_reason: DecodeStopReason,
+}
+
+impl InferenceSession {
+    /// 从请求创建运行态。
+    pub fn new(request: InferenceRequest, max_context: usize) -> Self {
+        let prompt_ended =
+            request.config.eos_token_id.is_some() && request.prompt.last().copied() == request.config.eos_token_id;
+        Self {
+            state: InferenceState::new(&request.prompt, max_context),
+            request,
+            generated_steps: 0,
+            finished: prompt_ended,
+            stop_reason: if prompt_ended {
+                DecodeStopReason::AlreadyEnded
+            } else {
+                DecodeStopReason::NotStopped
+            },
+        }
+    }
+
+    /// 请求 ID。
+    pub fn request_id(&self) -> u64 {
+        self.request.request_id
+    }
+
+    /// 完整 token 序列，包含 prompt 和已生成内容。
+    pub fn tokens(&self) -> &[usize] {
+        self.state.tokens()
+    }
+
+    /// 已生成的新 token。
+    pub fn generated_tokens(&self) -> &[usize] {
+        self.state.generated_tokens()
+    }
+
+    fn mark_finished(&mut self, reason: DecodeStopReason) {
+        self.finished = true;
+        self.stop_reason = reason;
+    }
+}
+
+/// 一个已激活微批的运行态。
+#[derive(Debug, Clone, PartialEq)]
+pub struct InferenceBatchState {
+    pub sessions: Vec<InferenceSession>,
+}
+
+impl InferenceBatchState {
+    /// 把调度计划转成运行态。
+    pub fn from_batch(batch: InferenceBatch, max_context: usize) -> Self {
+        Self {
+            sessions: batch
+                .requests
+                .into_iter()
+                .map(|request| InferenceSession::new(request, max_context))
+                .collect(),
+        }
+    }
+
+    /// 是否所有请求都已经结束。
+    pub fn is_finished(&self) -> bool {
+        self.sessions.iter().all(|session| session.finished)
+    }
+
+    /// 尚未结束的请求数量。
+    pub fn active_len(&self) -> usize {
+        self.sessions.iter().filter(|session| !session.finished).count()
+    }
+
+    /// 批次中的请求 ID。
+    pub fn request_ids(&self) -> Vec<u64> {
+        self.sessions.iter().map(|session| session.request_id()).collect()
+    }
+}
+
+/// 批次单轮推进结果。
+#[derive(Debug, Clone, PartialEq)]
+pub struct InferenceBatchStep {
+    pub request_id: u64,
+    pub step: DecodeStep,
+    pub generated_steps: usize,
+}
+
+/// 将一个调度批次激活为 GPT 运行态。
+pub fn activate_inference_batch(model: &GPT, batch: InferenceBatch) -> InferenceBatchState {
+    InferenceBatchState::from_batch(batch, model.seq_len)
+}
+
+/// 将一个调度批次激活为 Qwen/Llama 风格模型运行态。
+pub fn activate_qwen_like_inference_batch(model: &QwenLikeGPT, batch: InferenceBatch) -> InferenceBatchState {
+    InferenceBatchState::from_batch(batch, model.seq_len)
+}
+
+fn decode_session_with<M: AutoregressiveForward>(model: &M, session: &mut InferenceSession) -> DecodeStep {
+    if session.finished {
+        return DecodeStep {
+            token_id: None,
+            candidates: Vec::new(),
+            finished: true,
+            stop_reason: session.stop_reason,
+        };
+    }
+
+    if session.generated_steps >= session.request.config.max_new_tokens {
+        session.mark_finished(DecodeStopReason::MaxNewTokens);
+        return DecodeStep {
+            token_id: None,
+            candidates: Vec::new(),
+            finished: true,
+            stop_reason: DecodeStopReason::MaxNewTokens,
+        };
+    }
+
+    let mut rng = rand::thread_rng();
+    let step = decode_next_token_inner(model, &mut session.state, &session.request.config, None, &mut rng);
+    if step.token_id.is_some() {
+        session.generated_steps += 1;
+    }
+    if step.finished {
+        session.mark_finished(step.stop_reason);
+    } else if session.generated_steps >= session.request.config.max_new_tokens {
+        session.mark_finished(DecodeStopReason::MaxNewTokens);
+    }
+    step
+}
+
+fn decode_batch_round_with<M: AutoregressiveForward>(
+    model: &M,
+    batch: &mut InferenceBatchState,
+) -> Vec<InferenceBatchStep> {
+    let mut steps = Vec::new();
+    for session in batch.sessions.iter_mut().filter(|session| !session.finished) {
+        let request_id = session.request_id();
+        let step = decode_session_with(model, session);
+        steps.push(InferenceBatchStep {
+            request_id,
+            step,
+            generated_steps: session.generated_steps,
+        });
+    }
+    steps
+}
+
+/// 对 GPT 批次执行一轮逐请求解码。
+///
+/// 当前实现是语义层 round-robin：每个未结束请求各走一步。它先保证流式调度
+/// 不变量正确，后续可以把内部替换为真正 batched decode。
+pub fn decode_inference_batch_round(model: &GPT, batch: &mut InferenceBatchState) -> Vec<InferenceBatchStep> {
+    decode_batch_round_with(model, batch)
+}
+
+/// 对 Qwen/Llama 风格模型批次执行一轮逐请求解码。
+pub fn decode_qwen_like_inference_batch_round(
+    model: &QwenLikeGPT,
+    batch: &mut InferenceBatchState,
+) -> Vec<InferenceBatchStep> {
+    decode_batch_round_with(model, batch)
 }
 
 // ============ Constrained Decoding ============
@@ -2590,6 +2762,88 @@ mod tests {
         let batch = scheduler.plan_next_batch().unwrap();
         assert_eq!(batch.request_ids(), vec![1, 2]);
         assert_eq!(scheduler.pending_len(), 1);
+    }
+
+    #[test]
+    fn test_inference_batch_state_activates_sessions() {
+        let model = GPT::new(8, 4, 2, 1, 8, 6);
+        let config = GenerationConfig::greedy(2, 8);
+        let batch = InferenceBatch {
+            requests: vec![
+                InferenceRequest::new(10, vec![1, 2], config, 0),
+                InferenceRequest::new(11, vec![3], config, 1),
+            ],
+            total_token_budget: 0,
+        };
+
+        let state = activate_inference_batch(&model, batch);
+
+        assert_eq!(state.request_ids(), vec![10, 11]);
+        assert_eq!(state.active_len(), 2);
+        assert_eq!(state.sessions[0].tokens(), &[1, 2]);
+    }
+
+    #[test]
+    fn test_decode_inference_batch_round_advances_each_active_session() {
+        let mut model = GPT::new(8, 4, 2, 1, 8, 6);
+        model.set_training(false);
+        let config = GenerationConfig::greedy(2, 8);
+        let batch = InferenceBatch {
+            requests: vec![
+                InferenceRequest::new(1, vec![1], config, 0),
+                InferenceRequest::new(2, vec![2], config, 1),
+            ],
+            total_token_budget: 0,
+        };
+        let mut state = activate_inference_batch(&model, batch);
+
+        let steps = decode_inference_batch_round(&model, &mut state);
+
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps.iter().map(|step| step.request_id).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(state.sessions[0].generated_steps, 1);
+        assert_eq!(state.sessions[1].generated_steps, 1);
+        assert_eq!(state.sessions[0].generated_tokens().len(), 1);
+        assert_eq!(state.sessions[1].generated_tokens().len(), 1);
+    }
+
+    #[test]
+    fn test_decode_inference_batch_round_marks_max_new_tokens() {
+        let mut model = GPT::new(8, 4, 2, 1, 8, 6);
+        model.set_training(false);
+        let config = GenerationConfig::greedy(1, 8);
+        let batch = InferenceBatch {
+            requests: vec![InferenceRequest::new(1, vec![1], config, 0)],
+            total_token_budget: 0,
+        };
+        let mut state = activate_inference_batch(&model, batch);
+
+        let first = decode_inference_batch_round(&model, &mut state);
+        assert_eq!(first.len(), 1);
+        assert_eq!(state.sessions[0].generated_steps, 1);
+        assert!(state.is_finished());
+        assert_eq!(state.sessions[0].stop_reason, DecodeStopReason::MaxNewTokens);
+
+        let second = decode_inference_batch_round(&model, &mut state);
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn test_inference_batch_state_skips_prompt_that_already_ended() {
+        let model = GPT::new(8, 4, 2, 1, 8, 6);
+        let config = GenerationConfig {
+            eos_token_id: Some(2),
+            ..GenerationConfig::greedy(3, 8)
+        };
+        let batch = InferenceBatch {
+            requests: vec![InferenceRequest::new(1, vec![1, 2], config, 0)],
+            total_token_budget: 0,
+        };
+        let mut state = activate_inference_batch(&model, batch);
+
+        assert!(state.is_finished());
+        assert_eq!(state.sessions[0].stop_reason, DecodeStopReason::AlreadyEnded);
+        assert!(decode_inference_batch_round(&model, &mut state).is_empty());
     }
 
     // --- Dropout tests ---
