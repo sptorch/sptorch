@@ -14,6 +14,7 @@
 use rand::Rng;
 use sptorch_core_ops::*;
 use sptorch_core_tensor::Tensor;
+use std::collections::VecDeque;
 
 // ============ Module Trait ============
 
@@ -1705,6 +1706,183 @@ pub fn decode_constrained_next_token(
     decode_next_token_inner(model, state, config, Some(constraint), &mut rng)
 }
 
+// ============ Inference Scheduling ============
+
+/// 单个在线推理请求的框架级描述。
+///
+/// 这里不包含 HTTP header、用户身份或产品业务字段，只保留模型调度真正需要的
+/// 信息：请求 ID、prompt、解码配置和到达顺序。这样产品仓可以把任意服务协议
+/// 映射到这个结构，而框架只负责做稳定、可测试的准入和批处理计划。
+#[derive(Debug, Clone, PartialEq)]
+pub struct InferenceRequest {
+    pub request_id: u64,
+    pub prompt: Vec<usize>,
+    pub config: GenerationConfig,
+    pub arrival_order: u64,
+}
+
+impl InferenceRequest {
+    /// 创建推理请求。
+    ///
+    /// `arrival_order` 由调用方按入队顺序递增传入，调度器用它保持 FIFO 公平性。
+    pub fn new(request_id: u64, prompt: Vec<usize>, config: GenerationConfig, arrival_order: u64) -> Self {
+        Self {
+            request_id,
+            prompt,
+            config,
+            arrival_order,
+        }
+    }
+
+    /// 请求在调度阶段声明的 token 预算。
+    ///
+    /// 预算包含 prompt token 和最多可能生成的新 token。它不是精确显存估算，
+    /// 但足以作为第一层过载保护，避免单个请求把一个微批次撑爆。
+    pub fn token_budget(&self) -> usize {
+        self.prompt.len() + self.config.max_new_tokens
+    }
+}
+
+/// 推理调度器配置。
+///
+/// `max_batch_size` 限制同一轮最多取多少个请求，`max_batch_tokens` 限制这些请求
+/// 的总 token 预算，`max_queue_len` 则是入队前的背压阈值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InferenceSchedulerConfig {
+    pub max_batch_size: usize,
+    pub max_batch_tokens: usize,
+    pub max_queue_len: usize,
+}
+
+impl InferenceSchedulerConfig {
+    /// 创建调度器配置。
+    pub fn new(max_batch_size: usize, max_batch_tokens: usize, max_queue_len: usize) -> Self {
+        assert!(max_batch_size > 0, "max_batch_size must be positive");
+        assert!(max_batch_tokens > 0, "max_batch_tokens must be positive");
+        Self {
+            max_batch_size,
+            max_batch_tokens,
+            max_queue_len,
+        }
+    }
+}
+
+/// 推理调度拒绝原因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InferenceAdmissionError {
+    /// 队列已经达到上限，调用方应触发过载保护或稍后重试。
+    QueueFull,
+    /// 单个请求预算已经超过批次 token 上限，无法安全接入当前调度器。
+    RequestTooLarge,
+}
+
+/// 调度器产出的一个微批计划。
+///
+/// 当前批次仍然按请求独立执行；它的意义是把“哪些请求可以在同一轮被调度”
+/// 这件事稳定下来。后续接真实 batched prefill/decode 时，可沿用这个计划结构。
+#[derive(Debug, Clone, PartialEq)]
+pub struct InferenceBatch {
+    pub requests: Vec<InferenceRequest>,
+    pub total_token_budget: usize,
+}
+
+impl InferenceBatch {
+    /// 批次中的请求数量。
+    pub fn len(&self) -> usize {
+        self.requests.len()
+    }
+
+    /// 批次是否为空。
+    pub fn is_empty(&self) -> bool {
+        self.requests.is_empty()
+    }
+
+    /// 批次请求 ID，便于日志和测试断言。
+    pub fn request_ids(&self) -> Vec<u64> {
+        self.requests.iter().map(|request| request.request_id).collect()
+    }
+}
+
+/// 面向在线推理的 FIFO 微批调度器。
+///
+/// 这个结构故意不执行模型，也不创建线程；它只负责准入、排队和微批计划。
+/// 这样我们先把调度不变量练扎实，再让产品服务层决定用 Tokio、线程池还是硬件队列。
+#[derive(Debug, Clone)]
+pub struct InferenceScheduler {
+    config: InferenceSchedulerConfig,
+    pending: VecDeque<InferenceRequest>,
+}
+
+impl InferenceScheduler {
+    /// 创建空调度器。
+    pub fn new(config: InferenceSchedulerConfig) -> Self {
+        Self {
+            config,
+            pending: VecDeque::new(),
+        }
+    }
+
+    /// 尝试接纳一个请求。
+    pub fn enqueue(&mut self, request: InferenceRequest) -> Result<(), InferenceAdmissionError> {
+        if request.token_budget() > self.config.max_batch_tokens {
+            return Err(InferenceAdmissionError::RequestTooLarge);
+        }
+        if self.pending.len() >= self.config.max_queue_len {
+            return Err(InferenceAdmissionError::QueueFull);
+        }
+        self.pending.push_back(request);
+        Ok(())
+    }
+
+    /// 规划下一批请求。
+    ///
+    /// 调度器保持 FIFO：如果队首请求无法放入当前批次，说明后面的请求即使更小
+    /// 也不应越过它，否则高 token 请求会长期饥饿。
+    pub fn plan_next_batch(&mut self) -> Option<InferenceBatch> {
+        let mut requests = Vec::new();
+        let mut total_token_budget = 0usize;
+
+        while let Some(next) = self.pending.front() {
+            if requests.len() >= self.config.max_batch_size {
+                break;
+            }
+
+            let next_budget = next.token_budget();
+            if !requests.is_empty() && total_token_budget + next_budget > self.config.max_batch_tokens {
+                break;
+            }
+
+            let next = self.pending.pop_front().expect("front exists");
+            total_token_budget += next_budget;
+            requests.push(next);
+        }
+
+        if requests.is_empty() {
+            None
+        } else {
+            Some(InferenceBatch {
+                requests,
+                total_token_budget,
+            })
+        }
+    }
+
+    /// 当前等待中的请求数量。
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// 队列是否为空。
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    /// 返回调度器配置。
+    pub fn config(&self) -> InferenceSchedulerConfig {
+        self.config
+    }
+}
+
 // ============ Constrained Decoding ============
 
 /// 用于约束 token 生成的前缀 Trie。
@@ -2345,6 +2523,73 @@ mod tests {
         assert_eq!(step.token_id, None);
         assert_eq!(step.stop_reason, DecodeStopReason::NoCandidates);
         assert_eq!(state.tokens(), &[1]);
+    }
+
+    #[test]
+    fn test_inference_scheduler_batches_fifo_with_token_budget() {
+        let mut scheduler = InferenceScheduler::new(InferenceSchedulerConfig::new(3, 10, 8));
+        let config = GenerationConfig::greedy(2, 16);
+
+        scheduler
+            .enqueue(InferenceRequest::new(1, vec![1, 2], config, 0))
+            .unwrap();
+        scheduler
+            .enqueue(InferenceRequest::new(2, vec![3, 4, 5], config, 1))
+            .unwrap();
+        scheduler
+            .enqueue(InferenceRequest::new(3, vec![6, 7, 8], config, 2))
+            .unwrap();
+
+        let first = scheduler.plan_next_batch().unwrap();
+        assert_eq!(first.request_ids(), vec![1, 2]);
+        assert_eq!(first.total_token_budget, 9);
+        assert_eq!(scheduler.pending_len(), 1);
+
+        let second = scheduler.plan_next_batch().unwrap();
+        assert_eq!(second.request_ids(), vec![3]);
+        assert_eq!(second.total_token_budget, 5);
+        assert!(scheduler.is_empty());
+    }
+
+    #[test]
+    fn test_inference_scheduler_rejects_queue_full() {
+        let mut scheduler = InferenceScheduler::new(InferenceSchedulerConfig::new(2, 10, 1));
+        let config = GenerationConfig::greedy(1, 8);
+
+        scheduler.enqueue(InferenceRequest::new(1, vec![1], config, 0)).unwrap();
+        let err = scheduler
+            .enqueue(InferenceRequest::new(2, vec![2], config, 1))
+            .unwrap_err();
+
+        assert_eq!(err, InferenceAdmissionError::QueueFull);
+        assert_eq!(scheduler.pending_len(), 1);
+    }
+
+    #[test]
+    fn test_inference_scheduler_rejects_request_too_large() {
+        let mut scheduler = InferenceScheduler::new(InferenceSchedulerConfig::new(2, 4, 4));
+        let config = GenerationConfig::greedy(3, 8);
+        let err = scheduler
+            .enqueue(InferenceRequest::new(1, vec![1, 2], config, 0))
+            .unwrap_err();
+
+        assert_eq!(err, InferenceAdmissionError::RequestTooLarge);
+        assert!(scheduler.is_empty());
+    }
+
+    #[test]
+    fn test_inference_scheduler_respects_batch_size_limit() {
+        let mut scheduler = InferenceScheduler::new(InferenceSchedulerConfig::new(2, 100, 8));
+        let config = GenerationConfig::greedy(1, 8);
+        for idx in 0..3 {
+            scheduler
+                .enqueue(InferenceRequest::new(idx + 1, vec![idx as usize], config, idx))
+                .unwrap();
+        }
+
+        let batch = scheduler.plan_next_batch().unwrap();
+        assert_eq!(batch.request_ids(), vec![1, 2]);
+        assert_eq!(scheduler.pending_len(), 1);
     }
 
     // --- Dropout tests ---
