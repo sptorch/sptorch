@@ -662,13 +662,17 @@ impl MultiHeadAttention {
     /// 的最终内核，只是把“本层应该缓存什么”从完整前向路径里抽出来，方便
     /// 推理运行态先建立 prefill/decode 生命周期。
     pub fn project_kv_cache(&self, input: &Tensor, rope_base: Option<f32>) -> (Tensor, Tensor) {
+        self.project_kv_cache_with_offset(input, rope_base.map(|base| (base, 0)))
+    }
+
+    fn project_kv_cache_with_offset(&self, input: &Tensor, rope: Option<(f32, usize)>) -> (Tensor, Tensor) {
         let shape = input.shape();
         let seq_len = shape[0];
         let mut key = reshape_to_heads(&self.wk.forward(input), seq_len, self.n_head, self.head_dim);
         let value = reshape_to_heads(&self.wv.forward(input), seq_len, self.n_head, self.head_dim);
 
-        if let Some(rope_base) = rope_base {
-            key = rotary_position_embedding(&key, rope_base);
+        if let Some((rope_base, position_offset)) = rope {
+            key = rotary_position_embedding_with_offset(&key, rope_base, position_offset);
         }
 
         (key.detach(), value.detach())
@@ -1509,7 +1513,7 @@ impl PrefillCache for GPT {
                 self.kv_cache_spec(),
                 "kv cache spec does not match GPT model"
             );
-            materialize_gpt_kv_cache(self, token_ids, cache, true);
+            append_gpt_last_token_kv_cache(self, token_ids, cache);
         });
     }
 }
@@ -1542,7 +1546,7 @@ impl PrefillCache for QwenLikeGPT {
                 self.kv_cache_spec(),
                 "kv cache spec does not match QwenLikeGPT model"
             );
-            materialize_qwen_like_kv_cache(self, token_ids, cache, true);
+            append_qwen_like_last_token_kv_cache(self, token_ids, cache);
         });
     }
 }
@@ -1619,6 +1623,35 @@ fn materialize_gpt_kv_cache(model: &GPT, token_ids: &[usize], cache: &mut KvCach
     }
 }
 
+fn append_gpt_last_token_kv_cache(model: &GPT, token_ids: &[usize], cache: &mut KvCache) {
+    if token_ids.is_empty() || model.blocks.is_empty() {
+        return;
+    }
+
+    assert!(token_ids.len() <= model.seq_len);
+    assert_eq!(
+        cache.cached_len(),
+        token_ids.len().saturating_sub(1).min(cache.max_context()),
+        "kv cache must contain the previous context window before appending a decode token"
+    );
+
+    let last_pos = token_ids.len() - 1;
+    let tok = model.token_emb.forward_indices(&[token_ids[last_pos]]);
+    let pos = model.pos_emb.forward_indices(&[last_pos.min(model.seq_len - 1)]);
+    let mut x = add(&tok, &pos);
+
+    for (idx, block) in model.blocks.iter().enumerate() {
+        let normed = block.ln1.forward(&x);
+        let (key, value) = block.attn.project_kv_cache(&normed, None);
+        cache.append_layer(idx, key, value);
+        let layer_cache = cache.layer(idx).expect("missing kv cache layer after append");
+        x = block.forward_last_token_incremental(&x, layer_cache);
+    }
+
+    // 后续层没有消费输出头，但逐层更新 cache 时必须让 residual 流继续向前。
+    let _ = model.ln_f.forward(&x);
+}
+
 fn materialize_qwen_like_kv_cache(
     model: &QwenLikeGPT,
     token_ids: &[usize],
@@ -1638,6 +1671,33 @@ fn materialize_qwen_like_kv_cache(
         write_kv_cache_layer(cache, idx, key, value, append_last_only);
         x = block.forward_seq_inference(&x);
     }
+}
+
+fn append_qwen_like_last_token_kv_cache(model: &QwenLikeGPT, token_ids: &[usize], cache: &mut KvCache) {
+    if token_ids.is_empty() || model.blocks.is_empty() {
+        return;
+    }
+
+    assert!(token_ids.len() <= model.seq_len);
+    assert_eq!(
+        cache.cached_len(),
+        token_ids.len().saturating_sub(1).min(cache.max_context()),
+        "kv cache must contain the previous context window before appending a decode token"
+    );
+
+    let last_pos = token_ids.len() - 1;
+    let mut x = model.token_emb.forward_indices(&[token_ids[last_pos]]);
+    for (idx, block) in model.blocks.iter().enumerate() {
+        let normed = block.norm1.forward(&x);
+        let (key, value) = block
+            .attn
+            .project_kv_cache_with_offset(&normed, Some((block.rope_base, last_pos)));
+        cache.append_layer(idx, key, value);
+        let layer_cache = cache.layer(idx).expect("missing kv cache layer after append");
+        x = block.forward_last_token_incremental(&x, layer_cache, last_pos);
+    }
+
+    let _ = model.norm_f.forward(&x);
 }
 
 fn write_kv_cache_layer(cache: &mut KvCache, layer_idx: usize, key: Tensor, value: Tensor, append_last_only: bool) {
@@ -2949,6 +3009,42 @@ pub fn generate_constrained(
 mod tests {
     use super::*;
 
+    fn assert_kv_cache_close(actual: &KvCache, expected: &KvCache, tol: f32) {
+        assert_eq!(actual.spec(), expected.spec());
+        assert_eq!(actual.layer_count(), expected.layer_count());
+        for (layer_idx, (actual_layer, expected_layer)) in actual.layers().iter().zip(expected.layers()).enumerate() {
+            assert_eq!(
+                actual_layer.cached_len(),
+                expected_layer.cached_len(),
+                "layer {layer_idx} cached_len mismatch"
+            );
+            assert_tensor_close(
+                actual_layer.key().expect("actual key missing"),
+                expected_layer.key().expect("expected key missing"),
+                tol,
+                &format!("layer {layer_idx} key"),
+            );
+            assert_tensor_close(
+                actual_layer.value().expect("actual value missing"),
+                expected_layer.value().expect("expected value missing"),
+                tol,
+                &format!("layer {layer_idx} value"),
+            );
+        }
+    }
+
+    fn assert_tensor_close(actual: &Tensor, expected: &Tensor, tol: f32, label: &str) {
+        assert_eq!(actual.shape(), expected.shape(), "{label} shape mismatch");
+        let actual_data = actual.contiguous_data();
+        let expected_data = expected.contiguous_data();
+        for (idx, (actual, expected)) in actual_data.iter().zip(expected_data.iter()).enumerate() {
+            assert!(
+                (actual - expected).abs() <= tol,
+                "{label}[{idx}] mismatch: got {actual}, expected {expected}"
+            );
+        }
+    }
+
     // 验证线性层前向输出形状正确。
     #[test]
     fn test_linear_forward_shape() {
@@ -3498,6 +3594,32 @@ mod tests {
                 "Qwen-like incremental logit {idx} mismatch: got {actual}, expected {expected}"
             );
         }
+    }
+
+    #[test]
+    fn test_gpt_append_last_token_cache_matches_full_prefill_before_window_slides() {
+        let model = GPT::new(8, 4, 2, 2, 8, 6);
+        let mut incremental = KvCache::new(model.kv_cache_spec());
+        let mut full = KvCache::new(model.kv_cache_spec());
+
+        model.prefill_kv_cache(&[1, 2], &mut incremental);
+        model.append_last_token_kv_cache(&[1, 2, 3], &mut incremental);
+        model.prefill_kv_cache(&[1, 2, 3], &mut full);
+
+        assert_kv_cache_close(&incremental, &full, 1e-5);
+    }
+
+    #[test]
+    fn test_qwen_like_append_last_token_cache_matches_full_prefill_before_window_slides() {
+        let model = QwenLikeGPT::new(8, 4, 2, 2, 8, 6);
+        let mut incremental = KvCache::new(model.kv_cache_spec());
+        let mut full = KvCache::new(model.kv_cache_spec());
+
+        model.prefill_kv_cache(&[1, 2], &mut incremental);
+        model.append_last_token_kv_cache(&[1, 2, 3], &mut incremental);
+        model.prefill_kv_cache(&[1, 2, 3], &mut full);
+
+        assert_kv_cache_close(&incremental, &full, 1e-5);
     }
 
     #[test]
