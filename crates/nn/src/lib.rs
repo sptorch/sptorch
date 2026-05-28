@@ -695,6 +695,62 @@ impl MultiHeadAttention {
     }
 }
 
+fn causal_attention_last_token(
+    attn: &MultiHeadAttention,
+    input: &Tensor,
+    layer_cache: &KvCacheLayer,
+    rope: Option<(f32, usize)>,
+) -> Tensor {
+    let shape = input.shape();
+    assert_eq!(
+        shape,
+        vec![1, attn.d_model],
+        "incremental attention expects [1, d_model]"
+    );
+    let cached_len = layer_cache.cached_len();
+    assert!(cached_len > 0, "incremental attention requires a non-empty KV cache");
+
+    let mut query = reshape_to_heads(&attn.wq.forward(input), 1, attn.n_head, attn.head_dim);
+    if let Some((rope_base, position_offset)) = rope {
+        query = rotary_position_embedding_with_offset(&query, rope_base, position_offset);
+    }
+    let key = layer_cache.key().expect("kv cache key missing");
+    let value = layer_cache.value().expect("kv cache value missing");
+
+    let q_data = query.contiguous_data();
+    let k_data = key.contiguous_data();
+    let v_data = value.contiguous_data();
+    let mut head_out = vec![0.0f32; attn.n_head * attn.head_dim];
+    let scale = 1.0 / (attn.head_dim as f32).sqrt();
+
+    for h in 0..attn.n_head {
+        let q_off = h * attn.head_dim;
+        let mut scores = vec![0.0f32; cached_len];
+        for pos in 0..cached_len {
+            let k_off = h * cached_len * attn.head_dim + pos * attn.head_dim;
+            let mut dot = 0.0f32;
+            for d in 0..attn.head_dim {
+                dot += q_data[q_off + d] * k_data[k_off + d];
+            }
+            scores[pos] = dot * scale;
+        }
+
+        let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let exp_scores: Vec<f32> = scores.iter().map(|score| (score - max_score).exp()).collect();
+        let denom: f32 = exp_scores.iter().sum();
+        for pos in 0..cached_len {
+            let weight = exp_scores[pos] / denom;
+            let v_off = h * cached_len * attn.head_dim + pos * attn.head_dim;
+            for d in 0..attn.head_dim {
+                head_out[h * attn.head_dim + d] += weight * v_data[v_off + d];
+            }
+        }
+    }
+
+    let out = Tensor::new(head_out, vec![1, attn.d_model]);
+    attn.wo.forward(&out)
+}
+
 /// [seq_len, d_model] -> [n_head, seq_len, head_dim]
 fn reshape_to_heads(x: &Tensor, seq_len: usize, n_head: usize, head_dim: usize) -> Tensor {
     // x is [seq_len, d_model] where d_model = n_head * head_dim
@@ -869,6 +925,7 @@ fn apply_rope_raw(
     seq_len: usize,
     head_dim: usize,
     rope_base: f32,
+    position_offset: usize,
     inverse: bool,
 ) -> Vec<f32> {
     assert_eq!(head_dim % 2, 0, "rope requires an even head dimension");
@@ -878,8 +935,9 @@ fn apply_rope_raw(
     for h in 0..n_head {
         for pos in 0..seq_len {
             let off = h * seq_len * head_dim + pos * head_dim;
+            let absolute_pos = position_offset + pos;
             for pair in 0..half {
-                let theta = pos as f32 / rope_base.powf((2 * pair) as f32 / head_dim as f32);
+                let theta = absolute_pos as f32 / rope_base.powf((2 * pair) as f32 / head_dim as f32);
                 let (sin, cos) = theta.sin_cos();
                 let sin = if inverse { -sin } else { sin };
                 let even = data[off + 2 * pair];
@@ -898,10 +956,19 @@ fn apply_rope_raw(
 /// 输入和输出 shape 都是 `[n_head, seq_len, head_dim]`。这个实现不绑定具体模型，
 /// 只负责把位置信息以旋转方式注入到 query/key 的偶数维与奇数维配对中。
 pub fn rotary_position_embedding(x: &Tensor, rope_base: f32) -> Tensor {
+    rotary_position_embedding_with_offset(x, rope_base, 0)
+}
+
+/// 从给定绝对位置开始对注意力头张量应用 RoPE。
+///
+/// 增量解码时当前 query 的张量长度通常只有 1，但它的 RoPE 位置不是 0，而是
+/// 当前上下文里的最后一个 token 位置。把 offset 显式传进来，可以让 KV cache
+/// 路径和完整 `forward_ids` 路径在 Q/K 旋转语义上保持一致。
+pub fn rotary_position_embedding_with_offset(x: &Tensor, rope_base: f32, position_offset: usize) -> Tensor {
     let shape = x.shape();
     assert_eq!(shape.len(), 3, "rope expects [n_head, seq_len, head_dim]");
     let data = x.contiguous_data();
-    let out = apply_rope_raw(&data, shape[0], shape[1], shape[2], rope_base, false);
+    let out = apply_rope_raw(&data, shape[0], shape[1], shape[2], rope_base, position_offset, false);
     let res = Tensor::new(out, shape.clone());
 
     if x.requires_grad() {
@@ -913,6 +980,7 @@ pub fn rotary_position_embedding(x: &Tensor, rope_base: f32) -> Tensor {
                 seq_len: shape[1],
                 head_dim: shape[2],
                 rope_base,
+                position_offset,
             }),
             inputs: vec![x.clone()],
         }));
@@ -927,13 +995,22 @@ struct RotaryEmbeddingOp {
     seq_len: usize,
     head_dim: usize,
     rope_base: f32,
+    position_offset: usize,
 }
 
 impl sptorch_core_tensor::Op for RotaryEmbeddingOp {
     // 反向传播时只需要把梯度沿相反角度旋回去即可，因为 RoPE 本身是正交旋转。
     fn backward(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
         let g = grad_output.contiguous_data();
-        let out = apply_rope_raw(&g, self.n_head, self.seq_len, self.head_dim, self.rope_base, true);
+        let out = apply_rope_raw(
+            &g,
+            self.n_head,
+            self.seq_len,
+            self.head_dim,
+            self.rope_base,
+            self.position_offset,
+            true,
+        );
         vec![Some(Tensor::new(out, vec![self.n_head, self.seq_len, self.head_dim]))]
     }
 }
@@ -1010,6 +1087,27 @@ impl QwenLikeBlock {
     pub fn forward_seq_inference(&self, input: &Tensor) -> Tensor {
         let normed = self.norm1.forward(input);
         let attn_out = self.attn.forward_causal_rope(&normed, self.rope_base);
+        let x = add(input, &attn_out);
+
+        let normed2 = self.norm2.forward(&x);
+        let ffn_out = swiglu(&self.ffn_up.forward(&normed2), &self.ffn_gate.forward(&normed2));
+        let ffn_out = self.ffn_down.forward(&ffn_out);
+        add(&x, &ffn_out)
+    }
+
+    fn forward_last_token_incremental(
+        &self,
+        input: &Tensor,
+        layer_cache: &KvCacheLayer,
+        position_offset: usize,
+    ) -> Tensor {
+        let normed = self.norm1.forward(input);
+        let attn_out = causal_attention_last_token(
+            &self.attn,
+            &normed,
+            layer_cache,
+            Some((self.rope_base, position_offset)),
+        );
         let x = add(input, &attn_out);
 
         let normed2 = self.norm2.forward(&x);
@@ -1100,6 +1198,17 @@ impl TransformerBlock {
         let ffn_out = self.ffn_down.forward(&ffn_out);
         add(&x, &ffn_out)
     }
+
+    fn forward_last_token_incremental(&self, input: &Tensor, layer_cache: &KvCacheLayer) -> Tensor {
+        let normed = self.ln1.forward(input);
+        let attn_out = causal_attention_last_token(&self.attn, &normed, layer_cache, None);
+        let x = add(input, &attn_out);
+
+        let normed2 = self.ln2.forward(&x);
+        let ffn_out = gelu(&self.ffn_up.forward(&normed2));
+        let ffn_out = self.ffn_down.forward(&ffn_out);
+        add(&x, &ffn_out)
+    }
     /// 设置块内 Dropout 的训练/评估状态。
     pub fn set_training(&mut self, training: bool) {
         if training {
@@ -1182,6 +1291,10 @@ pub trait PrefillCache {
     /// 为了取得最后 token 的层输入而重放一段上下文，但写入 cache 时只 append
     /// 一个位置，外层生命周期已经与真实在线推理保持一致。
     fn append_last_token_kv_cache(&self, token_ids: &[usize], cache: &mut KvCache);
+}
+
+trait IncrementalDecode {
+    fn decode_logits_from_cache(&self, token_ids: &[usize], cache: &KvCache) -> Tensor;
 }
 
 impl GPT {
@@ -1279,6 +1392,11 @@ impl GPT {
     pub fn append_last_token_kv_cache(&self, token_ids: &[usize], cache: &mut KvCache) {
         <Self as PrefillCache>::append_last_token_kv_cache(self, token_ids, cache)
     }
+
+    /// 使用已有 KV cache 计算当前最后一个 token 的 logits。
+    pub fn decode_logits_from_cache(&self, token_ids: &[usize], cache: &KvCache) -> Tensor {
+        <Self as IncrementalDecode>::decode_logits_from_cache(self, token_ids, cache)
+    }
 }
 
 impl QwenLikeGPT {
@@ -1356,6 +1474,11 @@ impl QwenLikeGPT {
     pub fn append_last_token_kv_cache(&self, token_ids: &[usize], cache: &mut KvCache) {
         <Self as PrefillCache>::append_last_token_kv_cache(self, token_ids, cache)
     }
+
+    /// 使用已有 KV cache 计算当前最后一个 token 的 logits。
+    pub fn decode_logits_from_cache(&self, token_ids: &[usize], cache: &KvCache) -> Tensor {
+        <Self as IncrementalDecode>::decode_logits_from_cache(self, token_ids, cache)
+    }
 }
 
 impl PrefillCache for GPT {
@@ -1421,6 +1544,58 @@ impl PrefillCache for QwenLikeGPT {
             );
             materialize_qwen_like_kv_cache(self, token_ids, cache, true);
         });
+    }
+}
+
+impl IncrementalDecode for GPT {
+    fn decode_logits_from_cache(&self, token_ids: &[usize], cache: &KvCache) -> Tensor {
+        assert!(!token_ids.is_empty(), "incremental decode requires at least one token");
+        assert_eq!(
+            cache.spec(),
+            self.kv_cache_spec(),
+            "kv cache spec does not match GPT model"
+        );
+        if self.blocks.is_empty() {
+            return self.forward_ids(token_ids);
+        }
+
+        let last_pos = token_ids.len() - 1;
+        let tok = self.token_emb.forward_indices(&[token_ids[last_pos]]);
+        let pos = self.pos_emb.forward_indices(&[last_pos.min(self.seq_len - 1)]);
+        let mut x = add(&tok, &pos);
+
+        for (idx, block) in self.blocks.iter().enumerate() {
+            let layer_cache = cache.layer(idx).expect("missing kv cache layer");
+            x = block.forward_last_token_incremental(&x, layer_cache);
+        }
+
+        let x = self.ln_f.forward(&x);
+        self.lm_head.forward(&x)
+    }
+}
+
+impl IncrementalDecode for QwenLikeGPT {
+    fn decode_logits_from_cache(&self, token_ids: &[usize], cache: &KvCache) -> Tensor {
+        assert!(!token_ids.is_empty(), "incremental decode requires at least one token");
+        assert_eq!(
+            cache.spec(),
+            self.kv_cache_spec(),
+            "kv cache spec does not match QwenLikeGPT model"
+        );
+        if self.blocks.is_empty() {
+            return self.forward_ids(token_ids);
+        }
+
+        let last_pos = token_ids.len() - 1;
+        let last_token = token_ids[last_pos];
+        let mut x = self.token_emb.forward_indices(&[last_token]);
+        for (idx, block) in self.blocks.iter().enumerate() {
+            let layer_cache = cache.layer(idx).expect("missing kv cache layer");
+            x = block.forward_last_token_incremental(&x, layer_cache, last_pos);
+        }
+
+        let x = self.norm_f.forward(&x);
+        self.lm_head.forward(&x)
     }
 }
 
@@ -2073,28 +2248,9 @@ fn decode_next_token_inner<M: AutoregressiveForward>(
     }
 
     let logits = model.forward_token_ids(state.context());
-    let logits_data = logits.contiguous_data();
-    let last = &logits_data[logits_data.len() - config.vocab_size..];
-    let mut step_logits = last.to_vec();
-
-    if let Some(constraint) = constraint {
-        if let Some(allowed) = constraint.allowed_next(state.generated_tokens()) {
-            for (token_id, logit) in step_logits.iter_mut().enumerate() {
-                if !allowed.contains(&token_id) {
-                    *logit = f32::NEG_INFINITY;
-                }
-            }
-        }
-    }
-
-    let candidates = sampling_candidates(&step_logits, config, state.tokens());
-    let Some(next) = sample_from_candidates(&candidates, rng) else {
-        return DecodeStep {
-            token_id: None,
-            candidates,
-            finished: true,
-            stop_reason: DecodeStopReason::NoCandidates,
-        };
+    let step_logits = last_step_logits(&logits, config.vocab_size);
+    let Some((next, candidates)) = choose_next_token(&step_logits, state, config, constraint, rng) else {
+        return no_candidates_step(&step_logits, state, config, constraint);
     };
 
     state.push_token(next);
@@ -2108,6 +2264,56 @@ fn decode_next_token_inner<M: AutoregressiveForward>(
         candidates,
         finished: stop_reason != DecodeStopReason::NotStopped,
         stop_reason,
+    }
+}
+
+fn last_step_logits(logits: &Tensor, vocab_size: usize) -> Vec<f32> {
+    let logits_data = logits.contiguous_data();
+    logits_data[logits_data.len() - vocab_size..].to_vec()
+}
+
+fn filtered_step_logits(
+    step_logits: &[f32],
+    state: &InferenceState,
+    constraint: Option<&dyn TokenConstraint>,
+) -> Vec<f32> {
+    let mut filtered = step_logits.to_vec();
+    if let Some(constraint) = constraint {
+        if let Some(allowed) = constraint.allowed_next(state.generated_tokens()) {
+            for (token_id, logit) in filtered.iter_mut().enumerate() {
+                if !allowed.contains(&token_id) {
+                    *logit = f32::NEG_INFINITY;
+                }
+            }
+        }
+    }
+    filtered
+}
+
+fn choose_next_token(
+    step_logits: &[f32],
+    state: &InferenceState,
+    config: &GenerationConfig,
+    constraint: Option<&dyn TokenConstraint>,
+    rng: &mut impl Rng,
+) -> Option<(usize, Vec<TokenCandidate>)> {
+    let filtered = filtered_step_logits(step_logits, state, constraint);
+    let candidates = sampling_candidates(&filtered, config, state.tokens());
+    sample_from_candidates(&candidates, rng).map(|token_id| (token_id, candidates))
+}
+
+fn no_candidates_step(
+    step_logits: &[f32],
+    state: &InferenceState,
+    config: &GenerationConfig,
+    constraint: Option<&dyn TokenConstraint>,
+) -> DecodeStep {
+    let filtered = filtered_step_logits(step_logits, state, constraint);
+    DecodeStep {
+        token_id: None,
+        candidates: sampling_candidates(&filtered, config, state.tokens()),
+        finished: true,
+        stop_reason: DecodeStopReason::NoCandidates,
     }
 }
 
@@ -2557,10 +2763,7 @@ pub fn activate_qwen_like_inference_batch(model: &QwenLikeGPT, batch: InferenceB
     InferenceBatchState::from_batch_with_prefill(batch, model)
 }
 
-fn decode_session_with<M: AutoregressiveForward + PrefillCache>(
-    model: &M,
-    session: &mut InferenceSession,
-) -> DecodeStep {
+fn decode_session_with<M: IncrementalDecode + PrefillCache>(model: &M, session: &mut InferenceSession) -> DecodeStep {
     if session.finished {
         return DecodeStep {
             token_id: None,
@@ -2581,11 +2784,29 @@ fn decode_session_with<M: AutoregressiveForward + PrefillCache>(
     }
 
     let mut rng = rand::thread_rng();
-    let step = decode_next_token_inner(model, &mut session.state, &session.request.config, None, &mut rng);
-    if step.token_id.is_some() {
+    let logits = model.decode_logits_from_cache(session.state.context(), &session.kv_cache);
+    let step_logits = last_step_logits(&logits, session.request.config.vocab_size);
+    let step = if let Some((next, candidates)) =
+        choose_next_token(&step_logits, &session.state, &session.request.config, None, &mut rng)
+    {
+        session.state.push_token(next);
         session.generated_steps += 1;
         model.append_last_token_kv_cache(session.state.context(), &mut session.kv_cache);
-    }
+        let stop_reason = if Some(next) == session.request.config.eos_token_id {
+            DecodeStopReason::EosToken
+        } else {
+            DecodeStopReason::NotStopped
+        };
+        DecodeStep {
+            token_id: Some(next),
+            candidates,
+            finished: stop_reason != DecodeStopReason::NotStopped,
+            stop_reason,
+        }
+    } else {
+        no_candidates_step(&step_logits, &session.state, &session.request.config, None)
+    };
+
     if step.finished {
         session.mark_finished(step.stop_reason);
     } else if session.generated_steps >= session.request.config.max_new_tokens {
@@ -2594,7 +2815,7 @@ fn decode_session_with<M: AutoregressiveForward + PrefillCache>(
     step
 }
 
-fn decode_batch_round_with<M: AutoregressiveForward + PrefillCache>(
+fn decode_batch_round_with<M: IncrementalDecode + PrefillCache>(
     model: &M,
     batch: &mut InferenceBatchState,
 ) -> Vec<InferenceBatchStep> {
@@ -2853,6 +3074,24 @@ mod tests {
             (data[4] - 1.0).abs() > 1e-3 || data[5].abs() > 1e-3,
             "position 1 should be rotated"
         );
+    }
+
+    #[test]
+    fn test_rope_offset_matches_sliced_full_sequence_position() {
+        let full = Tensor::new(
+            vec![
+                1.0, 2.0, 3.0, 4.0, //
+                5.0, 6.0, 7.0, 8.0, //
+                9.0, 10.0, 11.0, 12.0,
+            ],
+            vec![1, 3, 4],
+        );
+        let last_only = Tensor::new(vec![9.0, 10.0, 11.0, 12.0], vec![1, 1, 4]);
+
+        let full_rotated = rotary_position_embedding(&full, 10000.0).contiguous_data();
+        let offset_rotated = rotary_position_embedding_with_offset(&last_only, 10000.0, 2).contiguous_data();
+
+        assert_eq!(&full_rotated[8..12], offset_rotated.as_slice());
     }
 
     // 验证多头注意力参数数量与结构一致。
@@ -3219,6 +3458,46 @@ mod tests {
             session.kv_cache.layer(1).unwrap().value().unwrap().shape(),
             vec![3, 2, 2]
         );
+    }
+
+    #[test]
+    fn test_incremental_decode_logits_match_full_forward_last_token() {
+        let mut model = GPT::new(8, 4, 2, 1, 8, 6);
+        model.set_training(false);
+        let tokens = [1, 2, 3];
+        let mut cache = KvCache::new(model.kv_cache_spec());
+
+        model.prefill_kv_cache(&tokens, &mut cache);
+        let incremental = model.decode_logits_from_cache(&tokens, &cache).contiguous_data();
+        let full = model.forward_ids(&tokens).contiguous_data();
+        let expected = &full[full.len() - 8..];
+
+        for (idx, (actual, expected)) in incremental.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (actual - expected).abs() < 1e-4,
+                "incremental logit {idx} mismatch: got {actual}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_qwen_like_incremental_decode_logits_match_full_forward_last_token() {
+        let mut model = QwenLikeGPT::new(8, 4, 2, 1, 8, 6);
+        model.set_training(false);
+        let tokens = [1, 2, 3];
+        let mut cache = KvCache::new(model.kv_cache_spec());
+
+        model.prefill_kv_cache(&tokens, &mut cache);
+        let incremental = model.decode_logits_from_cache(&tokens, &cache).contiguous_data();
+        let full = model.forward_ids(&tokens).contiguous_data();
+        let expected = &full[full.len() - 8..];
+
+        for (idx, (actual, expected)) in incremental.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (actual - expected).abs() < 1e-4,
+                "Qwen-like incremental logit {idx} mismatch: got {actual}, expected {expected}"
+            );
+        }
     }
 
     #[test]
