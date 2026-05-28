@@ -655,6 +655,25 @@ impl MultiHeadAttention {
     pub fn forward_causal_rope(&self, input: &Tensor, rope_base: f32) -> Tensor {
         self.forward_causal_impl(input, Some(rope_base))
     }
+
+    /// 计算当前输入对应的 Key/Value cache 张量。
+    ///
+    /// 返回的 K/V shape 均为 `[n_head, seq_len, head_dim]`。这不是增量 attention
+    /// 的最终内核，只是把“本层应该缓存什么”从完整前向路径里抽出来，方便
+    /// 推理运行态先建立 prefill/decode 生命周期。
+    pub fn project_kv_cache(&self, input: &Tensor, rope_base: Option<f32>) -> (Tensor, Tensor) {
+        let shape = input.shape();
+        let seq_len = shape[0];
+        let mut key = reshape_to_heads(&self.wk.forward(input), seq_len, self.n_head, self.head_dim);
+        let value = reshape_to_heads(&self.wv.forward(input), seq_len, self.n_head, self.head_dim);
+
+        if let Some(rope_base) = rope_base {
+            key = rotary_position_embedding(&key, rope_base);
+        }
+
+        (key.detach(), value.detach())
+    }
+
     /// 返回注意力层全部参数。
     pub fn parameters(&self) -> Vec<Tensor> {
         let mut p = Vec::new();
@@ -984,6 +1003,21 @@ impl QwenLikeBlock {
         add(&x, &ffn_out)
     }
 
+    /// 推理态的 block 前向，不经过 dropout。
+    ///
+    /// KV cache 的 materialize 过程需要一个稳定、可复现的残差流，因此这里
+    /// 显式绕过 dropout，而不是依赖模型当前是否处于 eval 模式。
+    pub fn forward_seq_inference(&self, input: &Tensor) -> Tensor {
+        let normed = self.norm1.forward(input);
+        let attn_out = self.attn.forward_causal_rope(&normed, self.rope_base);
+        let x = add(input, &attn_out);
+
+        let normed2 = self.norm2.forward(&x);
+        let ffn_out = swiglu(&self.ffn_up.forward(&normed2), &self.ffn_gate.forward(&normed2));
+        let ffn_out = self.ffn_down.forward(&ffn_out);
+        add(&x, &ffn_out)
+    }
+
     /// 切换训练/评估状态。
     pub fn set_training(&mut self, training: bool) {
         if training {
@@ -1051,6 +1085,21 @@ impl TransformerBlock {
         let ffn_out = self.ffn_dropout.forward(&self.ffn_down.forward(&ffn_out));
         add(&x, &ffn_out)
     }
+
+    /// 推理态的 block 前向，不经过 dropout。
+    ///
+    /// 这条路径用于 KV cache materialize 和推理侧语义对齐：与 `forward_seq`
+    /// 的主要区别是它不会引入训练时的随机失活。
+    pub fn forward_seq_inference(&self, input: &Tensor) -> Tensor {
+        let normed = self.ln1.forward(input);
+        let attn_out = self.attn.forward_causal(&normed);
+        let x = add(input, &attn_out);
+
+        let normed2 = self.ln2.forward(&x);
+        let ffn_out = gelu(&self.ffn_up.forward(&normed2));
+        let ffn_out = self.ffn_down.forward(&ffn_out);
+        add(&x, &ffn_out)
+    }
     /// 设置块内 Dropout 的训练/评估状态。
     pub fn set_training(&mut self, training: bool) {
         if training {
@@ -1113,6 +1162,19 @@ pub struct QwenLikeGPT {
     pub norm_f: RmsNorm,
     pub lm_head: Linear,
     pub seq_len: usize,
+}
+
+/// 能为自回归推理运行态刷新 KV cache 的模型接口。
+///
+/// 这是在线推理 runtime 和具体模型之间的最小桥梁：runtime 不关心模型内部是
+/// GPT 绝对位置编码、Qwen/Llama RoPE，还是未来的其他 decoder，只要求模型能
+/// 声明 cache 规格，并把当前 token 上下文 materialize 到 cache 里。
+pub trait PrefillCache {
+    /// 返回模型需要的 KV cache 规格。
+    fn kv_cache_spec(&self) -> KvCacheSpec;
+
+    /// 将 `token_ids` 对应的上下文写入 `cache`。
+    fn prefill_kv_cache(&self, token_ids: &[usize], cache: &mut KvCache);
 }
 
 impl GPT {
@@ -1198,11 +1260,12 @@ impl GPT {
     /// head 结构，避免调用方重复传入容易写错的模型元数据。空 block 模型仍
     /// 可以作为极简测试模型运行，此时 cache 层数为 0。
     pub fn kv_cache_spec(&self) -> KvCacheSpec {
-        if let Some(block) = self.blocks.first() {
-            KvCacheSpec::new(self.blocks.len(), self.seq_len, block.attn.n_head, block.attn.head_dim)
-        } else {
-            KvCacheSpec::token_only(self.seq_len)
-        }
+        <Self as PrefillCache>::kv_cache_spec(self)
+    }
+
+    /// 将当前上下文写入给定 KV cache。
+    pub fn prefill_kv_cache(&self, token_ids: &[usize], cache: &mut KvCache) {
+        <Self as PrefillCache>::prefill_kv_cache(self, token_ids, cache)
     }
 }
 
@@ -1269,11 +1332,84 @@ impl QwenLikeGPT {
 
     /// 返回该 Qwen/Llama 风格模型推理时需要的 KV cache 规格。
     pub fn kv_cache_spec(&self) -> KvCacheSpec {
+        <Self as PrefillCache>::kv_cache_spec(self)
+    }
+
+    /// 将当前上下文写入给定 KV cache。
+    pub fn prefill_kv_cache(&self, token_ids: &[usize], cache: &mut KvCache) {
+        <Self as PrefillCache>::prefill_kv_cache(self, token_ids, cache)
+    }
+}
+
+impl PrefillCache for GPT {
+    fn kv_cache_spec(&self) -> KvCacheSpec {
         if let Some(block) = self.blocks.first() {
             KvCacheSpec::new(self.blocks.len(), self.seq_len, block.attn.n_head, block.attn.head_dim)
         } else {
             KvCacheSpec::token_only(self.seq_len)
         }
+    }
+
+    fn prefill_kv_cache(&self, token_ids: &[usize], cache: &mut KvCache) {
+        sptorch_core_tensor::no_grad(|| {
+            assert_eq!(
+                cache.spec(),
+                self.kv_cache_spec(),
+                "kv cache spec does not match GPT model"
+            );
+            cache.reset();
+            if token_ids.is_empty() || self.blocks.is_empty() {
+                return;
+            }
+
+            let slen = token_ids.len();
+            assert!(slen <= self.seq_len);
+            let positions: Vec<usize> = (0..slen).collect();
+            let tok = self.token_emb.forward_indices(token_ids);
+            let pos = self.pos_emb.forward_indices(&positions);
+            let mut x = add(&tok, &pos);
+
+            for (idx, block) in self.blocks.iter().enumerate() {
+                let normed = block.ln1.forward(&x);
+                let (key, value) = block.attn.project_kv_cache(&normed, None);
+                cache.prefill_layer(idx, key, value);
+                x = block.forward_seq_inference(&x);
+            }
+        });
+    }
+}
+
+impl PrefillCache for QwenLikeGPT {
+    fn kv_cache_spec(&self) -> KvCacheSpec {
+        if let Some(block) = self.blocks.first() {
+            KvCacheSpec::new(self.blocks.len(), self.seq_len, block.attn.n_head, block.attn.head_dim)
+        } else {
+            KvCacheSpec::token_only(self.seq_len)
+        }
+    }
+
+    fn prefill_kv_cache(&self, token_ids: &[usize], cache: &mut KvCache) {
+        sptorch_core_tensor::no_grad(|| {
+            assert_eq!(
+                cache.spec(),
+                self.kv_cache_spec(),
+                "kv cache spec does not match QwenLikeGPT model"
+            );
+            cache.reset();
+            if token_ids.is_empty() || self.blocks.is_empty() {
+                return;
+            }
+
+            let slen = token_ids.len();
+            assert!(slen <= self.seq_len);
+            let mut x = self.token_emb.forward_indices(token_ids);
+            for (idx, block) in self.blocks.iter().enumerate() {
+                let normed = block.norm1.forward(&x);
+                let (key, value) = block.attn.project_kv_cache(&normed, Some(block.rope_base));
+                cache.prefill_layer(idx, key, value);
+                x = block.forward_seq_inference(&x);
+            }
+        });
     }
 }
 
@@ -2221,6 +2357,41 @@ impl InferenceSession {
         }
     }
 
+    /// 重新装载一个 prompt，并清空历史生成与 K/V cache。
+    ///
+    /// 这个方法对应一轮新的 prefill 生命周期：token 状态回到 prompt 起点，
+    /// cache 也被同步刷新为干净状态，避免上一轮请求污染新会话。
+    pub fn prefill<M: PrefillCache>(&mut self, model: &M) {
+        self.state.reset(&self.request.prompt);
+        self.generated_steps = 0;
+        self.finished = self.request.config.eos_token_id.is_some()
+            && self.request.prompt.last().copied() == self.request.config.eos_token_id;
+        self.stop_reason = if self.finished {
+            DecodeStopReason::AlreadyEnded
+        } else {
+            DecodeStopReason::NotStopped
+        };
+        model.prefill_kv_cache(self.state.tokens(), &mut self.kv_cache);
+    }
+
+    /// 重置 session 为新的请求。
+    ///
+    /// 与 `prefill` 不同，这里会替换请求本身，适合调度器复用 session 对象。
+    pub fn reset<M: PrefillCache>(&mut self, request: InferenceRequest, model: &M) {
+        self.request = request;
+        self.state = InferenceState::new(&self.request.prompt, self.kv_cache.max_context());
+        self.generated_steps = 0;
+        self.finished = self.request.config.eos_token_id.is_some()
+            && self.request.prompt.last().copied() == self.request.config.eos_token_id;
+        self.stop_reason = if self.finished {
+            DecodeStopReason::AlreadyEnded
+        } else {
+            DecodeStopReason::NotStopped
+        };
+        self.kv_cache.reset();
+        model.prefill_kv_cache(self.state.tokens(), &mut self.kv_cache);
+    }
+
     /// 请求 ID。
     pub fn request_id(&self) -> u64 {
         self.request.request_id
@@ -2265,6 +2436,16 @@ impl InferenceBatchState {
         }
     }
 
+    /// 用模型结构创建运行态并立即执行 prompt prefill。
+    pub fn from_batch_with_prefill<M: PrefillCache>(batch: InferenceBatch, model: &M) -> Self {
+        let cache_spec = model.kv_cache_spec();
+        let mut state = Self::from_batch_with_kv_cache_spec(batch, cache_spec);
+        for session in &mut state.sessions {
+            session.prefill(model);
+        }
+        state
+    }
+
     /// 是否所有请求都已经结束。
     pub fn is_finished(&self) -> bool {
         self.sessions.iter().all(|session| session.finished)
@@ -2291,15 +2472,18 @@ pub struct InferenceBatchStep {
 
 /// 将一个调度批次激活为 GPT 运行态。
 pub fn activate_inference_batch(model: &GPT, batch: InferenceBatch) -> InferenceBatchState {
-    InferenceBatchState::from_batch_with_kv_cache_spec(batch, model.kv_cache_spec())
+    InferenceBatchState::from_batch_with_prefill(batch, model)
 }
 
 /// 将一个调度批次激活为 Qwen/Llama 风格模型运行态。
 pub fn activate_qwen_like_inference_batch(model: &QwenLikeGPT, batch: InferenceBatch) -> InferenceBatchState {
-    InferenceBatchState::from_batch_with_kv_cache_spec(batch, model.kv_cache_spec())
+    InferenceBatchState::from_batch_with_prefill(batch, model)
 }
 
-fn decode_session_with<M: AutoregressiveForward>(model: &M, session: &mut InferenceSession) -> DecodeStep {
+fn decode_session_with<M: AutoregressiveForward + PrefillCache>(
+    model: &M,
+    session: &mut InferenceSession,
+) -> DecodeStep {
     if session.finished {
         return DecodeStep {
             token_id: None,
@@ -2323,6 +2507,7 @@ fn decode_session_with<M: AutoregressiveForward>(model: &M, session: &mut Infere
     let step = decode_next_token_inner(model, &mut session.state, &session.request.config, None, &mut rng);
     if step.token_id.is_some() {
         session.generated_steps += 1;
+        model.prefill_kv_cache(session.state.context(), &mut session.kv_cache);
     }
     if step.finished {
         session.mark_finished(step.stop_reason);
@@ -2332,7 +2517,7 @@ fn decode_session_with<M: AutoregressiveForward>(model: &M, session: &mut Infere
     step
 }
 
-fn decode_batch_round_with<M: AutoregressiveForward>(
+fn decode_batch_round_with<M: AutoregressiveForward + PrefillCache>(
     model: &M,
     batch: &mut InferenceBatchState,
 ) -> Vec<InferenceBatchStep> {
@@ -2951,7 +3136,12 @@ mod tests {
         assert_eq!(session.kv_cache.spec(), KvCacheSpec::new(2, 5, 3, 2));
         assert_eq!(session.kv_cache.layer_count(), 2);
         assert_eq!(session.state.context(), &[1, 2]);
-        assert!(session.kv_cache.is_empty());
+        assert_eq!(session.kv_cache.cached_len(), 2);
+        assert_eq!(session.kv_cache.layer(0).unwrap().key().unwrap().shape(), vec![3, 2, 2]);
+        assert_eq!(
+            session.kv_cache.layer(1).unwrap().value().unwrap().shape(),
+            vec![3, 2, 2]
+        );
     }
 
     #[test]
@@ -3006,19 +3196,29 @@ mod tests {
 
     #[test]
     fn test_generation_stops_after_sampling_eos_token() {
-        let mut model = GPT::new(6, 4, 2, 1, 8, 5);
-        model.set_training(false);
-
-        let preview = generate_with_config(&model, &[1], GenerationConfig::greedy(1, 6));
-        let first_generated = preview[1];
+        let model = QwenLikeGPT::new(6, 1, 1, 0, 1, 5);
+        {
+            let token_weight = model.token_emb.weight.0.write().unwrap();
+            let mut storage = token_weight.storage.write().unwrap();
+            let slice = storage.as_cpu_slice_mut();
+            slice.fill(0.0);
+            slice[1] = 1.0;
+        }
+        {
+            let lm_head_weight = model.lm_head.weight.0.write().unwrap();
+            let mut storage = lm_head_weight.storage.write().unwrap();
+            let slice = storage.as_cpu_slice_mut();
+            slice.fill(0.0);
+            slice[3] = 5.0;
+        }
 
         let config = GenerationConfig {
-            eos_token_id: Some(first_generated),
+            eos_token_id: Some(3),
             ..GenerationConfig::greedy(4, 6)
         };
-        let output = generate_with_config(&model, &[1], config);
+        let output = generate_qwen_like_with_config(&model, &[1], config);
 
-        assert_eq!(output, vec![1, first_generated]);
+        assert_eq!(output, vec![1, 3]);
     }
 
     #[test]
@@ -3170,6 +3370,8 @@ mod tests {
         assert_eq!(state.request_ids(), vec![10, 11]);
         assert_eq!(state.active_len(), 2);
         assert_eq!(state.sessions[0].tokens(), &[1, 2]);
+        assert_eq!(state.sessions[0].kv_cache.cached_len(), 2);
+        assert_eq!(state.sessions[1].kv_cache.cached_len(), 1);
     }
 
     #[test]
@@ -3194,6 +3396,14 @@ mod tests {
         assert_eq!(state.sessions[1].generated_steps, 1);
         assert_eq!(state.sessions[0].generated_tokens().len(), 1);
         assert_eq!(state.sessions[1].generated_tokens().len(), 1);
+        assert_eq!(
+            state.sessions[0].kv_cache.cached_len(),
+            state.sessions[0].state.context().len()
+        );
+        assert_eq!(
+            state.sessions[1].kv_cache.cached_len(),
+            state.sessions[1].state.context().len()
+        );
     }
 
     #[test]
