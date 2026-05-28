@@ -1175,6 +1175,13 @@ pub trait PrefillCache {
 
     /// 将 `token_ids` 对应的上下文写入 `cache`。
     fn prefill_kv_cache(&self, token_ids: &[usize], cache: &mut KvCache);
+
+    /// 只把当前上下文中最后一个 token 对应的 K/V 追加到 cache。
+    ///
+    /// 这是从“全量刷新 cache”走向真实增量 decode 的过渡接口。当前实现仍会
+    /// 为了取得最后 token 的层输入而重放一段上下文，但写入 cache 时只 append
+    /// 一个位置，外层生命周期已经与真实在线推理保持一致。
+    fn append_last_token_kv_cache(&self, token_ids: &[usize], cache: &mut KvCache);
 }
 
 impl GPT {
@@ -1267,6 +1274,11 @@ impl GPT {
     pub fn prefill_kv_cache(&self, token_ids: &[usize], cache: &mut KvCache) {
         <Self as PrefillCache>::prefill_kv_cache(self, token_ids, cache)
     }
+
+    /// 将当前上下文最后一个 token 的 K/V 追加到 cache。
+    pub fn append_last_token_kv_cache(&self, token_ids: &[usize], cache: &mut KvCache) {
+        <Self as PrefillCache>::append_last_token_kv_cache(self, token_ids, cache)
+    }
 }
 
 impl QwenLikeGPT {
@@ -1339,6 +1351,11 @@ impl QwenLikeGPT {
     pub fn prefill_kv_cache(&self, token_ids: &[usize], cache: &mut KvCache) {
         <Self as PrefillCache>::prefill_kv_cache(self, token_ids, cache)
     }
+
+    /// 将当前上下文最后一个 token 的 K/V 追加到 cache。
+    pub fn append_last_token_kv_cache(&self, token_ids: &[usize], cache: &mut KvCache) {
+        <Self as PrefillCache>::append_last_token_kv_cache(self, token_ids, cache)
+    }
 }
 
 impl PrefillCache for GPT {
@@ -1358,23 +1375,18 @@ impl PrefillCache for GPT {
                 "kv cache spec does not match GPT model"
             );
             cache.reset();
-            if token_ids.is_empty() || self.blocks.is_empty() {
-                return;
-            }
+            materialize_gpt_kv_cache(self, token_ids, cache, false);
+        });
+    }
 
-            let slen = token_ids.len();
-            assert!(slen <= self.seq_len);
-            let positions: Vec<usize> = (0..slen).collect();
-            let tok = self.token_emb.forward_indices(token_ids);
-            let pos = self.pos_emb.forward_indices(&positions);
-            let mut x = add(&tok, &pos);
-
-            for (idx, block) in self.blocks.iter().enumerate() {
-                let normed = block.ln1.forward(&x);
-                let (key, value) = block.attn.project_kv_cache(&normed, None);
-                cache.prefill_layer(idx, key, value);
-                x = block.forward_seq_inference(&x);
-            }
+    fn append_last_token_kv_cache(&self, token_ids: &[usize], cache: &mut KvCache) {
+        sptorch_core_tensor::no_grad(|| {
+            assert_eq!(
+                cache.spec(),
+                self.kv_cache_spec(),
+                "kv cache spec does not match GPT model"
+            );
+            materialize_gpt_kv_cache(self, token_ids, cache, true);
         });
     }
 }
@@ -1396,21 +1408,86 @@ impl PrefillCache for QwenLikeGPT {
                 "kv cache spec does not match QwenLikeGPT model"
             );
             cache.reset();
-            if token_ids.is_empty() || self.blocks.is_empty() {
-                return;
-            }
-
-            let slen = token_ids.len();
-            assert!(slen <= self.seq_len);
-            let mut x = self.token_emb.forward_indices(token_ids);
-            for (idx, block) in self.blocks.iter().enumerate() {
-                let normed = block.norm1.forward(&x);
-                let (key, value) = block.attn.project_kv_cache(&normed, Some(block.rope_base));
-                cache.prefill_layer(idx, key, value);
-                x = block.forward_seq_inference(&x);
-            }
+            materialize_qwen_like_kv_cache(self, token_ids, cache, false);
         });
     }
+
+    fn append_last_token_kv_cache(&self, token_ids: &[usize], cache: &mut KvCache) {
+        sptorch_core_tensor::no_grad(|| {
+            assert_eq!(
+                cache.spec(),
+                self.kv_cache_spec(),
+                "kv cache spec does not match QwenLikeGPT model"
+            );
+            materialize_qwen_like_kv_cache(self, token_ids, cache, true);
+        });
+    }
+}
+
+fn materialize_gpt_kv_cache(model: &GPT, token_ids: &[usize], cache: &mut KvCache, append_last_only: bool) {
+    if token_ids.is_empty() || model.blocks.is_empty() {
+        return;
+    }
+
+    let slen = token_ids.len();
+    assert!(slen <= model.seq_len);
+    let positions: Vec<usize> = (0..slen).collect();
+    let tok = model.token_emb.forward_indices(token_ids);
+    let pos = model.pos_emb.forward_indices(&positions);
+    let mut x = add(&tok, &pos);
+
+    for (idx, block) in model.blocks.iter().enumerate() {
+        let normed = block.ln1.forward(&x);
+        let (key, value) = block.attn.project_kv_cache(&normed, None);
+        write_kv_cache_layer(cache, idx, key, value, append_last_only);
+        x = block.forward_seq_inference(&x);
+    }
+}
+
+fn materialize_qwen_like_kv_cache(
+    model: &QwenLikeGPT,
+    token_ids: &[usize],
+    cache: &mut KvCache,
+    append_last_only: bool,
+) {
+    if token_ids.is_empty() || model.blocks.is_empty() {
+        return;
+    }
+
+    let slen = token_ids.len();
+    assert!(slen <= model.seq_len);
+    let mut x = model.token_emb.forward_indices(token_ids);
+    for (idx, block) in model.blocks.iter().enumerate() {
+        let normed = block.norm1.forward(&x);
+        let (key, value) = block.attn.project_kv_cache(&normed, Some(block.rope_base));
+        write_kv_cache_layer(cache, idx, key, value, append_last_only);
+        x = block.forward_seq_inference(&x);
+    }
+}
+
+fn write_kv_cache_layer(cache: &mut KvCache, layer_idx: usize, key: Tensor, value: Tensor, append_last_only: bool) {
+    if append_last_only {
+        cache.append_layer(layer_idx, last_kv_token(&key), last_kv_token(&value));
+    } else {
+        cache.prefill_layer(layer_idx, key, value);
+    }
+}
+
+fn last_kv_token(tensor: &Tensor) -> Tensor {
+    let shape = tensor.shape();
+    assert_eq!(shape.len(), 3, "kv tensor must be [n_head, seq_len, head_dim]");
+    let n_head = shape[0];
+    let seq_len = shape[1];
+    let head_dim = shape[2];
+    assert!(seq_len > 0, "cannot take last token from empty kv tensor");
+
+    let data = tensor.contiguous_data();
+    let mut out = Vec::with_capacity(n_head * head_dim);
+    for h in 0..n_head {
+        let start = h * seq_len * head_dim + (seq_len - 1) * head_dim;
+        out.extend_from_slice(&data[start..start + head_dim]);
+    }
+    Tensor::new(out, vec![n_head, 1, head_dim])
 }
 
 // ============ Text Generation ============
@@ -2507,7 +2584,7 @@ fn decode_session_with<M: AutoregressiveForward + PrefillCache>(
     let step = decode_next_token_inner(model, &mut session.state, &session.request.config, None, &mut rng);
     if step.token_id.is_some() {
         session.generated_steps += 1;
-        model.prefill_kv_cache(session.state.context(), &mut session.kv_cache);
+        model.append_last_token_kv_cache(session.state.context(), &mut session.kv_cache);
     }
     if step.finished {
         session.mark_finished(step.stop_reason);
