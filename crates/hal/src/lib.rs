@@ -120,6 +120,195 @@ impl fmt::Display for HalError {
 
 impl std::error::Error for HalError {}
 
+/// 设备侧 KV cache 的布局规格。
+///
+/// 这个类型刻意放在 HAL，而不是 `nn`：`nn` 关心注意力语义，HAL 关心设备内存
+/// 需要多大、每个槽位如何定位、窗口滑动后元数据如何同步。真实 CUDA/Tank9k
+/// 后端可以先按这份规格分配连续 K/V buffer，再逐步补增量 attention kernel。
+#[derive(Debug, Clone, PartialEq)]
+pub struct KvCacheBufferSpec {
+    pub device: DeviceId,
+    pub dtype: DType,
+    pub n_layer: usize,
+    pub max_context: usize,
+    pub n_head: usize,
+    pub head_dim: usize,
+}
+
+impl KvCacheBufferSpec {
+    /// 创建一份设备 KV cache 规格。
+    pub fn new(
+        device: DeviceId,
+        dtype: DType,
+        n_layer: usize,
+        max_context: usize,
+        n_head: usize,
+        head_dim: usize,
+    ) -> Self {
+        assert!(max_context > 0, "max_context must be positive");
+        assert!(n_head > 0, "n_head must be positive");
+        assert!(head_dim > 0, "head_dim must be positive");
+        Self {
+            device,
+            dtype,
+            n_layer,
+            max_context,
+            n_head,
+            head_dim,
+        }
+    }
+
+    /// 单个 K 或 V buffer 需要保存的元素数量。
+    pub fn elements_per_kind(&self) -> usize {
+        self.n_layer * self.max_context * self.n_head * self.head_dim
+    }
+
+    /// K/V 两个 buffer 合计的元素数量。
+    pub fn total_elements(&self) -> usize {
+        self.elements_per_kind() * 2
+    }
+
+    /// 按 dtype 计算设备侧 K/V 合计字节数。
+    pub fn total_bytes(&self) -> usize {
+        self.total_elements() * dtype_size_bytes(self.dtype)
+    }
+
+    /// 返回 `[layer, position, head, dim]` 在单个 K 或 V buffer 内的线性元素偏移。
+    ///
+    /// `position` 是窗口内槽位，不是绝对 token 位置。绝对位置由
+    /// [`KvCacheWindowState`] 记录，后端可用它做 RoPE offset 或诊断。
+    pub fn element_offset(&self, layer: usize, position: usize, head: usize, dim: usize) -> usize {
+        assert!(layer < self.n_layer, "layer out of range");
+        assert!(position < self.max_context, "position out of range");
+        assert!(head < self.n_head, "head out of range");
+        assert!(dim < self.head_dim, "dim out of range");
+        (((layer * self.max_context + position) * self.n_head + head) * self.head_dim) + dim
+    }
+}
+
+/// KV cache 当前窗口的设备侧元数据。
+///
+/// 真实设备 buffer 往往不会移动整段历史，而是维护一个 ring/write cursor。
+/// 这里先不强迫所有后端采用 ring，只把“窗口从完整序列哪个绝对位置开始”
+/// 和“当前有效 token 数”固定下来；CUDA、Tank9k、CPU dry-run 都能据此对齐。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvCacheWindowState {
+    pub window_start: usize,
+    pub cached_len: usize,
+    pub max_context: usize,
+}
+
+impl KvCacheWindowState {
+    /// 创建空窗口状态。
+    pub fn new(max_context: usize) -> Self {
+        assert!(max_context > 0, "max_context must be positive");
+        Self {
+            window_start: 0,
+            cached_len: 0,
+            max_context,
+        }
+    }
+
+    /// 下一次 append 对应的绝对 token 位置。
+    pub fn next_position(&self) -> usize {
+        self.window_start + self.cached_len
+    }
+
+    /// 当前窗口最后一个 token 的绝对位置。
+    pub fn last_position(&self) -> Option<usize> {
+        if self.cached_len == 0 {
+            None
+        } else {
+            Some(self.window_start + self.cached_len - 1)
+        }
+    }
+
+    /// 用一段 prefill 窗口覆盖当前状态。
+    pub fn prefill(&mut self, start_position: usize, len: usize) {
+        assert!(len <= self.max_context, "prefill len cannot exceed max_context");
+        self.window_start = start_position;
+        self.cached_len = len;
+    }
+
+    /// 追加 `len` 个 token，并在超出窗口时前移 `window_start`。
+    pub fn append(&mut self, len: usize) {
+        let total = self.cached_len + len;
+        let dropped = total.saturating_sub(self.max_context);
+        self.window_start += dropped;
+        self.cached_len = total.min(self.max_context);
+    }
+}
+
+/// 设备 KV cache buffer 的最小抽象。
+///
+/// 这不是 attention kernel 接口，而是“内存和窗口元数据”的底座。后续 CUDA/HAL
+/// 可以实现真正的 K/V 写入、ring buffer 和 fence 同步；上层只需要依赖这份
+/// 规格即可知道 buffer 是否足够、窗口位置是否正确。
+pub trait KvCacheBuffer: Send + Sync + fmt::Debug {
+    fn spec(&self) -> &KvCacheBufferSpec;
+    fn window_state(&self) -> KvCacheWindowState;
+    fn prefill_window(&mut self, start_position: usize, len: usize) -> HalResult<()>;
+    fn append_window(&mut self, len: usize) -> HalResult<()>;
+}
+
+/// CPU 参考 KV cache buffer。
+///
+/// 它只分配连续字节并维护窗口元数据，不计算 attention。这个实现的价值是把
+/// dtype、容量和滑动窗口规则先跑通，避免 CUDA/Tank9k 后端各自解释一套。
+#[derive(Debug)]
+pub struct CpuKvCacheBuffer {
+    spec: KvCacheBufferSpec,
+    storage: RawBuffer,
+    window: KvCacheWindowState,
+}
+
+impl CpuKvCacheBuffer {
+    pub fn new(spec: KvCacheBufferSpec) -> HalResult<Self> {
+        let backend = CpuBackend;
+        let storage = backend.allocate(spec.total_bytes())?;
+        let window = KvCacheWindowState::new(spec.max_context);
+        Ok(Self { spec, storage, window })
+    }
+
+    /// 返回底层字节容量，用于测试和后端规划校验。
+    pub fn storage_len(&self) -> usize {
+        self.storage.data.len()
+    }
+}
+
+impl KvCacheBuffer for CpuKvCacheBuffer {
+    fn spec(&self) -> &KvCacheBufferSpec {
+        &self.spec
+    }
+
+    fn window_state(&self) -> KvCacheWindowState {
+        self.window
+    }
+
+    fn prefill_window(&mut self, start_position: usize, len: usize) -> HalResult<()> {
+        if len > self.spec.max_context {
+            return Err(HalError::Unsupported(format!(
+                "prefill len {len} exceeds kv cache max_context {}",
+                self.spec.max_context
+            )));
+        }
+        self.window.prefill(start_position, len);
+        Ok(())
+    }
+
+    fn append_window(&mut self, len: usize) -> HalResult<()> {
+        self.window.append(len);
+        Ok(())
+    }
+}
+
+fn dtype_size_bytes(dtype: DType) -> usize {
+    match dtype {
+        DType::F32 => 4,
+        DType::F16 | DType::BF16 => 2,
+    }
+}
+
 /// Minimal hardware fence snapshot shared by HAL, planners and Studio.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FenceState {
@@ -479,6 +668,56 @@ mod tests {
         assert_eq!(fence.phase, "WaitFence");
         assert_eq!(queue.depth, fence.queue_depth);
         assert!(queue.draining);
+    }
+
+    #[test]
+    fn test_kv_cache_buffer_spec_layout_and_capacity() {
+        let spec = KvCacheBufferSpec::new(DeviceId::cuda(0), DType::BF16, 2, 4, 3, 8);
+
+        assert_eq!(spec.elements_per_kind(), 2 * 4 * 3 * 8);
+        assert_eq!(spec.total_elements(), 2 * 2 * 4 * 3 * 8);
+        assert_eq!(spec.total_bytes(), 2 * 2 * 4 * 3 * 8 * 2);
+        assert_eq!(spec.element_offset(1, 2, 1, 3), (((4 + 2) * 3 + 1) * 8) + 3);
+    }
+
+    #[test]
+    fn test_kv_cache_window_state_prefill_and_append() {
+        let mut window = KvCacheWindowState::new(3);
+        assert_eq!(window.next_position(), 0);
+        assert_eq!(window.last_position(), None);
+
+        window.prefill(5, 2);
+        assert_eq!(window.window_start, 5);
+        assert_eq!(window.cached_len, 2);
+        assert_eq!(window.last_position(), Some(6));
+        assert_eq!(window.next_position(), 7);
+
+        window.append(2);
+        assert_eq!(window.window_start, 6);
+        assert_eq!(window.cached_len, 3);
+        assert_eq!(window.last_position(), Some(8));
+        assert_eq!(window.next_position(), 9);
+    }
+
+    #[test]
+    fn test_cpu_kv_cache_buffer_tracks_capacity_and_window() {
+        let spec = KvCacheBufferSpec::new(DeviceId::cpu(), DType::F32, 1, 3, 2, 4);
+        let mut buffer = CpuKvCacheBuffer::new(spec.clone()).unwrap();
+
+        assert_eq!(buffer.spec(), &spec);
+        assert_eq!(buffer.storage_len(), spec.total_bytes());
+        assert_eq!(buffer.window_state(), KvCacheWindowState::new(3));
+
+        buffer.prefill_window(10, 3).unwrap();
+        buffer.append_window(1).unwrap();
+        assert_eq!(
+            buffer.window_state(),
+            KvCacheWindowState {
+                window_start: 11,
+                cached_len: 3,
+                max_context: 3,
+            }
+        );
     }
 
     #[test]

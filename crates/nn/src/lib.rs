@@ -587,7 +587,7 @@ impl MultiHeadAttention {
     /// 执行带因果掩码的自注意力前向。
     ///
     /// 适合自回归语言模型，不适合双向编码器语义。
-    fn forward_causal_impl(&self, input: &Tensor, rope_base: Option<f32>) -> Tensor {
+    fn forward_causal_impl(&self, input: &Tensor, rope: Option<(f32, usize)>) -> Tensor {
         let shape = input.shape();
         let seq_len = shape[0];
         let h = self.n_head;
@@ -603,9 +603,9 @@ impl MultiHeadAttention {
         let mut k3 = reshape_to_heads(&k, seq_len, h, hd);
         let v3 = reshape_to_heads(&v, seq_len, h, hd);
 
-        if let Some(rope_base) = rope_base {
-            q3 = rotary_position_embedding(&q3, rope_base);
-            k3 = rotary_position_embedding(&k3, rope_base);
+        if let Some((rope_base, position_offset)) = rope {
+            q3 = rotary_position_embedding_with_offset(&q3, rope_base, position_offset);
+            k3 = rotary_position_embedding_with_offset(&k3, rope_base, position_offset);
         }
 
         // Attention scores: [n_head, seq_len, seq_len]
@@ -653,7 +653,11 @@ impl MultiHeadAttention {
     /// 这条路径在 Qwen/Llama 风格模型里更常见：位置信息先注入 Q/K，再做因果
     /// attention。
     pub fn forward_causal_rope(&self, input: &Tensor, rope_base: f32) -> Tensor {
-        self.forward_causal_impl(input, Some(rope_base))
+        self.forward_causal_rope_with_offset(input, rope_base, 0)
+    }
+
+    fn forward_causal_rope_with_offset(&self, input: &Tensor, rope_base: f32, position_offset: usize) -> Tensor {
+        self.forward_causal_impl(input, Some((rope_base, position_offset)))
     }
 
     /// 计算当前输入对应的 Key/Value cache 张量。
@@ -1089,8 +1093,14 @@ impl QwenLikeBlock {
     /// KV cache 的 materialize 过程需要一个稳定、可复现的残差流，因此这里
     /// 显式绕过 dropout，而不是依赖模型当前是否处于 eval 模式。
     pub fn forward_seq_inference(&self, input: &Tensor) -> Tensor {
+        self.forward_seq_inference_at(input, 0)
+    }
+
+    fn forward_seq_inference_at(&self, input: &Tensor, position_offset: usize) -> Tensor {
         let normed = self.norm1.forward(input);
-        let attn_out = self.attn.forward_causal_rope(&normed, self.rope_base);
+        let attn_out = self
+            .attn
+            .forward_causal_rope_with_offset(&normed, self.rope_base, position_offset);
         let x = add(input, &attn_out);
 
         let normed2 = self.norm2.forward(&x);
@@ -1289,12 +1299,25 @@ pub trait PrefillCache {
     /// 将 `token_ids` 对应的上下文写入 `cache`。
     fn prefill_kv_cache(&self, token_ids: &[usize], cache: &mut KvCache);
 
+    /// 从给定绝对位置开始，将一段上下文窗口写入 `cache`。
+    ///
+    /// 普通 prefill 可以把 `start_position` 设为 0；滑动窗口长上下文则应传入
+    /// 当前窗口在完整序列中的起点。RoPE、监控和后续设备 KV buffer 都依赖这个
+    /// 位置，不能只看窗口内局部下标。
+    fn prefill_kv_cache_at(&self, token_ids: &[usize], start_position: usize, cache: &mut KvCache);
+
     /// 只把当前上下文中最后一个 token 对应的 K/V 追加到 cache。
     ///
     /// 这是从“全量刷新 cache”走向真实增量 decode 的过渡接口。当前实现仍会
     /// 为了取得最后 token 的层输入而重放一段上下文，但写入 cache 时只 append
     /// 一个位置，外层生命周期已经与真实在线推理保持一致。
     fn append_last_token_kv_cache(&self, token_ids: &[usize], cache: &mut KvCache);
+
+    /// 用绝对 token 位置追加当前上下文窗口的最后一个 token。
+    ///
+    /// `last_position` 是完整会话里的位置，不是 `token_ids` 窗口里的下标。
+    /// 当上下文已经滑动时，这个值是 RoPE 和设备侧 cache 元数据的唯一可信来源。
+    fn append_last_token_kv_cache_at(&self, token_ids: &[usize], last_position: usize, cache: &mut KvCache);
 }
 
 trait IncrementalDecode {
@@ -1392,9 +1415,19 @@ impl GPT {
         <Self as PrefillCache>::prefill_kv_cache(self, token_ids, cache)
     }
 
+    /// 从给定绝对位置开始写入 KV cache。
+    pub fn prefill_kv_cache_at(&self, token_ids: &[usize], start_position: usize, cache: &mut KvCache) {
+        <Self as PrefillCache>::prefill_kv_cache_at(self, token_ids, start_position, cache)
+    }
+
     /// 将当前上下文最后一个 token 的 K/V 追加到 cache。
     pub fn append_last_token_kv_cache(&self, token_ids: &[usize], cache: &mut KvCache) {
         <Self as PrefillCache>::append_last_token_kv_cache(self, token_ids, cache)
+    }
+
+    /// 用完整会话里的绝对位置追加最后一个 token 的 K/V。
+    pub fn append_last_token_kv_cache_at(&self, token_ids: &[usize], last_position: usize, cache: &mut KvCache) {
+        <Self as PrefillCache>::append_last_token_kv_cache_at(self, token_ids, last_position, cache)
     }
 
     /// 使用已有 KV cache 计算当前最后一个 token 的 logits。
@@ -1474,9 +1507,19 @@ impl QwenLikeGPT {
         <Self as PrefillCache>::prefill_kv_cache(self, token_ids, cache)
     }
 
+    /// 从给定绝对位置开始写入 KV cache。
+    pub fn prefill_kv_cache_at(&self, token_ids: &[usize], start_position: usize, cache: &mut KvCache) {
+        <Self as PrefillCache>::prefill_kv_cache_at(self, token_ids, start_position, cache)
+    }
+
     /// 将当前上下文最后一个 token 的 K/V 追加到 cache。
     pub fn append_last_token_kv_cache(&self, token_ids: &[usize], cache: &mut KvCache) {
         <Self as PrefillCache>::append_last_token_kv_cache(self, token_ids, cache)
+    }
+
+    /// 用完整会话里的绝对位置追加最后一个 token 的 K/V。
+    pub fn append_last_token_kv_cache_at(&self, token_ids: &[usize], last_position: usize, cache: &mut KvCache) {
+        <Self as PrefillCache>::append_last_token_kv_cache_at(self, token_ids, last_position, cache)
     }
 
     /// 使用已有 KV cache 计算当前最后一个 token 的 logits。
@@ -1495,6 +1538,11 @@ impl PrefillCache for GPT {
     }
 
     fn prefill_kv_cache(&self, token_ids: &[usize], cache: &mut KvCache) {
+        let (window, start_position) = kv_context_window(token_ids, cache.max_context());
+        self.prefill_kv_cache_at(window, start_position, cache);
+    }
+
+    fn prefill_kv_cache_at(&self, token_ids: &[usize], start_position: usize, cache: &mut KvCache) {
         sptorch_core_tensor::no_grad(|| {
             assert_eq!(
                 cache.spec(),
@@ -1502,18 +1550,24 @@ impl PrefillCache for GPT {
                 "kv cache spec does not match GPT model"
             );
             cache.reset();
-            materialize_gpt_kv_cache(self, token_ids, cache, false);
+            cache.set_window_start(start_position);
+            materialize_gpt_kv_cache(self, token_ids, start_position, cache, false);
         });
     }
 
     fn append_last_token_kv_cache(&self, token_ids: &[usize], cache: &mut KvCache) {
+        let last_position = cache.next_position();
+        self.append_last_token_kv_cache_at(token_ids, last_position, cache);
+    }
+
+    fn append_last_token_kv_cache_at(&self, token_ids: &[usize], last_position: usize, cache: &mut KvCache) {
         sptorch_core_tensor::no_grad(|| {
             assert_eq!(
                 cache.spec(),
                 self.kv_cache_spec(),
                 "kv cache spec does not match GPT model"
             );
-            append_gpt_last_token_kv_cache(self, token_ids, cache);
+            append_gpt_last_token_kv_cache(self, token_ids, last_position, cache);
         });
     }
 }
@@ -1528,6 +1582,11 @@ impl PrefillCache for QwenLikeGPT {
     }
 
     fn prefill_kv_cache(&self, token_ids: &[usize], cache: &mut KvCache) {
+        let (window, start_position) = kv_context_window(token_ids, cache.max_context());
+        self.prefill_kv_cache_at(window, start_position, cache);
+    }
+
+    fn prefill_kv_cache_at(&self, token_ids: &[usize], start_position: usize, cache: &mut KvCache) {
         sptorch_core_tensor::no_grad(|| {
             assert_eq!(
                 cache.spec(),
@@ -1535,18 +1594,24 @@ impl PrefillCache for QwenLikeGPT {
                 "kv cache spec does not match QwenLikeGPT model"
             );
             cache.reset();
-            materialize_qwen_like_kv_cache(self, token_ids, cache, false);
+            cache.set_window_start(start_position);
+            materialize_qwen_like_kv_cache(self, token_ids, start_position, cache, false);
         });
     }
 
     fn append_last_token_kv_cache(&self, token_ids: &[usize], cache: &mut KvCache) {
+        let last_position = cache.next_position();
+        self.append_last_token_kv_cache_at(token_ids, last_position, cache);
+    }
+
+    fn append_last_token_kv_cache_at(&self, token_ids: &[usize], last_position: usize, cache: &mut KvCache) {
         sptorch_core_tensor::no_grad(|| {
             assert_eq!(
                 cache.spec(),
                 self.kv_cache_spec(),
                 "kv cache spec does not match QwenLikeGPT model"
             );
-            append_qwen_like_last_token_kv_cache(self, token_ids, cache);
+            append_qwen_like_last_token_kv_cache(self, token_ids, last_position, cache);
         });
     }
 }
@@ -1563,8 +1628,10 @@ impl IncrementalDecode for GPT {
             return self.forward_ids(token_ids);
         }
 
-        let last_pos = token_ids.len() - 1;
-        let tok = self.token_emb.forward_indices(&[token_ids[last_pos]]);
+        let last_pos = cache
+            .last_position()
+            .expect("incremental decode requires cached positions");
+        let tok = self.token_emb.forward_indices(&[*token_ids.last().unwrap()]);
         let pos = self.pos_emb.forward_indices(&[last_pos.min(self.seq_len - 1)]);
         let mut x = add(&tok, &pos);
 
@@ -1590,8 +1657,10 @@ impl IncrementalDecode for QwenLikeGPT {
             return self.forward_ids(token_ids);
         }
 
-        let last_pos = token_ids.len() - 1;
-        let last_token = token_ids[last_pos];
+        let last_pos = cache
+            .last_position()
+            .expect("incremental decode requires cached positions");
+        let last_token = *token_ids.last().unwrap();
         let mut x = self.token_emb.forward_indices(&[last_token]);
         for (idx, block) in self.blocks.iter().enumerate() {
             let layer_cache = cache.layer(idx).expect("missing kv cache layer");
@@ -1603,14 +1672,22 @@ impl IncrementalDecode for QwenLikeGPT {
     }
 }
 
-fn materialize_gpt_kv_cache(model: &GPT, token_ids: &[usize], cache: &mut KvCache, append_last_only: bool) {
+fn materialize_gpt_kv_cache(
+    model: &GPT,
+    token_ids: &[usize],
+    start_position: usize,
+    cache: &mut KvCache,
+    append_last_only: bool,
+) {
     if token_ids.is_empty() || model.blocks.is_empty() {
         return;
     }
 
     let slen = token_ids.len();
     assert!(slen <= model.seq_len);
-    let positions: Vec<usize> = (0..slen).collect();
+    let positions: Vec<usize> = (start_position..start_position + slen)
+        .map(|pos| pos.min(model.seq_len - 1))
+        .collect();
     let tok = model.token_emb.forward_indices(token_ids);
     let pos = model.pos_emb.forward_indices(&positions);
     let mut x = add(&tok, &pos);
@@ -1623,7 +1700,7 @@ fn materialize_gpt_kv_cache(model: &GPT, token_ids: &[usize], cache: &mut KvCach
     }
 }
 
-fn append_gpt_last_token_kv_cache(model: &GPT, token_ids: &[usize], cache: &mut KvCache) {
+fn append_gpt_last_token_kv_cache(model: &GPT, token_ids: &[usize], last_position: usize, cache: &mut KvCache) {
     if token_ids.is_empty() || model.blocks.is_empty() {
         return;
     }
@@ -1631,13 +1708,12 @@ fn append_gpt_last_token_kv_cache(model: &GPT, token_ids: &[usize], cache: &mut 
     assert!(token_ids.len() <= model.seq_len);
     assert_eq!(
         cache.cached_len(),
-        token_ids.len().saturating_sub(1).min(cache.max_context()),
+        expected_previous_cache_len_for_append(token_ids, cache.max_context()),
         "kv cache must contain the previous context window before appending a decode token"
     );
 
-    let last_pos = token_ids.len() - 1;
-    let tok = model.token_emb.forward_indices(&[token_ids[last_pos]]);
-    let pos = model.pos_emb.forward_indices(&[last_pos.min(model.seq_len - 1)]);
+    let tok = model.token_emb.forward_indices(&[*token_ids.last().unwrap()]);
+    let pos = model.pos_emb.forward_indices(&[last_position.min(model.seq_len - 1)]);
     let mut x = add(&tok, &pos);
 
     for (idx, block) in model.blocks.iter().enumerate() {
@@ -1655,6 +1731,7 @@ fn append_gpt_last_token_kv_cache(model: &GPT, token_ids: &[usize], cache: &mut 
 fn materialize_qwen_like_kv_cache(
     model: &QwenLikeGPT,
     token_ids: &[usize],
+    start_position: usize,
     cache: &mut KvCache,
     append_last_only: bool,
 ) {
@@ -1667,13 +1744,20 @@ fn materialize_qwen_like_kv_cache(
     let mut x = model.token_emb.forward_indices(token_ids);
     for (idx, block) in model.blocks.iter().enumerate() {
         let normed = block.norm1.forward(&x);
-        let (key, value) = block.attn.project_kv_cache(&normed, Some(block.rope_base));
+        let (key, value) = block
+            .attn
+            .project_kv_cache_with_offset(&normed, Some((block.rope_base, start_position)));
         write_kv_cache_layer(cache, idx, key, value, append_last_only);
-        x = block.forward_seq_inference(&x);
+        x = block.forward_seq_inference_at(&x, start_position);
     }
 }
 
-fn append_qwen_like_last_token_kv_cache(model: &QwenLikeGPT, token_ids: &[usize], cache: &mut KvCache) {
+fn append_qwen_like_last_token_kv_cache(
+    model: &QwenLikeGPT,
+    token_ids: &[usize],
+    last_position: usize,
+    cache: &mut KvCache,
+) {
     if token_ids.is_empty() || model.blocks.is_empty() {
         return;
     }
@@ -1681,20 +1765,19 @@ fn append_qwen_like_last_token_kv_cache(model: &QwenLikeGPT, token_ids: &[usize]
     assert!(token_ids.len() <= model.seq_len);
     assert_eq!(
         cache.cached_len(),
-        token_ids.len().saturating_sub(1).min(cache.max_context()),
+        expected_previous_cache_len_for_append(token_ids, cache.max_context()),
         "kv cache must contain the previous context window before appending a decode token"
     );
 
-    let last_pos = token_ids.len() - 1;
-    let mut x = model.token_emb.forward_indices(&[token_ids[last_pos]]);
+    let mut x = model.token_emb.forward_indices(&[*token_ids.last().unwrap()]);
     for (idx, block) in model.blocks.iter().enumerate() {
         let normed = block.norm1.forward(&x);
         let (key, value) = block
             .attn
-            .project_kv_cache_with_offset(&normed, Some((block.rope_base, last_pos)));
+            .project_kv_cache_with_offset(&normed, Some((block.rope_base, last_position)));
         cache.append_layer(idx, key, value);
         let layer_cache = cache.layer(idx).expect("missing kv cache layer after append");
-        x = block.forward_last_token_incremental(&x, layer_cache, last_pos);
+        x = block.forward_last_token_incremental(&x, layer_cache, last_position);
     }
 
     let _ = model.norm_f.forward(&x);
@@ -1705,6 +1788,23 @@ fn write_kv_cache_layer(cache: &mut KvCache, layer_idx: usize, key: Tensor, valu
         cache.append_layer(layer_idx, last_kv_token(&key), last_kv_token(&value));
     } else {
         cache.prefill_layer(layer_idx, key, value);
+    }
+}
+
+fn kv_context_window(token_ids: &[usize], max_context: usize) -> (&[usize], usize) {
+    if token_ids.len() > max_context {
+        let start = token_ids.len() - max_context;
+        (&token_ids[start..], start)
+    } else {
+        (token_ids, 0)
+    }
+}
+
+fn expected_previous_cache_len_for_append(token_ids: &[usize], max_context: usize) -> usize {
+    if token_ids.len() < max_context {
+        token_ids.len().saturating_sub(1)
+    } else {
+        max_context
     }
 }
 
@@ -1899,6 +1999,7 @@ fn tensor_option_eq(a: &Option<Tensor>, b: &Option<Tensor>) -> bool {
 pub struct KvCache {
     spec: KvCacheSpec,
     layers: Vec<KvCacheLayer>,
+    window_start: usize,
 }
 
 impl KvCache {
@@ -1907,6 +2008,7 @@ impl KvCache {
         Self {
             spec,
             layers: (0..spec.n_layer).map(|_| KvCacheLayer::empty()).collect(),
+            window_start: 0,
         }
     }
 
@@ -1923,6 +2025,34 @@ impl KvCache {
     /// 返回最大上下文窗口。
     pub fn max_context(&self) -> usize {
         self.spec.max_context
+    }
+
+    /// 返回当前 cache 窗口在完整序列中的起始绝对位置。
+    ///
+    /// 当 prompt 或生成序列超过 `max_context` 时，cache 中的第 0 个槽位并不等于
+    /// 原始序列位置 0。把窗口起点显式暴露出来，可以让 RoPE、监控和设备 buffer
+    /// 都使用同一套位置语义。
+    pub fn window_start(&self) -> usize {
+        self.window_start
+    }
+
+    fn set_window_start(&mut self, window_start: usize) {
+        self.window_start = window_start;
+    }
+
+    /// 返回下一次 decode append 应使用的绝对 token 位置。
+    pub fn next_position(&self) -> usize {
+        self.window_start + self.cached_len()
+    }
+
+    /// 返回当前 cache 中最后一个 token 的绝对位置。
+    pub fn last_position(&self) -> Option<usize> {
+        let len = self.cached_len();
+        if len == 0 {
+            None
+        } else {
+            Some(self.window_start + len - 1)
+        }
     }
 
     /// 返回注意力头数。
@@ -1963,6 +2093,7 @@ impl KvCache {
         for layer in &mut self.layers {
             *layer = KvCacheLayer::empty();
         }
+        self.window_start = 0;
     }
 
     /// 清空指定层缓存。
@@ -2010,9 +2141,13 @@ impl KvCache {
             self.spec.head_dim,
         );
         let cached_len = next_key.shape()[1];
+        let dropped = layer.cached_len + key.shape()[1] - cached_len;
         layer.key = Some(next_key);
         layer.value = Some(next_value);
         layer.cached_len = cached_len;
+        if layer_idx == 0 {
+            self.window_start += dropped;
+        }
     }
 
     fn validate_kv_shape(&self, tensor: &Tensor, name: &str) {
@@ -2110,6 +2245,15 @@ impl InferenceState {
         } else {
             &self.tokens
         }
+    }
+
+    /// 返回当前上下文窗口在完整 token 序列中的起始绝对位置。
+    ///
+    /// 这个值用于把 `context()` 这种局部切片重新放回完整序列坐标系。RoPE、
+    /// KV cache 和未来设备 buffer 都应使用这个位置，而不是假设窗口下标 0
+    /// 就是整段会话的第 0 个 token。
+    pub fn context_start_position(&self) -> usize {
+        self.tokens.len().saturating_sub(self.context().len())
     }
 
     /// prompt 的 token 数量。
@@ -2714,7 +2858,11 @@ impl InferenceSession {
         } else {
             DecodeStopReason::NotStopped
         };
-        model.prefill_kv_cache(self.state.tokens(), &mut self.kv_cache);
+        model.prefill_kv_cache_at(
+            self.state.context(),
+            self.state.context_start_position(),
+            &mut self.kv_cache,
+        );
     }
 
     /// 重置 session 为新的请求。
@@ -2732,7 +2880,11 @@ impl InferenceSession {
             DecodeStopReason::NotStopped
         };
         self.kv_cache.reset();
-        model.prefill_kv_cache(self.state.tokens(), &mut self.kv_cache);
+        model.prefill_kv_cache_at(
+            self.state.context(),
+            self.state.context_start_position(),
+            &mut self.kv_cache,
+        );
     }
 
     /// 请求 ID。
@@ -2851,7 +3003,11 @@ fn decode_session_with<M: IncrementalDecode + PrefillCache>(model: &M, session: 
     {
         session.state.push_token(next);
         session.generated_steps += 1;
-        model.append_last_token_kv_cache(session.state.context(), &mut session.kv_cache);
+        model.append_last_token_kv_cache_at(
+            session.state.context(),
+            session.state.context_start_position() + session.state.context().len() - 1,
+            &mut session.kv_cache,
+        );
         let stop_reason = if Some(next) == session.request.config.eos_token_id {
             DecodeStopReason::EosToken
         } else {
@@ -3465,11 +3621,13 @@ mod tests {
         assert_eq!(state.tokens(), &[10, 11, 12, 13, 14]);
         assert_eq!(state.generated_tokens(), &[13, 14]);
         assert_eq!(state.context(), &[11, 12, 13, 14]);
+        assert_eq!(state.context_start_position(), 1);
 
         state.reset(&[7, 8]);
         assert_eq!(state.tokens(), &[7, 8]);
         assert_eq!(state.generated_tokens(), &[]);
         assert_eq!(state.context(), &[7, 8]);
+        assert_eq!(state.context_start_position(), 0);
     }
 
     #[test]
@@ -3493,6 +3651,9 @@ mod tests {
             vec![2, 2, 2],
         );
         cache.prefill_layer(0, key_prefill, value_prefill);
+        assert_eq!(cache.window_start(), 0);
+        assert_eq!(cache.next_position(), 2);
+        assert_eq!(cache.last_position(), Some(1));
         assert_eq!(cache.layer(0).unwrap().cached_len(), 2);
 
         let key_decode = Tensor::new(
@@ -3512,6 +3673,9 @@ mod tests {
         cache.append_layer(0, key_decode, value_decode);
 
         let layer = cache.layer(0).unwrap();
+        assert_eq!(cache.window_start(), 1);
+        assert_eq!(cache.next_position(), 4);
+        assert_eq!(cache.last_position(), Some(3));
         assert_eq!(layer.cached_len(), 3);
         assert_eq!(layer.key().unwrap().shape(), vec![2, 3, 2]);
         assert_eq!(
@@ -3554,6 +3718,31 @@ mod tests {
             session.kv_cache.layer(1).unwrap().value().unwrap().shape(),
             vec![3, 2, 2]
         );
+    }
+
+    #[test]
+    fn test_prefill_long_prompt_uses_context_window_absolute_positions() {
+        let model = QwenLikeGPT::new(8, 4, 2, 2, 8, 4);
+        let config = GenerationConfig::greedy(1, 8);
+        let prompt = vec![0, 1, 2, 3, 4, 5];
+        let batch = InferenceBatch {
+            requests: vec![InferenceRequest::new(7, prompt.clone(), config, 0)],
+            total_token_budget: prompt.len() + 1,
+        };
+
+        let state = activate_qwen_like_inference_batch(&model, batch);
+        let session = &state.sessions[0];
+
+        assert_eq!(session.state.context(), &[2, 3, 4, 5]);
+        assert_eq!(session.state.context_start_position(), 2);
+        assert_eq!(session.kv_cache.window_start(), 2);
+        assert_eq!(session.kv_cache.cached_len(), 4);
+        assert_eq!(session.kv_cache.last_position(), Some(5));
+        assert_eq!(session.kv_cache.next_position(), 6);
+
+        let mut expected = KvCache::new(model.kv_cache_spec());
+        model.prefill_kv_cache_at(&prompt[2..], 2, &mut expected);
+        assert_kv_cache_close(&session.kv_cache, &expected, 1e-5);
     }
 
     #[test]
@@ -3620,6 +3809,24 @@ mod tests {
         model.prefill_kv_cache(&[1, 2, 3], &mut full);
 
         assert_kv_cache_close(&incremental, &full, 1e-5);
+    }
+
+    #[test]
+    fn test_qwen_like_append_sliding_window_keeps_absolute_position_metadata() {
+        let model = QwenLikeGPT::new(8, 4, 2, 1, 8, 3);
+        let mut incremental = KvCache::new(model.kv_cache_spec());
+        let mut expected = KvCache::new(model.kv_cache_spec());
+        let tokens = [1, 2, 3, 4];
+
+        model.prefill_kv_cache_at(&tokens[..3], 0, &mut incremental);
+        model.append_last_token_kv_cache_at(&tokens[1..], 3, &mut incremental);
+        model.prefill_kv_cache_at(&tokens[1..], 1, &mut expected);
+
+        assert_eq!(incremental.window_start(), 1);
+        assert_eq!(incremental.cached_len(), 3);
+        assert_eq!(incremental.last_position(), Some(3));
+        assert_eq!(incremental.next_position(), 4);
+        assert_kv_cache_close(&incremental, &expected, 1e-5);
     }
 
     #[test]

@@ -86,7 +86,9 @@ pub mod v1 {
     /// 这一层提供的是框架侧可见的硬件边界，而不是具体驱动实现。规划器、监控
     /// 工具和 Studio 可以依赖这里的类型来描述 fence、队列和后端状态。
     pub mod hal {
-        pub use sptorch_hal::{FenceState, QueueState};
+        pub use sptorch_hal::{
+            CpuKvCacheBuffer, FenceState, KvCacheBuffer, KvCacheBufferSpec, KvCacheWindowState, QueueState,
+        };
     }
 
     /// 版本化与遥测协议入口。
